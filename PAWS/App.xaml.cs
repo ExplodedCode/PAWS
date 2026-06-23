@@ -42,8 +42,8 @@ namespace PAWS
 
         public SetupWorkflow CreateSetupWorkflow() => new(SettingsStore, SecretStore, Authenticator);
 
-        /// <summary>True once this machine has been linked to a Proton account.</summary>
-        public bool IsConfigured => SecretStore.HasProtonSecrets && SettingsStore.Load().SetupCompleted;
+        /// <summary>True once at least one Proton account has been added.</summary>
+        public bool IsConfigured => SettingsStore.Load().Accounts.Count > 0;
 
         protected override void OnLaunched(LaunchActivatedEventArgs args)
         {

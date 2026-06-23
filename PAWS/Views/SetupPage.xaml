@@ -9,9 +9,18 @@
 
     <ScrollViewer>
         <StackPanel Padding="40" Spacing="14" MaxWidth="560" HorizontalAlignment="Center">
-            <TextBlock Text="Set up PAWS" Style="{StaticResource TitleTextBlockStyle}" />
+            <StackPanel Orientation="Horizontal" Spacing="4">
+                <Button
+                    x:Name="BackButton"
+                    Click="OnBackClicked"
+                    Style="{StaticResource NavigationBackButtonNormalStyle}"
+                    VerticalAlignment="Center"
+                    ToolTipService.ToolTip="Back"
+                    Visibility="Collapsed" />
+                <TextBlock Text="Add a Proton account" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
+            </StackPanel>
             <TextBlock
-                Text="Link this PC to your Proton Drive account and choose a folder to sync."
+                Text="Sign in to a Proton account and choose a folder to sync. You can add more accounts and more folders later — even the same account twice."
                 TextWrapping="Wrap"
                 Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
 
@@ -20,6 +29,7 @@
             <TextBlock Text="Proton account" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
             <TextBox x:Name="EmailBox" Header="Email" PlaceholderText="you@proton.me" />
             <PasswordBox x:Name="PasswordInput" Header="Password" />
+            <TextBox x:Name="LabelBox" Header="Label for this account (optional)" PlaceholderText="e.g. Work or Personal" />
 
             <ToggleSwitch x:Name="TwoFactorToggle" Header="Two-factor authentication (2FA) is enabled" Toggled="OnTwoFactorToggled" />
             <TextBox x:Name="TwoFactorBox" Header="2FA code" MaxLength="8" Visibility="Collapsed" />
@@ -45,7 +55,7 @@
 
             <StackPanel Orientation="Horizontal" Spacing="12" HorizontalAlignment="Right" Margin="0,12,0,0">
                 <ProgressRing x:Name="Busy" IsActive="False" Width="24" Height="24" VerticalAlignment="Center" />
-                <Button x:Name="ConnectButton" Content="Connect" Style="{StaticResource AccentButtonStyle}" Click="OnConnectClicked" />
+                <Button x:Name="ConnectButton" Content="Add account" Style="{StaticResource AccentButtonStyle}" Click="OnConnectClicked" />
             </StackPanel>
 
             <InfoBar

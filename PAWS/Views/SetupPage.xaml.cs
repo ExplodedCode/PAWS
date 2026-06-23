@@ -14,7 +14,13 @@ namespace PAWS.Views
         public SetupPage()
         {
             InitializeComponent();
+
+            // Only offer "back" when there is an existing account to return to (i.e. adding another).
+            BackButton.Visibility = App.Instance.IsConfigured ? Visibility.Visible : Visibility.Collapsed;
         }
+
+        private void OnBackClicked(object sender, RoutedEventArgs e)
+            => App.Instance.Window?.NavigateToHome();
 
         private void OnTwoFactorToggled(object sender, RoutedEventArgs e)
             => TwoFactorBox.Visibility = TwoFactorToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
@@ -78,10 +84,11 @@ namespace PAWS.Views
                     Mode = (SyncMode)Math.Max(0, ModeBox.SelectedIndex),
                 };
 
-                var result = await App.Instance.CreateSetupWorkflow().AuthenticateAndPersistAsync(login, pair);
+                var displayName = LabelBox.Text?.Trim();
+                var result = await App.Instance.CreateSetupWorkflow().AddAccountAsync(login, pair, displayName);
                 if (!result.IsSuccess)
                 {
-                    ShowError($"{result.Status}: {result.Message}");
+                    ShowError($"{result.Auth.Status}: {result.Auth.Message}");
                     return;
                 }
 

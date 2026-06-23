@@ -46,19 +46,17 @@ internal static class Program
 
         Header();
         Console.WriteLine($"Config folder: {paths.Root}");
-        if (secretStore.HasProtonSecrets)
+
+        var existing = settingsStore.Load();
+        if (existing.Accounts.Count > 0)
         {
-            Console.WriteLine("\nThis machine is already linked to a Proton account.");
-            if (!Confirm("Reconfigure and overwrite the stored credentials?", defaultYes: false))
-            {
-                Console.WriteLine("Left unchanged.");
-                return 0;
-            }
+            Console.WriteLine($"\n{existing.Accounts.Count} account(s) already configured. Adding another.");
         }
 
         Console.WriteLine("\n— Proton account —");
         var username = Prompt("Proton email");
         var password = ReadSecret("Proton password");
+        var displayName = PromptOptional("Label for this account (optional, e.g. Work)");
 
         var mailboxPassword = Confirm("Does this account use a separate second (mailbox) password?", defaultYes: false)
             ? ReadSecret("Mailbox password")
@@ -84,75 +82,79 @@ internal static class Program
         var pair = new SyncPair { LocalPath = localPath, RemotePath = remotePath, Mode = mode };
 
         Console.WriteLine("\nAuthenticating…");
-        var result = await workflow.AuthenticateAndPersistAsync(login, pair).ConfigureAwait(false);
+        var result = await workflow.AddAccountAsync(login, pair, displayName).ConfigureAwait(false);
 
         if (!result.IsSuccess)
         {
-            Console.WriteLine($"\n  x {result.Status}: {result.Message}");
+            Console.WriteLine($"\n  x {result.Auth.Status}: {result.Auth.Message}");
             Console.WriteLine("Nothing was saved.");
             return 1;
         }
 
         Console.WriteLine("  + Authenticated.");
-        Console.WriteLine($"  + Credentials encrypted (DPAPI) -> {paths.ProtonSecretsFile}");
+        Console.WriteLine($"  + Credentials encrypted (DPAPI) -> {paths.SecretsFileFor(result.Account!.Id)}");
         Console.WriteLine($"  + Settings written -> {paths.SettingsFile}");
 
-        // Prove the round-trip: reload what we just stored.
-        VerifyRoundTrip(settingsStore, secretStore);
+        Console.WriteLine();
+        ShowAccounts(settingsStore, secretStore);
 
         Console.WriteLine("\nNote: this build uses the STUB authenticator (no real Proton call yet).");
-        Console.WriteLine("It validates and exercises secure storage so the pipeline is ready for the real SDK.");
+        Console.WriteLine("Run setup again to add more accounts or more folders.");
         return 0;
-    }
-
-    private static void VerifyRoundTrip(ISettingsStore settingsStore, ISecretStore secretStore)
-    {
-        Console.WriteLine("\nVerifying stored data can be read back…");
-        var settings = settingsStore.Load();
-        var secrets = secretStore.LoadProtonSecrets();
-
-        Console.WriteLine($"  account        : {settings.AccountEmail}");
-        Console.WriteLine($"  setup complete : {settings.SetupCompleted}");
-        foreach (var p in settings.SyncPairs)
-        {
-            Console.WriteLine($"  sync pair      : \"{p.LocalPath}\"  <=>  \"{p.RemotePath}\"  [{p.Mode}]");
-        }
-
-        Console.WriteLine($"  session token  : {Redact(secrets?.AccessToken)}");
-        Console.WriteLine($"  refresh token  : {Redact(secrets?.RefreshToken)}");
-        Console.WriteLine($"  data password  : {Redact(secrets?.DataPassword)} (decrypted OK)");
     }
 
     // ---------------------------------------------------------------- other commands ----
 
     private static int Show(PawsPaths paths)
     {
-        var settings = new JsonSettingsStore(paths).Load();
-        var secretStore = new DpapiSecretStore(paths);
-
         Header();
-        Console.WriteLine($"Config folder : {paths.Root}");
-        Console.WriteLine($"Account       : {settings.AccountEmail ?? "(none)"}");
-        Console.WriteLine($"Setup done    : {settings.SetupCompleted}");
-        Console.WriteLine($"Secrets stored: {secretStore.HasProtonSecrets}");
-        Console.WriteLine($"Sync pairs    : {settings.SyncPairs.Count}");
-        foreach (var p in settings.SyncPairs)
+        Console.WriteLine($"Config folder : {paths.Root}\n");
+        ShowAccounts(new JsonSettingsStore(paths), new DpapiSecretStore(paths));
+        return 0;
+    }
+
+    private static void ShowAccounts(ISettingsStore settingsStore, ISecretStore secretStore)
+    {
+        var settings = settingsStore.Load();
+        if (settings.Accounts.Count == 0)
         {
-            Console.WriteLine($"  - \"{p.LocalPath}\"  <=>  \"{p.RemotePath}\"  [{p.Mode}]  enabled={p.Enabled}");
+            Console.WriteLine("No accounts configured yet.");
+            return;
         }
 
-        return 0;
+        Console.WriteLine($"{settings.Accounts.Count} account(s):");
+        foreach (var account in settings.Accounts)
+        {
+            var hasSecrets = secretStore.HasSecrets(account.Id);
+            Console.WriteLine($"\n  • {account.Label}   [id {account.Id[..8]}]   secrets={(hasSecrets ? "stored" : "MISSING")}");
+            if (account.SyncPairs.Count == 0)
+            {
+                Console.WriteLine("      (no folders)");
+            }
+
+            foreach (var p in account.SyncPairs)
+            {
+                Console.WriteLine($"      \"{p.LocalPath}\"  <=>  \"{p.RemotePath}\"  [{p.Mode}]");
+            }
+        }
     }
 
     private static int Reset(PawsPaths paths)
     {
-        new DpapiSecretStore(paths).ClearProtonSecrets();
+        var settingsStore = new JsonSettingsStore(paths);
+        var secretStore = new DpapiSecretStore(paths);
+
+        foreach (var account in settingsStore.Load().Accounts)
+        {
+            secretStore.ClearSecrets(account.Id);
+        }
+
         if (File.Exists(paths.SettingsFile))
         {
             File.Delete(paths.SettingsFile);
         }
 
-        Console.WriteLine("Cleared stored credentials and settings.");
+        Console.WriteLine("Cleared all stored credentials and settings.");
         return 0;
     }
 
@@ -160,19 +162,19 @@ internal static class Program
     {
         Header();
         Console.WriteLine("Usage: PAWS.Setup [command]\n");
-        Console.WriteLine("  (no args)    Interactive setup: capture credentials + folder pair, store securely.");
-        Console.WriteLine("  --show       Show current configuration (secrets redacted).");
-        Console.WriteLine("  --reset      Delete stored credentials and settings.");
-        Console.WriteLine("  --selftest   Non-interactive storage round-trip check (uses a temp folder).");
+        Console.WriteLine("  (no args)    Interactive setup: add a Proton account + folder, store securely.");
+        Console.WriteLine("  --show       List configured accounts and their folders (secrets redacted).");
+        Console.WriteLine("  --reset      Delete ALL stored credentials and settings.");
+        Console.WriteLine("  --selftest   Non-interactive multi-account storage round-trip check (temp folder).");
         return 0;
     }
 
     // ---------------------------------------------------------------- self test ----
 
     /// <summary>
-    /// Exercises the whole persistence pipeline without user input: authenticate (stub) -> save ->
-    /// reload -> assert equality. Uses a throwaway temp folder so it never touches real config.
-    /// Returns 0 on success, non-zero on failure (suitable for CI).
+    /// Exercises the multi-account persistence pipeline without user input: add two accounts (incl.
+    /// extra folder), reload, assert, then remove one. Uses a throwaway temp folder. Returns 0 on
+    /// success, non-zero on failure (suitable for CI).
     /// </summary>
     private static int SelfTest()
     {
@@ -187,33 +189,50 @@ internal static class Program
             var secretStore = new DpapiSecretStore(paths);
             var workflow = new SetupWorkflow(settingsStore, secretStore, new StubProtonAuthenticator());
 
-            var login = new ProtonLoginRequest { Username = "tester@proton.me", Password = "correct horse battery staple" };
-            var pair = new SyncPair { LocalPath = @"C:\Users\tester\ProtonSync", RemotePath = "/Backup/Desktop", Mode = SyncMode.OnDemand };
+            var personal = workflow.AddAccountAsync(
+                new ProtonLoginRequest { Username = "personal@proton.me", Password = "correct horse battery staple" },
+                new SyncPair { LocalPath = @"C:\Users\me\Personal", RemotePath = "/Personal", Mode = SyncMode.OnDemand },
+                "Personal").GetAwaiter().GetResult();
 
-            var result = workflow.AuthenticateAndPersistAsync(login, pair).GetAwaiter().GetResult();
+            var work = workflow.AddAccountAsync(
+                new ProtonLoginRequest { Username = "work@proton.me", Password = "tr0ub4dor&3" },
+                new SyncPair { LocalPath = @"C:\Users\me\Work", RemotePath = "/Work", Mode = SyncMode.FullSync },
+                "Work").GetAwaiter().GetResult();
+
+            // Same account can be added again, and accounts can have multiple folders.
+            if (personal.IsSuccess)
+            {
+                workflow.AddSyncPair(personal.Account!.Id, new SyncPair { LocalPath = @"C:\Users\me\Photos", RemotePath = "/Photos", Mode = SyncMode.CloudOnly });
+            }
+
+            var settings = settingsStore.Load();
 
             var checks = new List<(string Name, bool Ok)>
             {
-                ("authentication succeeded", result.IsSuccess),
-                ("secret file written", secretStore.HasProtonSecrets),
-                ("settings file written", File.Exists(paths.SettingsFile)),
+                ("first account added", personal.IsSuccess),
+                ("second account added", work.IsSuccess),
+                ("two accounts in settings", settings.Accounts.Count == 2),
+                ("accounts have distinct ids", personal.Account!.Id != work.Account!.Id),
+                ("each account has its own secret file", secretStore.HasSecrets(personal.Account!.Id) && secretStore.HasSecrets(work.Account!.Id)),
+                ("two secret files on disk", Directory.GetFiles(paths.SecretsDirectory, "*.bin").Length == 2),
+                ("extra folder added to first account", settings.Accounts.First(a => a.Id == personal.Account!.Id).SyncPairs.Count == 2),
+                ("first account session resumable", secretStore.LoadSecrets(personal.Account!.Id)?.HasResumableSession == true),
+                ("second account stores its own password", secretStore.LoadSecrets(work.Account!.Id)?.DataPassword == "tr0ub4dor&3"),
             };
 
-            var secrets = secretStore.LoadProtonSecrets();
-            var settings = settingsStore.Load();
+            // On-disk blobs must be encrypted: neither plaintext password should appear.
+            var allBytes = Directory.GetFiles(paths.SecretsDirectory, "*.bin")
+                .Select(File.ReadAllBytes)
+                .Select(b => Encoding.UTF8.GetString(b))
+                .ToList();
+            checks.Add(("on-disk blobs encrypted (no plaintext passwords)",
+                allBytes.All(t => !t.Contains("correct horse") && !t.Contains("tr0ub4dor"))));
 
-            checks.Add(("secrets decrypt + deserialize", secrets is not null));
-            checks.Add(("username round-trips", secrets?.Username == login.Username));
-            checks.Add(("data password round-trips", secrets?.DataPassword == login.Password));
-            checks.Add(("session is resumable", secrets?.HasResumableSession == true));
-            checks.Add(("account saved in settings", settings.AccountEmail == login.Username));
-            checks.Add(("setup marked complete", settings.SetupCompleted));
-            checks.Add(("sync pair saved", settings.SyncPairs.Count == 1 && settings.SyncPairs[0].RemotePath == "/Backup/Desktop"));
-
-            // The secret blob on disk must be encrypted — assert the plaintext password is not present.
-            var raw = File.ReadAllBytes(paths.ProtonSecretsFile);
-            var rawText = Encoding.UTF8.GetString(raw);
-            checks.Add(("on-disk blob is encrypted (no plaintext password)", !rawText.Contains("correct horse")));
+            // Removing an account clears its secret and its config.
+            workflow.RemoveAccount(work.Account!.Id);
+            var afterRemove = settingsStore.Load();
+            checks.Add(("account removed from settings", afterRemove.Accounts.Count == 1));
+            checks.Add(("removed account's secret cleared", !secretStore.HasSecrets(work.Account!.Id)));
 
             var allOk = true;
             foreach (var (name, ok) in checks)
@@ -259,6 +278,13 @@ internal static class Program
 
             Console.WriteLine("  (required)");
         }
+    }
+
+    private static string? PromptOptional(string label)
+    {
+        Console.Write($"{label}: ");
+        var value = Console.ReadLine()?.Trim();
+        return string.IsNullOrEmpty(value) ? null : value;
     }
 
     private static string PromptWithDefault(string label, string defaultValue)
@@ -346,17 +372,5 @@ internal static class Program
                     break;
             }
         }
-    }
-
-    private static string Redact(string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-        {
-            return "(none)";
-        }
-
-        return value.Length <= 8
-            ? new string('*', value.Length)
-            : value[..4] + new string('*', value.Length - 8) + value[^4..];
     }
 }

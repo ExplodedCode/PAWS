@@ -33,11 +33,14 @@ dotnet run --project src/PAWS.Setup -- --reset     # clear stored credentials + 
 dotnet run --project src/PAWS.Setup -- --selftest  # non-interactive storage round-trip check
 ```
 
+PAWS supports **multiple accounts at once** — different Proton accounts, or even the same
+account added more than once — each with its own set of synced folders.
+
 ### Where things are stored (`%LOCALAPPDATA%\PAWS\`)
-- `settings.json` — non-secret config: account email, folder pairs, sync mode.
-- `secrets\proton.bin` — **DPAPI-encrypted** (CurrentUser): the resumable Proton session
-  (UID + access/refresh tokens) and the data password needed to unlock encryption keys.
-  Decryptable only by the same Windows user on the same machine.
+- `settings.json` — non-secret config (schema v2): `Accounts[]`, each with its own `SyncPairs[]`.
+- `secrets\{accountId}.bin` — **one DPAPI-encrypted blob per account** (CurrentUser): the resumable
+  Proton session (UID + access/refresh tokens) and the data password needed to unlock encryption
+  keys. Decryptable only by the same Windows user on the same machine.
 
 The design stores a **resumable session**, not the login password, so the daemon can reconnect
 without prompting and survives token refresh.

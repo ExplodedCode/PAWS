@@ -8,8 +8,15 @@
     mc:Ignorable="d">
 
     <ScrollViewer>
-        <StackPanel Padding="40" Spacing="16" MaxWidth="640" HorizontalAlignment="Center">
-            <TextBlock Text="PAWS" Style="{StaticResource TitleTextBlockStyle}" />
+        <StackPanel Padding="40" Spacing="16" MaxWidth="760" HorizontalAlignment="Center">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Accounts &amp; folders" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
+                <Button Grid.Column="1" Content="Add account" Click="OnAddAccountClicked" Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />
+            </Grid>
 
             <InfoBar
                 IsOpen="True"
@@ -18,23 +25,14 @@
                 Title="Running in the background"
                 Message="Closing this window keeps PAWS running. Use the tray icon in the notification area to reopen or quit." />
 
-            <TextBlock x:Name="AccountText" Style="{StaticResource BodyStrongTextBlockStyle}" />
-
-            <TextBlock Text="Synced folders" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-            <ItemsControl x:Name="PairsList" />
-
-            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,12,0,0">
-                <Button Content="Open local folder" Click="OnOpenFolderClicked" />
-                <Button Content="Reconfigure" Click="OnReconfigureClicked" />
-                <Button Content="Sign out" Click="OnSignOutClicked" />
-            </StackPanel>
+            <StackPanel x:Name="AccountsPanel" Spacing="12" />
 
             <InfoBar
                 IsOpen="True"
                 IsClosable="False"
                 Severity="Informational"
                 Title="Preview build"
-                Message="Authentication uses a stub (no real Proton connection yet) and syncing is not active. This screen confirms setup and that credentials were stored securely." />
+                Message="Authentication uses a stub (no real Proton connection yet) and syncing is not active. This screen manages accounts and folders and confirms credentials are stored securely." />
         </StackPanel>
     </ScrollViewer>
 </Page>

@@ -7,10 +7,10 @@ using PAWS.Core.Security;
 namespace PAWS.Infrastructure.Storage;
 
 /// <summary>
-/// <see cref="ISecretStore"/> backed by Windows DPAPI (<see cref="ProtectedData"/>, CurrentUser scope).
-/// Encrypted blobs can only be decrypted by the same Windows user on the same machine — exactly the
-/// trust boundary a per-machine sync client wants. Swap for a Windows Credential Manager implementation
-/// later without touching callers, since they depend only on <see cref="ISecretStore"/>.
+/// <see cref="ISecretStore"/> backed by Windows DPAPI (<see cref="ProtectedData"/>, CurrentUser scope),
+/// one encrypted blob per account (<c>secrets\{accountId}.bin</c>). Blobs can only be decrypted by the
+/// same Windows user on the same machine. Swap for a Windows Credential Manager implementation later
+/// without touching callers, since they depend only on <see cref="ISecretStore"/>.
 /// </summary>
 public sealed class DpapiSecretStore : ISecretStore
 {
@@ -23,10 +23,11 @@ public sealed class DpapiSecretStore : ISecretStore
 
     public DpapiSecretStore(PawsPaths paths) => _paths = paths;
 
-    public bool HasProtonSecrets => File.Exists(_paths.ProtonSecretsFile);
+    public bool HasSecrets(string accountId) => File.Exists(_paths.SecretsFileFor(accountId));
 
-    public void SaveProtonSecrets(ProtonSecrets secrets)
+    public void SaveSecrets(string accountId, ProtonSecrets secrets)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accountId);
         ArgumentNullException.ThrowIfNull(secrets);
         _paths.EnsureCreated();
 
@@ -36,9 +37,10 @@ public sealed class DpapiSecretStore : ISecretStore
             var encrypted = ProtectedData.Protect(plaintext, Entropy, DataProtectionScope.CurrentUser);
 
             // Write atomically: temp file, then replace, so a crash mid-write can't corrupt the store.
-            var tmp = _paths.ProtonSecretsFile + ".tmp";
+            var file = _paths.SecretsFileFor(accountId);
+            var tmp = file + ".tmp";
             File.WriteAllBytes(tmp, encrypted);
-            File.Move(tmp, _paths.ProtonSecretsFile, overwrite: true);
+            File.Move(tmp, file, overwrite: true);
         }
         finally
         {
@@ -46,14 +48,15 @@ public sealed class DpapiSecretStore : ISecretStore
         }
     }
 
-    public ProtonSecrets? LoadProtonSecrets()
+    public ProtonSecrets? LoadSecrets(string accountId)
     {
-        if (!File.Exists(_paths.ProtonSecretsFile))
+        var file = _paths.SecretsFileFor(accountId);
+        if (!File.Exists(file))
         {
             return null;
         }
 
-        var encrypted = File.ReadAllBytes(_paths.ProtonSecretsFile);
+        var encrypted = File.ReadAllBytes(file);
         var plaintext = ProtectedData.Unprotect(encrypted, Entropy, DataProtectionScope.CurrentUser);
         try
         {
@@ -65,11 +68,12 @@ public sealed class DpapiSecretStore : ISecretStore
         }
     }
 
-    public void ClearProtonSecrets()
+    public void ClearSecrets(string accountId)
     {
-        if (File.Exists(_paths.ProtonSecretsFile))
+        var file = _paths.SecretsFileFor(accountId);
+        if (File.Exists(file))
         {
-            File.Delete(_paths.ProtonSecretsFile);
+            File.Delete(file);
         }
     }
 }

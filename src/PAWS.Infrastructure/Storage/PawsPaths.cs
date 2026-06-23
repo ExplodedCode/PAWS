@@ -20,7 +20,17 @@ public sealed class PawsPaths
 
     public string SettingsFile => Path.Combine(Root, "settings.json");
 
-    public string ProtonSecretsFile => Path.Combine(SecretsDirectory, "proton.bin");
+    /// <summary>Per-account encrypted secret blob, e.g. <c>secrets\{accountId}.bin</c>.</summary>
+    public string SecretsFileFor(string accountId)
+    {
+        var safe = new string(accountId.Where(char.IsLetterOrDigit).ToArray());
+        if (string.IsNullOrEmpty(safe))
+        {
+            throw new ArgumentException("Account id must contain alphanumeric characters.", nameof(accountId));
+        }
+
+        return Path.Combine(SecretsDirectory, safe + ".bin");
+    }
 
     public void EnsureCreated()
     {
