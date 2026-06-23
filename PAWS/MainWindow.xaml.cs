@@ -1,31 +1,83 @@
 using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices.WindowsRuntime;
+using System.Windows.Input;
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
-using Microsoft.UI.Xaml.Data;
-using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Navigation;
-using Windows.Foundation;
-using Windows.Foundation.Collections;
-
-// To learn more about WinUI, the WinUI project structure,
-// and more about our project templates, see: http://aka.ms/winui-project-info.
+using PAWS.Views;
 
 namespace PAWS
 {
     /// <summary>
-    /// An empty window that can be used on its own or navigated to within a Frame.
+    /// Host window. Shows the setup flow on first run and the home screen afterwards, and implements
+    /// "close keeps running in the background" via a tray icon (the OneDrive/Proton model).
     /// </summary>
     public sealed partial class MainWindow : Window
     {
+        private bool _allowClose;
+
         public MainWindow()
         {
             InitializeComponent();
+
+            // Blend the caption area into the Mica backdrop with a custom title bar.
+            ExtendsContentIntoTitleBar = true;
+            SetTitleBar(AppTitleBar);
+
+            AppWindow.Closing += OnClosing;
+            TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
+
+            if (App.Instance.IsConfigured)
+            {
+                RootFrame.Navigate(typeof(HomePage));
+            }
+            else
+            {
+                RootFrame.Navigate(typeof(SetupPage));
+            }
         }
+
+        public void NavigateToHome() => RootFrame.Navigate(typeof(HomePage));
+
+        public void NavigateToSetup() => RootFrame.Navigate(typeof(SetupPage));
+
+        public void ShowFromTray()
+        {
+            AppWindow.Show();
+            Activate();
+        }
+
+        private void OnTrayOpen(object sender, RoutedEventArgs e) => ShowFromTray();
+
+        private void OnTrayQuit(object sender, RoutedEventArgs e)
+        {
+            _allowClose = true;
+            TrayIcon.Dispose();
+            Close();
+        }
+
+        private void OnClosing(AppWindow sender, AppWindowClosingEventArgs e)
+        {
+            if (_allowClose)
+            {
+                return;
+            }
+
+            // Don't exit — just hide. The sync engine (once added) keeps running in the background.
+            e.Cancel = true;
+            sender.Hide();
+        }
+    }
+
+    /// <summary>Minimal ICommand used for the tray icon's left-click action.</summary>
+    internal sealed class RelayCommand : ICommand
+    {
+        private readonly Action _execute;
+
+        public RelayCommand(Action execute) => _execute = execute;
+
+        public event EventHandler? CanExecuteChanged { add { } remove { } }
+
+        public bool CanExecute(object? parameter) => true;
+
+        public void Execute(object? parameter) => _execute();
     }
 }

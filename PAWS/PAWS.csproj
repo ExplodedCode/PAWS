@@ -37,8 +37,13 @@
     <ProjectCapability Include="Msix" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.3.2" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.1839" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\src\PAWS.Core\PAWS.Core.csproj" />
+    <ProjectReference Include="..\src\PAWS.Infrastructure\PAWS.Infrastructure.csproj" />
   </ItemGroup>
 
   <!--

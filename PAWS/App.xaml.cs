@@ -1,47 +1,51 @@
-﻿using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices.WindowsRuntime;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
-using Microsoft.UI.Xaml.Data;
-using Microsoft.UI.Xaml.Input;
-using Microsoft.UI.Xaml.Media;
-using Microsoft.UI.Xaml.Navigation;
-using Microsoft.UI.Xaml.Shapes;
-using Windows.ApplicationModel;
-using Windows.ApplicationModel.Activation;
-using Windows.Foundation;
-using Windows.Foundation.Collections;
-
-// To learn more about WinUI, the WinUI project structure,
-// and more about our project templates, see: http://aka.ms/winui-project-info.
+using PAWS.Core.Abstractions;
+using PAWS.Core.Proton;
+using PAWS.Core.Setup;
+using PAWS.Infrastructure.Proton;
+using PAWS.Infrastructure.Storage;
 
 namespace PAWS
 {
     /// <summary>
-    /// Provides application-specific behavior to supplement the default Application class.
+    /// Application entry point. Owns the shared stores/services and routes the first launch to
+    /// setup (capture credentials) versus the normal home screen.
     /// </summary>
     public partial class App : Application
     {
-        private Window? _window;
+        private MainWindow? _window;
 
-        /// <summary>
-        /// Initializes the singleton application object.  This is the first line of authored code
-        /// executed, and as such is the logical equivalent of main() or WinMain().
-        /// </summary>
         public App()
         {
             InitializeComponent();
+
+            Paths = new PawsPaths();
+            SettingsStore = new JsonSettingsStore(Paths);
+            SecretStore = new DpapiSecretStore(Paths);
+
+            // TODO: swap StubProtonAuthenticator for the real Proton.Sdk-backed adapter (PAWS.Proton).
+            Authenticator = new StubProtonAuthenticator();
         }
 
-        /// <summary>
-        /// Invoked when the application is launched.
-        /// </summary>
-        /// <param name="args">Details about the launch request and process.</param>
-        protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
+        /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
+        public static App Instance => (App)Current;
+
+        public PawsPaths Paths { get; }
+
+        public ISettingsStore SettingsStore { get; }
+
+        public ISecretStore SecretStore { get; }
+
+        public IProtonAuthenticator Authenticator { get; }
+
+        public MainWindow? Window => _window;
+
+        public SetupWorkflow CreateSetupWorkflow() => new(SettingsStore, SecretStore, Authenticator);
+
+        /// <summary>True once this machine has been linked to a Proton account.</summary>
+        public bool IsConfigured => SecretStore.HasProtonSecrets && SettingsStore.Load().SetupCompleted;
+
+        protected override void OnLaunched(LaunchActivatedEventArgs args)
         {
             _window = new MainWindow();
             _window.Activate();

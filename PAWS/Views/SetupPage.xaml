@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="PAWS.Views.SetupPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer>
+        <StackPanel Padding="40" Spacing="14" MaxWidth="560" HorizontalAlignment="Center">
+            <TextBlock Text="Set up PAWS" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock
+                Text="Link this PC to your Proton Drive account and choose a folder to sync."
+                TextWrapping="Wrap"
+                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+            <InfoBar x:Name="ErrorBar" Severity="Error" IsOpen="False" IsClosable="True" />
+
+            <TextBlock Text="Proton account" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+            <TextBox x:Name="EmailBox" Header="Email" PlaceholderText="you@proton.me" />
+            <PasswordBox x:Name="PasswordInput" Header="Password" />
+
+            <ToggleSwitch x:Name="TwoFactorToggle" Header="Two-factor authentication (2FA) is enabled" Toggled="OnTwoFactorToggled" />
+            <TextBox x:Name="TwoFactorBox" Header="2FA code" MaxLength="8" Visibility="Collapsed" />
+
+            <ToggleSwitch x:Name="MailboxToggle" Header="Account uses a separate (second) mailbox password" Toggled="OnMailboxToggled" />
+            <PasswordBox x:Name="MailboxPasswordInput" Header="Mailbox password" Visibility="Collapsed" />
+
+            <TextBlock Text="Folder to sync" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+            <Grid ColumnSpacing="8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="LocalFolderBox" Header="Local folder" PlaceholderText="C:\Users\you\ProtonSync" IsReadOnly="True" />
+                <Button Grid.Column="1" Content="Browse…" VerticalAlignment="Bottom" Click="OnBrowseClicked" />
+            </Grid>
+            <TextBox x:Name="RemotePathBox" Header="Proton Drive folder" Text="/" PlaceholderText="/Backup/Desktop" />
+            <ComboBox x:Name="ModeBox" Header="Sync mode" HorizontalAlignment="Stretch" SelectedIndex="0">
+                <ComboBoxItem Content="On-demand — placeholders, download when opened" />
+                <ComboBoxItem Content="Full sync — keep every file local" />
+                <ComboBoxItem Content="Cloud-only — download only when pinned" />
+            </ComboBox>
+
+            <StackPanel Orientation="Horizontal" Spacing="12" HorizontalAlignment="Right" Margin="0,12,0,0">
+                <ProgressRing x:Name="Busy" IsActive="False" Width="24" Height="24" VerticalAlignment="Center" />
+                <Button x:Name="ConnectButton" Content="Connect" Style="{StaticResource AccentButtonStyle}" Click="OnConnectClicked" />
+            </StackPanel>
+
+            <InfoBar
+                IsOpen="True"
+                IsClosable="False"
+                Severity="Informational"
+                Title="Preview build"
+                Message="This build validates input and securely stores credentials, but does not connect to Proton yet (stub authenticator)." />
+        </StackPanel>
+    </ScrollViewer>
+</Page>
