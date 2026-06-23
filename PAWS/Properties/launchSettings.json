@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "PAWS (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "PAWS (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
