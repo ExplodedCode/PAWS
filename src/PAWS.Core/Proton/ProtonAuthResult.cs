@@ -3,9 +3,6 @@ namespace PAWS.Core.Proton;
 public enum ProtonAuthStatus
 {
     Success,
-    TwoFactorRequired,
-    MailboxPasswordRequired,
-    InvalidCredentials,
     Error,
 }
 

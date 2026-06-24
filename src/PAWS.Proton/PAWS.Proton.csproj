@@ -11,11 +11,19 @@
     <ProjectReference Include="..\PAWS.Core\PAWS.Core.csproj" />
 
     <!--
-      Proton's official MIT SDK, built from the local clones under D:\Testing\PAWS.
-      Proton.Sdk transitively brings in Proton.Cryptography and the native proton_crypto.dll.
-      If the clones move, update this relative path (or convert these to local NuGet packages).
+      Proton's official MIT SDK (current `sdk` repo, net10), built from the local clones under
+      D:\Testing\PAWS. Both projects pull Proton.Cryptography from the local dotnet-crypto source
+      (their NuGet refs were swapped to ProjectReferences, since it's on no public feed). If the
+      clones move, update these relative paths.
     -->
-    <ProjectReference Include="..\..\..\..\Testing\PAWS\sdk-tech-demo\src\Proton.Sdk\Proton.Sdk.csproj" />
+    <ProjectReference Include="..\..\..\..\Testing\PAWS\sdk\client\cs\sdk\src\Proton.Sdk\Proton.Sdk.csproj" />
+
+    <!-- Drive file operations (list/upload/download/move/trash) for the sync engine. -->
+    <ProjectReference Include="..\..\..\..\Testing\PAWS\sdk\client\cs\sdk\src\Proton.Drive.Sdk\Proton.Drive.Sdk.csproj" />
+
+    <!-- Direct ref so the offline native-crypto self-test can use Proton.Cryptography.Pgp (the SDK
+         projects reference it with PrivateAssets=compile, so it doesn't flow transitively). -->
+    <ProjectReference Include="..\..\..\..\Testing\PAWS\dotnet-crypto\src\dotnet\Proton.Cryptography.csproj" />
   </ItemGroup>
 
   <!--

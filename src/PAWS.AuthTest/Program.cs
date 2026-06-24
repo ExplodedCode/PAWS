@@ -1,18 +1,22 @@
+using System.Diagnostics;
 using System.Text;
-using PAWS.Core.Proton;
+using PAWS.Core.Drive;
+using PAWS.Infrastructure.Proton;
 using PAWS.Proton;
+using PAWS.Proton.Drive;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "login";
+var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "drive";
+var doWrite = args.Contains("--write", StringComparer.OrdinalIgnoreCase);
 
 return mode switch
 {
     "--cryptocheck" or "cryptocheck" => CryptoCheck(),
-    _ => await LoginAsync(),
+    _ => await DriveAsync(doWrite),
 };
 
-// Proves the native proton_crypto library loads and runs, without needing a Proton account.
+// Offline: proves the native proton_crypto library loads and runs, without a Proton account.
 static int CryptoCheck()
 {
     try
@@ -29,75 +33,75 @@ static int CryptoCheck()
     }
 }
 
-// Performs a REAL login against the Proton API using the official SDK.
-static async Task<int> LoginAsync()
+// End-to-end: browser login -> resume SDK session -> Drive list (and optional upload/download/trash).
+static async Task<int> DriveAsync(bool doWrite)
 {
-    Console.WriteLine("PAWS - real Proton login test\n");
+    Console.WriteLine("PAWS - Proton Drive test\n");
 
-    Console.Write("Proton email: ");
-    var email = Console.ReadLine()?.Trim() ?? string.Empty;
-    var password = ReadSecret("Proton password: ");
-    Console.Write("2FA code (leave blank if 2FA is off): ");
-    var twoFactor = Console.ReadLine()?.Trim();
-    var mailbox = ReadSecret("Mailbox password (blank for single-password accounts): ");
-
-    var authenticator = new ProtonAuthenticator();
-
-    Console.WriteLine("\nAuthenticating against Proton…");
-    var result = await authenticator.AuthenticateAsync(new ProtonLoginRequest
+    // 1) Browser/session-fork login (no password handled here).
+    var web = new WebProtonAuthenticator();
+    var auth = await web.SignInAsync(challenge =>
     {
-        Username = email,
-        Password = password,
-        TwoFactorCode = string.IsNullOrEmpty(twoFactor) ? null : twoFactor,
-        MailboxPassword = string.IsNullOrEmpty(mailbox) ? null : mailbox,
-    });
+        Console.WriteLine($"Opening: {challenge.Url}\n");
+        try { Process.Start(new ProcessStartInfo { FileName = challenge.Url, UseShellExecute = true }); }
+        catch { Console.WriteLine("(Could not open a browser automatically - paste the URL above.)"); }
+        Console.WriteLine("Waiting for you to finish signing in on the website…");
+        return Task.CompletedTask;
+    }).ConfigureAwait(false);
 
-    if (!result.IsSuccess)
+    if (!auth.IsSuccess)
     {
-        Console.WriteLine($"  x {result.Status}: {result.Message}");
+        Console.WriteLine($"  x sign-in failed: {auth.Status}: {auth.Message}");
         return 1;
     }
 
-    var s = result.Session!;
-    Console.WriteLine("  + Authenticated against Proton!\n");
-    Console.WriteLine($"    user id       : {s.UserId}");
-    Console.WriteLine($"    session id    : {s.SessionId}");
-    Console.WriteLine($"    password mode : {s.PasswordMode}");
-    Console.WriteLine($"    scopes        : {string.Join(", ", s.Scopes)}");
-    Console.WriteLine($"    access token  : {Redact(s.AccessToken)}");
-    Console.WriteLine($"    refresh token : {Redact(s.RefreshToken)}");
-    return 0;
-}
+    var session = auth.Session!;
+    Console.WriteLine($"  + Signed in as {session.Username}\n");
 
-static string ReadSecret(string label)
-{
-    Console.Write(label);
-    var builder = new StringBuilder();
-    while (true)
+    // 2) Resume the SDK session and open the Drive client.
+    await using var drive = new ProtonDriveClientAdapter(await ProtonSessionConnector.ResumeAsync(session).ConfigureAwait(false));
+    await drive.ConnectAsync().ConfigureAwait(false);
+
+    var root = await drive.GetRootAsync().ConfigureAwait(false);
+    Console.WriteLine($"My files root: uid={root.Uid}\n");
+
+    // 3) List the root folder.
+    Console.WriteLine("Children of root:");
+    var count = 0;
+    await foreach (var child in drive.ListChildrenAsync(root).ConfigureAwait(false))
     {
-        var key = Console.ReadKey(intercept: true);
-        switch (key.Key)
-        {
-            case ConsoleKey.Enter:
-                Console.WriteLine();
-                return builder.ToString();
-            case ConsoleKey.Backspace when builder.Length > 0:
-                builder.Length--;
-                Console.Write("\b \b");
-                break;
-            default:
-                if (!char.IsControl(key.KeyChar))
-                {
-                    builder.Append(key.KeyChar);
-                    Console.Write('*');
-                }
-
-                break;
-        }
+        var kind = child.IsFolder ? "DIR " : "file";
+        var size = child.Size is { } s ? $"{s,12:N0} B" : new string(' ', 14);
+        Console.WriteLine($"  [{kind}] {size}  {child.Name}");
+        count++;
     }
-}
 
-static string Redact(string? value)
-    => string.IsNullOrEmpty(value)
-        ? "(none)"
-        : value.Length <= 8 ? new string('*', value.Length) : value[..4] + "…" + value[^4..];
+    Console.WriteLine($"\n  ({count} item(s))");
+
+    if (!doWrite)
+    {
+        Console.WriteLine("\nPass --write to also run an upload/download/trash round-trip.");
+        return 0;
+    }
+
+    // 4) Round-trip: upload a small file, download it back, verify bytes, then trash it.
+    Console.WriteLine("\n— round-trip —");
+    var payload = $"PAWS round-trip {DateTime.UtcNow:O}";
+    var name = $"paws-roundtrip-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+
+    using var upload = new MemoryStream(Encoding.UTF8.GetBytes(payload));
+    var uploaded = await drive.UploadAsync(root, name, upload, DateTimeOffset.UtcNow).ConfigureAwait(false);
+    Console.WriteLine($"  uploaded   : {uploaded.Name}  (uid={uploaded.Uid})");
+
+    using var download = new MemoryStream();
+    await drive.DownloadAsync(uploaded, download).ConfigureAwait(false);
+    var roundTripped = Encoding.UTF8.GetString(download.ToArray());
+
+    var ok = string.Equals(roundTripped, payload, StringComparison.Ordinal);
+    Console.WriteLine($"  downloaded : {download.Length} B, content match = {(ok ? "YES" : "NO")}");
+
+    await drive.TrashAsync(uploaded).ConfigureAwait(false);
+    Console.WriteLine("  trashed    : test file moved to Drive trash");
+
+    return ok ? 0 : 1;
+}

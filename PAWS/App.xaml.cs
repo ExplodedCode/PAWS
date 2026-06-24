@@ -23,12 +23,9 @@ namespace PAWS
             SettingsStore = new JsonSettingsStore(Paths);
             SecretStore = new DpapiSecretStore(Paths);
 
-            // Primary login is browser-based (session forking) — no password handled in-app,
-            // supports passkeys/2FA, and avoids Proton's anti-abuse blocks.
+            // Login is browser-based (session forking) — no password handled in-app, supports
+            // passkeys/2FA, and avoids Proton's anti-abuse blocks. There is no SRP/password path.
             WebAuthenticator = new WebProtonAuthenticator();
-
-            // SRP/password path kept as an internal fallback (not surfaced in the UI).
-            Authenticator = new StubProtonAuthenticator();
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -40,13 +37,11 @@ namespace PAWS
 
         public ISecretStore SecretStore { get; }
 
-        public IProtonAuthenticator Authenticator { get; }
-
         public IWebProtonAuthenticator WebAuthenticator { get; }
 
         public MainWindow? Window => _window;
 
-        public SetupWorkflow CreateSetupWorkflow() => new(SettingsStore, SecretStore, Authenticator);
+        public SetupWorkflow CreateSetupWorkflow() => new(SettingsStore, SecretStore);
 
         /// <summary>True once at least one Proton account has been added.</summary>
         public bool IsConfigured => SettingsStore.Load().Accounts.Count > 0;

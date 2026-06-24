@@ -5,84 +5,34 @@ using PAWS.Core.Security;
 
 namespace PAWS.Core.Setup;
 
-/// <summary>Result of <see cref="SetupWorkflow.AddAccountAsync"/>.</summary>
+/// <summary>Result of <see cref="SetupWorkflow.AddAccount"/>.</summary>
 public sealed record AddAccountResult(ProtonAuthResult Auth, ProtonAccount? Account)
 {
     public bool IsSuccess => Auth.IsSuccess && Account is not null;
 }
 
 /// <summary>
-/// Orchestrates multi-account setup and management. Authentication produces a resumable session
-/// stored per account (encrypted), while folder mappings live in non-secret settings. Free of
-/// UI/console I/O so it is shared by the console tool and the WinUI app, and is unit-testable.
+/// Orchestrates multi-account setup and management. Authentication (always browser/session-fork)
+/// produces a resumable session stored per account (encrypted), while folder mappings live in
+/// non-secret settings. Free of UI/console I/O so it is shared by the console tool and the WinUI
+/// app, and is unit-testable.
 /// </summary>
 public sealed class SetupWorkflow
 {
     private readonly ISettingsStore _settings;
     private readonly ISecretStore _secrets;
-    private readonly IProtonAuthenticator _authenticator;
 
-    public SetupWorkflow(ISettingsStore settings, ISecretStore secrets, IProtonAuthenticator authenticator)
+    public SetupWorkflow(ISettingsStore settings, ISecretStore secrets)
     {
         _settings = settings;
         _secrets = secrets;
-        _authenticator = authenticator;
     }
 
     /// <summary>
-    /// Authenticates and, on success, registers a NEW account. Multiple accounts are supported —
-    /// even the same Proton email more than once, since accounts are keyed by a generated id.
-    /// Persists the account's resumable session under its id and adds it (with an optional first
-    /// folder) to settings. Nothing is written if authentication fails.
-    /// </summary>
-    public async Task<AddAccountResult> AddAccountAsync(
-        ProtonLoginRequest login,
-        SyncPair? initialPair = null,
-        string? displayName = null,
-        CancellationToken cancellationToken = default)
-    {
-        var auth = await _authenticator.AuthenticateAsync(login, cancellationToken).ConfigureAwait(false);
-        if (!auth.IsSuccess)
-        {
-            return new AddAccountResult(auth, null);
-        }
-
-        var session = auth.Session!;
-        var account = new ProtonAccount
-        {
-            Email = session.Username,
-            DisplayName = string.IsNullOrWhiteSpace(displayName) ? null : displayName.Trim(),
-        };
-
-        if (initialPair is not null)
-        {
-            account.SyncPairs.Add(initialPair);
-        }
-
-        // Persist the resumable session + the data password (for key unlock), keyed by account id.
-        _secrets.SaveSecrets(account.Id, new ProtonSecrets
-        {
-            Username = session.Username,
-            DataPassword = login.MailboxPassword ?? login.Password,
-            SessionId = session.SessionId,
-            AccessToken = session.AccessToken,
-            RefreshToken = session.RefreshToken,
-            UserId = session.UserId,
-            Scopes = session.Scopes,
-            PasswordMode = session.PasswordMode,
-        });
-
-        var settings = _settings.Load();
-        settings.Accounts.Add(account);
-        _settings.Save(settings);
-
-        return new AddAccountResult(auth, account);
-    }
-
-    /// <summary>
-    /// Registers a NEW account from an already-authenticated <see cref="ProtonSession"/> (e.g. one
-    /// obtained via the browser/session-fork flow). Persists its session + key password and adds it
-    /// to settings. Use this for the web login path, where there is no password form to read.
+    /// Registers a NEW account from an already-authenticated <see cref="ProtonSession"/> obtained via
+    /// the browser/session-fork flow. Persists its session + key password and adds it to settings.
+    /// Multiple accounts are supported — even the same Proton email more than once, since accounts are
+    /// keyed by a generated id.
     /// </summary>
     public AddAccountResult AddAccount(ProtonSession session, SyncPair? initialPair = null, string? displayName = null)
     {
