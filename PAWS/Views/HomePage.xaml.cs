@@ -8,6 +8,7 @@ using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using PAWS.Core.Configuration;
+using PAWS.Core.Sync;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
 
@@ -103,8 +104,6 @@ namespace PAWS.Views
             var row = new Grid();
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             row.Children.Add(new TextBlock
             {
@@ -113,10 +112,11 @@ namespace PAWS.Views
                 TextWrapping = TextWrapping.Wrap,
             });
 
-            var browse = new Button { Content = "Browse remote", Margin = new Thickness(8, 0, 0, 0) };
+            var browse = new Button { Content = "Browse" };
             browse.Click += async (_, _) => await BrowseRemoteAsync(account, pair);
-            Grid.SetColumn(browse, 1);
-            row.Children.Add(browse);
+
+            var snapshot = new Button { Content = "Snapshot", Margin = new Thickness(8, 0, 0, 0) };
+            snapshot.Click += async (_, _) => await ShowSnapshotAsync(account, pair);
 
             var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
             open.Click += (_, _) =>
@@ -126,8 +126,6 @@ namespace PAWS.Views
                     Process.Start(new ProcessStartInfo { FileName = pair.LocalPath, UseShellExecute = true });
                 }
             };
-            Grid.SetColumn(open, 2);
-            row.Children.Add(open);
 
             var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
             remove.Click += (_, _) =>
@@ -135,10 +133,80 @@ namespace PAWS.Views
                 App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
                 Refresh();
             };
-            Grid.SetColumn(remove, 3);
-            row.Children.Add(remove);
+
+            var buttons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            buttons.Children.Add(browse);
+            buttons.Children.Add(snapshot);
+            buttons.Children.Add(open);
+            buttons.Children.Add(remove);
+            Grid.SetColumn(buttons, 1);
+            row.Children.Add(buttons);
 
             return row;
+        }
+
+        /// <summary>
+        /// Phase 2 in the UI: capture the full recursive remote snapshot for a folder and show it as an
+        /// indented tree with counts/sizes. Exercises <see cref="RemoteSnapshotBuilder"/> and the
+        /// active-only listing filter via the same connected client as Browse.
+        /// </summary>
+        private async Task ShowSnapshotAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Capturing remote snapshot…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var results = new StackPanel { Spacing = 2 };
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
+            panel.Children.Add(header);
+            panel.Children.Add(results);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Snapshot: {pair.RemotePath}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 460 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
+
+                    var snapshot = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath);
+                    if (snapshot is null)
+                    {
+                        ring.IsActive = false;
+                        status.Text = $"\"{pair.RemotePath}\" is not a folder on Drive.";
+                        return;
+                    }
+
+                    foreach (var entry in snapshot.Entries)
+                    {
+                        var depth = entry.RelativePath.AsSpan().Count('/');
+                        var indent = new string(' ', depth * 4);
+                        var size = entry.IsFile && entry.Size is { } s ? $"   ({FormatSize(s)})" : string.Empty;
+                        results.Children.Add(new TextBlock { Text = $"{indent}{(entry.IsFolder ? "📁" : "📄")} {entry.Name}{size}" });
+                    }
+
+                    ring.IsActive = false;
+                    status.Text = snapshot.Entries.Count == 0
+                        ? "This folder tree is empty."
+                        : $"{snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.";
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Snapshot failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
         }
 
         /// <summary>

@@ -73,7 +73,9 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
         var folderUid = NodeUid.Parse(folder.Uid);
         await foreach (var node in _client.EnumerateFolderChildrenAsync(folderUid, cancellationToken).ConfigureAwait(false))
         {
-            if (node.TrashTime is null)
+            // Only active files and folders: the children listing can also return trashed nodes
+            // (TrashTime set), draft files (FileDraftNode), and photos — none of which we sync.
+            if (node.TrashTime is null && node is FolderNode or FileNode)
             {
                 yield return Map(node);
             }
@@ -165,10 +167,18 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
         }
     }
 
-    public Task TrashAsync(RemoteNode node, CancellationToken cancellationToken = default)
+    public async Task TrashAsync(RemoteNode node, CancellationToken cancellationToken = default)
     {
         EnsureConnected();
-        return _client.TrashNodesAsync([NodeUid.Parse(node.Uid)], cancellationToken).AsTask();
+
+        var uid = NodeUid.Parse(node.Uid);
+        var results = await _client.TrashNodesAsync([uid], cancellationToken).ConfigureAwait(false);
+
+        // TrashNodesAsync reports per-node success/failure rather than throwing — surface failures.
+        if (results.TryGetValue(uid, out var result) && result.TryGetError(out var error))
+        {
+            throw new InvalidOperationException($"Failed to trash '{node.Name}': {error.Message}", error);
+        }
     }
 
     public ValueTask DisposeAsync()

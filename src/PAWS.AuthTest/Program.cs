@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Text;
 using PAWS.Core.Drive;
+using PAWS.Core.Sync;
 using PAWS.Infrastructure.Proton;
+using PAWS.Infrastructure.Storage;
 using PAWS.Proton;
 using PAWS.Proton.Drive;
 
@@ -10,9 +12,14 @@ Console.OutputEncoding = Encoding.UTF8;
 var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "drive";
 var doWrite = args.Contains("--write", StringComparer.OrdinalIgnoreCase);
 
+// First non-flag argument after the mode (e.g. a remote path for --snapshot); defaults to the root.
+var pathArg = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : "/";
+
 return mode switch
 {
     "--cryptocheck" or "cryptocheck" => CryptoCheck(),
+    "--snapshot" or "snapshot" => await SnapshotAsync(pathArg),
+    "--trash" or "trash" => await TrashPathAsync(pathArg),
     _ => await DriveAsync(doWrite),
 };
 
@@ -33,12 +40,9 @@ static int CryptoCheck()
     }
 }
 
-// End-to-end: browser login -> resume SDK session -> Drive list (and optional upload/download/trash).
-static async Task<int> DriveAsync(bool doWrite)
+// Browser/session-fork login -> resume the SDK session -> connected Drive client. Null on failure.
+static async Task<IProtonDriveClient?> SignInAndConnectAsync()
 {
-    Console.WriteLine("PAWS - Proton Drive test\n");
-
-    // 1) Browser/session-fork login (no password handled here).
     var web = new WebProtonAuthenticator();
     var auth = await web.SignInAsync(challenge =>
     {
@@ -52,15 +56,26 @@ static async Task<int> DriveAsync(bool doWrite)
     if (!auth.IsSuccess)
     {
         Console.WriteLine($"  x sign-in failed: {auth.Status}: {auth.Message}");
-        return 1;
+        return null;
     }
 
-    var session = auth.Session!;
-    Console.WriteLine($"  + Signed in as {session.Username}\n");
+    Console.WriteLine($"  + Signed in as {auth.Session!.Username}\n");
 
-    // 2) Resume the SDK session and open the Drive client.
-    await using var drive = new ProtonDriveClientAdapter(await ProtonSessionConnector.ResumeAsync(session).ConfigureAwait(false));
+    var drive = new ProtonDriveClientAdapter(await ProtonSessionConnector.ResumeAsync(auth.Session).ConfigureAwait(false));
     await drive.ConnectAsync().ConfigureAwait(false);
+    return drive;
+}
+
+// End-to-end: browser login -> resume SDK session -> Drive list (and optional upload/download/trash).
+static async Task<int> DriveAsync(bool doWrite)
+{
+    Console.WriteLine("PAWS - Proton Drive test\n");
+
+    await using var drive = await SignInAndConnectAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
 
     var root = await drive.GetRootAsync().ConfigureAwait(false);
     Console.WriteLine($"My files root: uid={root.Uid}\n");
@@ -100,8 +115,129 @@ static async Task<int> DriveAsync(bool doWrite)
     var ok = string.Equals(roundTripped, payload, StringComparison.Ordinal);
     Console.WriteLine($"  downloaded : {download.Length} B, content match = {(ok ? "YES" : "NO")}");
 
-    await drive.TrashAsync(uploaded).ConfigureAwait(false);
-    Console.WriteLine("  trashed    : test file moved to Drive trash");
+    try
+    {
+        await drive.TrashAsync(uploaded).ConfigureAwait(false);
+        Console.WriteLine("  trashed    : test file moved to Drive trash");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  trash FAILED: {ex.Message}");
+    }
 
     return ok ? 0 : 1;
+}
+
+// Phase 2: capture and print the full remote subtree snapshot under a path (default "/").
+static async Task<int> SnapshotAsync(string remotePath)
+{
+    Console.WriteLine($"PAWS - remote snapshot of \"{remotePath}\"\n");
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    Console.WriteLine($"Walking {remotePath} …\n");
+
+    var snapshot = await new RemoteSnapshotBuilder(drive).CaptureAsync(remotePath).ConfigureAwait(false);
+    if (snapshot is null)
+    {
+        Console.WriteLine($"  x \"{remotePath}\" did not resolve to a folder.");
+        return 1;
+    }
+
+    foreach (var entry in snapshot.Entries)
+    {
+        var depth = entry.RelativePath.AsSpan().Count('/');
+        var indent = new string(' ', depth * 2);
+        var marker = entry.IsFolder ? "[DIR ]" : "file  ";
+        var size = entry.IsFile ? $"   ({FormatSize(entry.Size ?? 0)})" : string.Empty;
+        Console.WriteLine($"  {marker} {indent}{entry.Name}{size}");
+    }
+
+    Console.WriteLine($"\n  {snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.");
+    Console.WriteLine($"  captured {snapshot.CapturedUtc:u}");
+    return 0;
+}
+
+// Trash a single node by path (stored creds). Decisive test of the trash result handling + cleanup.
+static async Task<int> TrashPathAsync(string remotePath)
+{
+    if (remotePath is "/" or "")
+    {
+        Console.WriteLine("  x Provide a path to trash, e.g.: --trash paws-roundtrip-….txt");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - trash \"{remotePath}\"\n");
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var node = await drive.ResolvePathAsync(remotePath).ConfigureAwait(false);
+    if (node is null)
+    {
+        Console.WriteLine($"  x Not found: {remotePath}");
+        return 1;
+    }
+
+    Console.WriteLine($"  Found {(node.IsFolder ? "folder" : "file")}: {node.Name}  (uid={node.Uid})");
+
+    try
+    {
+        await drive.TrashAsync(node).ConfigureAwait(false);
+        Console.WriteLine("  + Trashed successfully.");
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Trash FAILED: {ex.Message}");
+        return 1;
+    }
+}
+
+// Connect using an already-configured app account's stored session (no browser login). Exercises the
+// real resume + token-rotation path; null if nothing is configured or the session can't be resumed.
+static async Task<IProtonDriveClient?> ConnectFromStoredAsync()
+{
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured. Add one in the PAWS app (or: PAWS.Setup --weblogin).");
+        return null;
+    }
+
+    Console.WriteLine($"  Using stored account: {account.Label} [{account.Id[..8]}]\n");
+
+    var factory = new ProtonDriveClientFactory(new DpapiSecretStore(paths));
+    try
+    {
+        return await factory.CreateAsync(account.Id).ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Could not resume the stored session: {ex.Message}");
+        Console.WriteLine("    If it mentions a token/session, open the app and click \"Sign in again\", then retry.");
+        return null;
+    }
+}
+
+static string FormatSize(long bytes)
+{
+    string[] units = { "B", "KB", "MB", "GB", "TB" };
+    double size = bytes;
+    var unit = 0;
+    while (size >= 1024 && unit < units.Length - 1)
+    {
+        size /= 1024;
+        unit++;
+    }
+
+    return unit == 0 ? $"{bytes} B" : $"{size:0.#} {units[unit]}";
 }
