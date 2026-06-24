@@ -10,7 +10,7 @@
 
   <PropertyGroup>
     <!-- Windows-only: DPAPI (and later the Cloud Filter API) require Windows. -->
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
