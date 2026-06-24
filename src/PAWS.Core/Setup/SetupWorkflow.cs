@@ -68,6 +68,34 @@ public sealed class SetupWorkflow
         return new AddAccountResult(ProtonAuthResult.Success(session), account);
     }
 
+    /// <summary>
+    /// Re-saves an existing account's session (fresh tokens + key password) after another browser
+    /// login, without creating a new account or disturbing its folder mappings. Use this to recover a
+    /// session whose refresh token has expired/rotated.
+    /// </summary>
+    public void RefreshAccountSession(string accountId, ProtonSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        var settings = _settings.Load();
+        if (settings.Accounts.All(a => a.Id != accountId))
+        {
+            throw new InvalidOperationException($"Unknown account '{accountId}'.");
+        }
+
+        _secrets.SaveSecrets(accountId, new ProtonSecrets
+        {
+            Username = session.Username,
+            DataPassword = session.DataPassword,
+            SessionId = session.SessionId,
+            AccessToken = session.AccessToken,
+            RefreshToken = session.RefreshToken,
+            UserId = session.UserId,
+            Scopes = session.Scopes,
+            PasswordMode = session.PasswordMode,
+        });
+    }
+
     /// <summary>Adds another folder mapping to an existing account (no re-authentication needed).</summary>
     public void AddSyncPair(string accountId, SyncPair pair)
     {

@@ -1,9 +1,11 @@
 using Microsoft.UI.Xaml;
 using PAWS.Core.Abstractions;
+using PAWS.Core.Drive;
 using PAWS.Core.Proton;
 using PAWS.Core.Setup;
 using PAWS.Infrastructure.Proton;
 using PAWS.Infrastructure.Storage;
+using PAWS.Proton.Drive;
 
 namespace PAWS
 {
@@ -26,6 +28,9 @@ namespace PAWS
             // Login is browser-based (session forking) — no password handled in-app, supports
             // passkeys/2FA, and avoids Proton's anti-abuse blocks. There is no SRP/password path.
             WebAuthenticator = new WebProtonAuthenticator();
+
+            // Builds a connected Proton Drive client for an account by resuming its stored session.
+            DriveClientFactory = new ProtonDriveClientFactory(SecretStore);
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -38,6 +43,8 @@ namespace PAWS
         public ISecretStore SecretStore { get; }
 
         public IWebProtonAuthenticator WebAuthenticator { get; }
+
+        public IProtonDriveClientFactory DriveClientFactory { get; }
 
         public MainWindow? Window => _window;
 

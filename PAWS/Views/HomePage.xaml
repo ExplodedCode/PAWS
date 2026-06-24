@@ -32,7 +32,7 @@
                 IsClosable="False"
                 Severity="Informational"
                 Title="Preview build"
-                Message="Authentication uses a stub (no real Proton connection yet) and syncing is not active. This screen manages accounts and folders and confirms credentials are stored securely." />
+                Message="Sign-in and Proton Drive access are live — use &quot;Browse remote&quot; on a folder to list it from your Drive. Automatic two-way syncing is not active yet; this screen manages accounts and folders." />
         </StackPanel>
     </ScrollViewer>
 </Page>

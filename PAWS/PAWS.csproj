@@ -44,6 +44,9 @@
   <ItemGroup>
     <ProjectReference Include="..\src\PAWS.Core\PAWS.Core.csproj" />
     <ProjectReference Include="..\src\PAWS.Infrastructure\PAWS.Infrastructure.csproj" />
+    <!-- Real Proton Drive client (resume session + file ops). Brings in Proton.Sdk + the native
+         proton_crypto.dll, which flow transitively into the app output / MSIX. -->
+    <ProjectReference Include="..\src\PAWS.Proton\PAWS.Proton.csproj" />
   </ItemGroup>
 
   <!--

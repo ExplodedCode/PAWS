@@ -1,7 +1,9 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -52,15 +54,22 @@ namespace PAWS.Views
                 FontWeight = FontWeights.SemiBold,
             };
 
-            var removeAccount = new Button { Content = "Remove account" };
+            var reSignIn = new Button { Content = "Sign in again" };
+            reSignIn.Click += async (_, _) => await ReSignInAsync(account);
+
+            var removeAccount = new Button { Content = "Remove account", Margin = new Thickness(8, 0, 0, 0) };
             removeAccount.Click += async (_, _) => await RemoveAccountAsync(account);
+
+            var headerButtons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            headerButtons.Children.Add(reSignIn);
+            headerButtons.Children.Add(removeAccount);
 
             var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             header.Children.Add(title);
-            Grid.SetColumn(removeAccount, 1);
-            header.Children.Add(removeAccount);
+            Grid.SetColumn(headerButtons, 1);
+            header.Children.Add(headerButtons);
 
             var content = new StackPanel { Spacing = 6 };
             if (account.SyncPairs.Count == 0)
@@ -95,6 +104,7 @@ namespace PAWS.Views
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             row.Children.Add(new TextBlock
             {
@@ -102,6 +112,11 @@ namespace PAWS.Views
                 VerticalAlignment = VerticalAlignment.Center,
                 TextWrapping = TextWrapping.Wrap,
             });
+
+            var browse = new Button { Content = "Browse remote", Margin = new Thickness(8, 0, 0, 0) };
+            browse.Click += async (_, _) => await BrowseRemoteAsync(account, pair);
+            Grid.SetColumn(browse, 1);
+            row.Children.Add(browse);
 
             var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
             open.Click += (_, _) =>
@@ -111,7 +126,7 @@ namespace PAWS.Views
                     Process.Start(new ProcessStartInfo { FileName = pair.LocalPath, UseShellExecute = true });
                 }
             };
-            Grid.SetColumn(open, 1);
+            Grid.SetColumn(open, 2);
             row.Children.Add(open);
 
             var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
@@ -120,10 +135,167 @@ namespace PAWS.Views
                 App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
                 Refresh();
             };
-            Grid.SetColumn(remove, 2);
+            Grid.SetColumn(remove, 3);
             row.Children.Add(remove);
 
             return row;
+        }
+
+        /// <summary>
+        /// Live proof of the app↔Drive wiring: resume the account's stored session, resolve the pair's
+        /// remote path, and list its contents in a dialog. Runs entirely off the persisted browser login.
+        /// </summary>
+        private async Task BrowseRemoteAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Connecting to Proton Drive…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85 };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var results = new StackPanel { Spacing = 2 };
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 380 };
+            panel.Children.Add(header);
+            panel.Children.Add(results);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Remote folder: {pair.RemotePath}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
+
+                    var folder = await client.ResolvePathAsync(pair.RemotePath);
+                    if (folder is null)
+                    {
+                        ring.IsActive = false;
+                        status.Text = $"Folder not found on Drive: {pair.RemotePath}";
+                        return;
+                    }
+
+                    var count = 0;
+                    await foreach (var child in client.ListChildrenAsync(folder))
+                    {
+                        var size = child.Size is { } s ? $"   ({FormatSize(s)})" : string.Empty;
+                        results.Children.Add(new TextBlock { Text = $"{(child.IsFolder ? "📁" : "📄")}  {child.Name}{size}" });
+                        count++;
+                    }
+
+                    ring.IsActive = false;
+                    status.Text = count == 0 ? "This folder is empty." : $"{count} item(s).";
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Could not list folder: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        /// <summary>
+        /// Re-runs the browser login for an existing account and refreshes its stored session (fresh
+        /// tokens + key password). Recovers an expired/rotated session without touching its folders.
+        /// </summary>
+        private async Task ReSignInAsync(ProtonAccount account)
+        {
+            // The authenticator's challenge callback runs on a background thread, so all UI updates from
+            // it (and from the continuation) must be marshalled back to the UI thread.
+            var ui = DispatcherQueue;
+            using var cts = new CancellationTokenSource();
+
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Opening Proton sign-in…", TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+            var busy = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            busy.Children.Add(ring);
+            busy.Children.Add(status);
+
+            var panel = new StackPanel { Spacing = 12, MinWidth = 380 };
+            panel.Children.Add(busy);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Sign in again — {account.Label}",
+                Content = panel,
+                CloseButtonText = "Cancel",
+                XamlRoot = XamlRoot,
+            };
+
+            // Closing the dialog (Cancel) aborts the sign-in poll.
+            dialog.Closing += (_, _) => cts.Cancel();
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    var result = await App.Instance.WebAuthenticator.SignInAsync(
+                        challenge =>
+                        {
+                            ui.TryEnqueue(async () =>
+                            {
+                                try { await Windows.System.Launcher.LaunchUriAsync(new Uri(challenge.Url)); }
+                                catch { /* user can complete the opened page manually */ }
+
+                                status.Text = $"A Proton login page opened (code {challenge.UserCode}). Finish signing in there…";
+                            });
+
+                            return Task.CompletedTask;
+                        },
+                        cts.Token);
+
+                    ui.TryEnqueue(() =>
+                    {
+                        ring.IsActive = false;
+
+                        if (!result.IsSuccess)
+                        {
+                            status.Text = "Sign-in failed: " + (result.Message ?? "unknown error");
+                            return;
+                        }
+
+                        App.Instance.CreateSetupWorkflow().RefreshAccountSession(account.Id, result.Session!);
+                        status.Text = $"✓ Signed in as {result.Session!.Username}. Session refreshed — you can Browse remote again.";
+                        dialog.CloseButtonText = "Done";
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                    // Dialog was cancelled.
+                }
+                catch (Exception ex)
+                {
+                    ui.TryEnqueue(() =>
+                    {
+                        ring.IsActive = false;
+                        status.Text = "Error: " + ex.Message;
+                    });
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        private static string FormatSize(long bytes)
+        {
+            string[] units = { "B", "KB", "MB", "GB", "TB" };
+            double size = bytes;
+            var unit = 0;
+            while (size >= 1024 && unit < units.Length - 1)
+            {
+                size /= 1024;
+                unit++;
+            }
+
+            return unit == 0 ? $"{bytes} B" : $"{size:0.#} {units[unit]}";
         }
 
         private async Task RemoveAccountAsync(ProtonAccount account)
