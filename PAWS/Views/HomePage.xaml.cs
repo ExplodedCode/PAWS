@@ -118,6 +118,9 @@ namespace PAWS.Views
             var snapshot = new Button { Content = "Snapshot", Margin = new Thickness(8, 0, 0, 0) };
             snapshot.Click += async (_, _) => await ShowSnapshotAsync(account, pair);
 
+            var preview = new Button { Content = "Preview sync", Margin = new Thickness(8, 0, 0, 0) };
+            preview.Click += async (_, _) => await PreviewSyncAsync(account, pair);
+
             var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
             open.Click += (_, _) =>
             {
@@ -137,6 +140,7 @@ namespace PAWS.Views
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             buttons.Children.Add(browse);
             buttons.Children.Add(snapshot);
+            buttons.Children.Add(preview);
             buttons.Children.Add(open);
             buttons.Children.Add(remove);
             Grid.SetColumn(buttons, 1);
@@ -144,6 +148,97 @@ namespace PAWS.Views
 
             return row;
         }
+
+        /// <summary>
+        /// Phase 4 in the UI: capture remote + local snapshots, reconcile against an empty (first-sync)
+        /// state, and show the planned operations. Pure dry run — no files are moved.
+        /// </summary>
+        private async Task PreviewSyncAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Comparing local and remote…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var results = new StackPanel { Spacing = 2 };
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 460 };
+            panel.Children.Add(header);
+            panel.Children.Add(results);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Sync preview: {pair.LocalPath}  ⇄  {pair.RemotePath}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 480 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
+
+                    var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath);
+                    if (remote is null)
+                    {
+                        ring.IsActive = false;
+                        status.Text = $"\"{pair.RemotePath}\" is not a folder on Drive.";
+                        return;
+                    }
+
+                    var local = await Task.Run(() => new LocalSnapshotBuilder().Capture(pair.LocalPath));
+                    if (local is null)
+                    {
+                        ring.IsActive = false;
+                        status.Text = $"Local folder not found: {pair.LocalPath}";
+                        return;
+                    }
+
+                    var ops = new Reconciler().Reconcile(remote, local, SyncState.Empty(pair.Id));
+
+                    ring.IsActive = false;
+
+                    if (ops.Count == 0)
+                    {
+                        status.Text = "Already in sync — nothing to do.";
+                        return;
+                    }
+
+                    status.Text = $"{ops.Count} planned operation(s). Preview only — no files moved.";
+
+                    foreach (var op in ops)
+                    {
+                        results.Children.Add(new TextBlock
+                        {
+                            Text = $"{OperationGlyph(op.Kind)}  {op.RelativePath}{(op.IsFolder ? "/" : string.Empty)}   — {op.Reason}",
+                            TextWrapping = TextWrapping.Wrap,
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Preview failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        private static string OperationGlyph(SyncOperationKind kind) => kind switch
+        {
+            SyncOperationKind.DownloadFile => "⬇ download",
+            SyncOperationKind.UploadFile => "⬆ upload",
+            SyncOperationKind.CreateLocalFolder => "📁⬇ new local folder",
+            SyncOperationKind.CreateRemoteFolder => "📁⬆ new remote folder",
+            SyncOperationKind.DeleteLocal => "🗑 delete local",
+            SyncOperationKind.DeleteRemote => "🗑 delete remote",
+            SyncOperationKind.Conflict => "⚠ conflict",
+            _ => kind.ToString(),
+        };
 
         /// <summary>
         /// Phase 2 in the UI: capture the full recursive remote snapshot for a folder and show it as an

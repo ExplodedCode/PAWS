@@ -20,6 +20,8 @@ return mode switch
     "--cryptocheck" or "cryptocheck" => CryptoCheck(),
     "--snapshot" or "snapshot" => await SnapshotAsync(pathArg),
     "--trash" or "trash" => await TrashPathAsync(pathArg),
+    "--plan" or "plan" => await PlanAsync(),
+    "--plantest" or "plantest" => ReconcileSelfTest(),
     _ => await DriveAsync(doWrite),
 };
 
@@ -159,6 +161,173 @@ static async Task<int> SnapshotAsync(string remotePath)
 
     Console.WriteLine($"\n  {snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.");
     Console.WriteLine($"  captured {snapshot.CapturedUtc:u}");
+    return 0;
+}
+
+// Phase 4: offline self-test of the reconciler diff — fabricated remote/local/last-known snapshots
+// exercising every branch, asserting the resulting operation per path. No network, no config.
+static int ReconcileSelfTest()
+{
+    Console.WriteLine("PAWS - reconciler self-test\n");
+
+    var t0 = new DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+    var t1 = t0.AddHours(1);
+
+    static RemoteEntry RFile(string path, string rev, long size) => new()
+    { RelativePath = path, Name = path, IsFolder = false, Size = size, Uid = "node-" + path, RevisionUid = rev };
+    static RemoteEntry RDir(string path) => new() { RelativePath = path, Name = path, IsFolder = true, Uid = "node-" + path };
+    static LocalEntry LFile(string path, long size, DateTimeOffset m) => new()
+    { RelativePath = path, Name = path, IsFolder = false, Size = size, ModifiedUtc = m };
+    static SyncStateEntry SFile(string path, string rev, long size, DateTimeOffset m) => new()
+    { RelativePath = path, IsFolder = false, RemoteUid = "node-" + path, RemoteRevisionUid = rev, Size = size, LocalModifiedUtc = m };
+
+    var remote = new RemoteSnapshot
+    {
+        RootPath = "/",
+        CapturedUtc = DateTimeOffset.UtcNow,
+        Entries =
+        [
+            RFile("shared.txt", "rev-shared-1", 10),
+            RFile("remote-changed.txt", "rev-rc-2", 22),
+            RFile("local-changed.txt", "rev-lc-1", 30),
+            RFile("both-changed.txt", "rev-bc-2", 40),
+            RFile("deleted-local.txt", "rev-dl-1", 50),
+            RFile("new-remote.txt", "rev-nr-1", 7),
+            RDir("newdir"),
+            RFile("adopt-same.txt", "rev-as-1", 100),
+            RFile("nohist-conflict.txt", "rev-nc-1", 100),
+        ],
+    };
+
+    var local = new LocalSnapshot
+    {
+        RootPath = @"C:\local",
+        CapturedUtc = DateTimeOffset.UtcNow,
+        Entries =
+        [
+            LFile("shared.txt", 10, t0),
+            LFile("remote-changed.txt", 20, t0),
+            LFile("local-changed.txt", 33, t1),
+            LFile("both-changed.txt", 44, t1),
+            LFile("deleted-remote.txt", 60, t0),
+            LFile("new-local.txt", 5, t1),
+            LFile("adopt-same.txt", 100, t0),
+            LFile("nohist-conflict.txt", 200, t0),
+        ],
+    };
+
+    var state = new SyncState
+    {
+        PairId = "p1",
+        Entries =
+        [
+            SFile("shared.txt", "rev-shared-1", 10, t0),
+            SFile("remote-changed.txt", "rev-rc-1", 20, t0),
+            SFile("local-changed.txt", "rev-lc-1", 30, t0),
+            SFile("both-changed.txt", "rev-bc-1", 40, t0),
+            SFile("deleted-local.txt", "rev-dl-1", 50, t0),
+            SFile("deleted-remote.txt", "rev-dr-1", 60, t0),
+        ],
+    };
+
+    var ops = new Reconciler().Reconcile(remote, local, state);
+    var actual = ops.ToDictionary(o => o.RelativePath, o => (SyncOperationKind?)o.Kind, StringComparer.Ordinal);
+
+    var expected = new Dictionary<string, SyncOperationKind?>(StringComparer.Ordinal)
+    {
+        ["shared.txt"] = null,                                       // unchanged both sides
+        ["remote-changed.txt"] = SyncOperationKind.DownloadFile,     // remote newer
+        ["local-changed.txt"] = SyncOperationKind.UploadFile,        // local newer
+        ["both-changed.txt"] = SyncOperationKind.Conflict,           // both changed
+        ["deleted-remote.txt"] = SyncOperationKind.DeleteLocal,      // gone on remote
+        ["deleted-local.txt"] = SyncOperationKind.DeleteRemote,      // gone on local
+        ["new-remote.txt"] = SyncOperationKind.DownloadFile,         // new on remote
+        ["newdir"] = SyncOperationKind.CreateLocalFolder,            // new folder on remote
+        ["new-local.txt"] = SyncOperationKind.UploadFile,            // new on local
+        ["adopt-same.txt"] = null,                                   // no history, same size -> adopt
+        ["nohist-conflict.txt"] = SyncOperationKind.Conflict,        // no history, different size
+    };
+
+    var allOk = true;
+    foreach (var (path, exp) in expected)
+    {
+        actual.TryGetValue(path, out var act);
+        var ok = act == exp;
+        allOk &= ok;
+        Console.WriteLine($"  [{(ok ? "PASS" : "FAIL")}] {path,-22} expected {exp?.ToString() ?? "no-op",-16} got {act?.ToString() ?? "no-op"}");
+    }
+
+    foreach (var op in ops.Where(o => !expected.ContainsKey(o.RelativePath)))
+    {
+        Console.WriteLine($"  [FAIL] unexpected op: {op.Kind} {op.RelativePath}");
+        allOk = false;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine(allOk ? "RECONCILER SELF-TEST PASSED" : "RECONCILER SELF-TEST FAILED");
+    return allOk ? 0 : 1;
+}
+
+// Phase 4: dry-run sync preview for the first configured pair — capture remote + local, reconcile
+// against an empty (first-sync) state, and print the planned operations. Moves no files.
+static async Task<int> PlanAsync()
+{
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    var pair = account?.SyncPairs.FirstOrDefault();
+    if (account is null || pair is null)
+    {
+        Console.WriteLine("  x No account+folder configured. Add one in the PAWS app first.");
+        return 1;
+    }
+
+    Console.WriteLine("PAWS - sync preview (dry run)\n");
+    Console.WriteLine($"  local  : {pair.LocalPath}");
+    Console.WriteLine($"  remote : {pair.RemotePath}\n");
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var remote = await new RemoteSnapshotBuilder(drive).CaptureAsync(pair.RemotePath).ConfigureAwait(false);
+    if (remote is null)
+    {
+        Console.WriteLine($"  x Remote path is not a folder: {pair.RemotePath}");
+        return 1;
+    }
+
+    var local = new LocalSnapshotBuilder().Capture(pair.LocalPath);
+    if (local is null)
+    {
+        Console.WriteLine($"  x Local folder not found: {pair.LocalPath}");
+        return 1;
+    }
+
+    Console.WriteLine($"  remote: {remote.FolderCount} folder(s), {remote.FileCount} file(s)");
+    Console.WriteLine($"  local : {local.FolderCount} folder(s), {local.FileCount} file(s)\n");
+
+    var ops = new Reconciler().Reconcile(remote, local, SyncState.Empty(pair.Id));
+
+    if (ops.Count == 0)
+    {
+        Console.WriteLine("Already in sync — nothing to do.");
+        return 0;
+    }
+
+    Console.WriteLine($"Planned operations ({ops.Count}):");
+    foreach (var op in ops)
+    {
+        Console.WriteLine($"  {op.Kind,-18} {op.RelativePath}{(op.IsFolder ? "/" : string.Empty)}   — {op.Reason}");
+    }
+
+    Console.WriteLine("\nSummary:");
+    foreach (var group in ops.GroupBy(o => o.Kind))
+    {
+        Console.WriteLine($"  {group.Count(),4}  {group.Key}");
+    }
+
     return 0;
 }
 
