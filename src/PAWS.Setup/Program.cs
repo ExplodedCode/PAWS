@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using PAWS.Core.Abstractions;
 using PAWS.Core.Configuration;
@@ -19,6 +20,7 @@ internal static class Program
         return mode switch
         {
             "--selftest" or "selftest" => SelfTest(),
+            "--weblogin" or "weblogin" => await WebLoginAsync().ConfigureAwait(false),
             "--show" or "show" => Show(BuildPaths()),
             "--reset" or "reset" => Reset(BuildPaths()),
             "--help" or "-h" or "help" => Help(),
@@ -103,6 +105,52 @@ internal static class Program
         return 0;
     }
 
+    // ---------------------------------------------------------------- web (browser) login ----
+
+    private static async Task<int> WebLoginAsync()
+    {
+        var paths = BuildPaths();
+        var settingsStore = new JsonSettingsStore(paths);
+        var secretStore = new DpapiSecretStore(paths);
+        var workflow = new SetupWorkflow(settingsStore, secretStore, new StubProtonAuthenticator());
+        var web = new WebProtonAuthenticator();
+
+        Header();
+        Console.WriteLine("Sign in with your browser (supports passkeys / 2FA). A Proton login page will open.\n");
+
+        var result = await web.SignInAsync(challenge =>
+        {
+            Console.WriteLine($"Opening: {challenge.Url}\n");
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = challenge.Url, UseShellExecute = true });
+            }
+            catch
+            {
+                Console.WriteLine("(Could not open a browser automatically - paste the URL above into your browser.)");
+            }
+
+            Console.WriteLine("Waiting for you to finish signing in on the website…");
+            return Task.CompletedTask;
+        }).ConfigureAwait(false);
+
+        if (!result.IsSuccess)
+        {
+            Console.WriteLine($"\n  x {result.Status}: {result.Message}");
+            return 1;
+        }
+
+        var session = result.Session!;
+        var added = workflow.AddAccount(session);
+
+        Console.WriteLine($"\n  + Signed in as {session.Username}");
+        Console.WriteLine($"  + Account {added.Account!.Id[..8]} stored securely (DPAPI).");
+        Console.WriteLine($"    session id   : {session.SessionId}");
+        Console.WriteLine($"    key password : {(string.IsNullOrEmpty(session.DataPassword) ? "(none)" : "recovered + stored")}");
+        Console.WriteLine("\nRun with --show to see configured accounts.");
+        return 0;
+    }
+
     // ---------------------------------------------------------------- other commands ----
 
     private static int Show(PawsPaths paths)
@@ -163,6 +211,7 @@ internal static class Program
         Header();
         Console.WriteLine("Usage: PAWS.Setup [command]\n");
         Console.WriteLine("  (no args)    Interactive setup: add a Proton account + folder, store securely.");
+        Console.WriteLine("  --weblogin   Sign in with your browser (passkeys/2FA), no password typed into PAWS.");
         Console.WriteLine("  --show       List configured accounts and their folders (secrets redacted).");
         Console.WriteLine("  --reset      Delete ALL stored credentials and settings.");
         Console.WriteLine("  --selftest   Non-interactive multi-account storage round-trip check (temp folder).");

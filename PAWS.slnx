@@ -5,8 +5,10 @@
     <Platform Name="x86" />
   </Configurations>
   <Folder Name="/src/">
+    <Project Path="src/PAWS.AuthTest/PAWS.AuthTest.csproj" />
     <Project Path="src/PAWS.Core/PAWS.Core.csproj" />
     <Project Path="src/PAWS.Infrastructure/PAWS.Infrastructure.csproj" />
+    <Project Path="src/PAWS.Proton/PAWS.Proton.csproj" />
     <Project Path="src/PAWS.Setup/PAWS.Setup.csproj" />
   </Folder>
   <Project Path="PAWS/PAWS.csproj">

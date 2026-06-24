@@ -10,6 +10,13 @@ public sealed class ProtonSession
     public required string RefreshToken { get; init; }
     public string[] Scopes { get; init; } = Array.Empty<string>();
 
-    /// <summary>"single" or "dual".</summary>
+    /// <summary>"single", "dual", or "web".</summary>
     public string PasswordMode { get; init; } = "single";
+
+    /// <summary>
+    /// The key/mailbox password needed to unlock encryption keys, when it is known at auth time
+    /// (e.g. returned by the browser/session-fork flow). Null for the SRP path, where the caller
+    /// supplies it from the login form instead.
+    /// </summary>
+    public string? DataPassword { get; init; }
 }

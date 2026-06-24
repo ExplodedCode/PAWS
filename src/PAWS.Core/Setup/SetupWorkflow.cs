@@ -79,6 +79,45 @@ public sealed class SetupWorkflow
         return new AddAccountResult(auth, account);
     }
 
+    /// <summary>
+    /// Registers a NEW account from an already-authenticated <see cref="ProtonSession"/> (e.g. one
+    /// obtained via the browser/session-fork flow). Persists its session + key password and adds it
+    /// to settings. Use this for the web login path, where there is no password form to read.
+    /// </summary>
+    public AddAccountResult AddAccount(ProtonSession session, SyncPair? initialPair = null, string? displayName = null)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        var account = new ProtonAccount
+        {
+            Email = session.Username,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? null : displayName.Trim(),
+        };
+
+        if (initialPair is not null)
+        {
+            account.SyncPairs.Add(initialPair);
+        }
+
+        _secrets.SaveSecrets(account.Id, new ProtonSecrets
+        {
+            Username = session.Username,
+            DataPassword = session.DataPassword,
+            SessionId = session.SessionId,
+            AccessToken = session.AccessToken,
+            RefreshToken = session.RefreshToken,
+            UserId = session.UserId,
+            Scopes = session.Scopes,
+            PasswordMode = session.PasswordMode,
+        });
+
+        var settings = _settings.Load();
+        settings.Accounts.Add(account);
+        _settings.Save(settings);
+
+        return new AddAccountResult(ProtonAuthResult.Success(session), account);
+    }
+
     /// <summary>Adds another folder mapping to an existing account (no re-authentication needed).</summary>
     public void AddSyncPair(string accountId, SyncPair pair)
     {

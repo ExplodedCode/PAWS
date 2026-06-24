@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net10 to match Proton.Cryptography / Proton.Sdk. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PAWS.Core\PAWS.Core.csproj" />
+
+    <!--
+      Proton's official MIT SDK, built from the local clones under D:\Testing\PAWS.
+      Proton.Sdk transitively brings in Proton.Cryptography and the native proton_crypto.dll.
+      If the clones move, update this relative path (or convert these to local NuGet packages).
+    -->
+    <ProjectReference Include="..\..\..\..\Testing\PAWS\sdk-tech-demo\src\Proton.Sdk\Proton.Sdk.csproj" />
+  </ItemGroup>
+
+  <!--
+    Native GopenPGP/GoSRP library (built from dotnet-crypto's Go source, vendored into the repo).
+    Copied next to the executable so DllImport("proton_crypto") resolves it. Flows to consumers.
+  -->
+  <ItemGroup>
+    <None Include="..\..\native\win-x64\proton_crypto.dll">
+      <Link>proton_crypto.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+</Project>

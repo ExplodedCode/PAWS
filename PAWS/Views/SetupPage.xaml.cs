@@ -1,4 +1,7 @@
 using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using PAWS.Core.Configuration;
@@ -8,9 +11,15 @@ using WinRT.Interop;
 
 namespace PAWS.Views
 {
-    /// <summary>First-run onboarding: capture Proton credentials + a folder mapping, then persist them.</summary>
+    /// <summary>
+    /// First-run / add-account onboarding. Primary login is browser-based (session forking): the user
+    /// signs in on Proton's website, the app receives a forked session, and then picks a folder to sync.
+    /// </summary>
     public sealed partial class SetupPage : Page
     {
+        private ProtonSession? _session;
+        private CancellationTokenSource? _signInCts;
+
         public SetupPage()
         {
             InitializeComponent();
@@ -20,13 +29,89 @@ namespace PAWS.Views
         }
 
         private void OnBackClicked(object sender, RoutedEventArgs e)
-            => App.Instance.Window?.NavigateToHome();
+        {
+            _signInCts?.Cancel();
+            App.Instance.Window?.NavigateToHome();
+        }
 
-        private void OnTwoFactorToggled(object sender, RoutedEventArgs e)
-            => TwoFactorBox.Visibility = TwoFactorToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
+        private async void OnSignInClicked(object sender, RoutedEventArgs e)
+        {
+            // The authenticator runs on background threads (it uses ConfigureAwait(false)), so every
+            // UI touch from its callback or continuation must be marshalled back to the UI thread.
+            var ui = DispatcherQueue;
 
-        private void OnMailboxToggled(object sender, RoutedEventArgs e)
-            => MailboxPasswordInput.Visibility = MailboxToggle.IsOn ? Visibility.Visible : Visibility.Collapsed;
+            ErrorBar.IsOpen = false;
+            _signInCts?.Cancel();
+            _signInCts = new CancellationTokenSource();
+            var token = _signInCts.Token;
+
+            SetSignInBusy(true);
+            SignInStatus.Text = "Opening Proton sign-in…";
+
+            try
+            {
+                var result = await App.Instance.WebAuthenticator.SignInAsync(
+                    challenge =>
+                    {
+                        // Invoked on a background thread — hop to the UI thread to open the browser
+                        // and update status.
+                        ui.TryEnqueue(async () =>
+                        {
+                            try
+                            {
+                                await Windows.System.Launcher.LaunchUriAsync(new Uri(challenge.Url));
+                            }
+                            catch
+                            {
+                                // If the browser can't be launched, the user can still complete it manually.
+                            }
+
+                            SignInInfo.Title = "Finish signing in in your browser";
+                            SignInInfo.Message = $"A Proton login page opened. Verification code: {challenge.UserCode}. Waiting for you to finish…";
+                            SignInInfo.IsOpen = true;
+                        });
+
+                        return Task.CompletedTask;
+                    },
+                    token);
+
+                ui.TryEnqueue(() =>
+                {
+                    SetSignInBusy(false);
+                    SignInInfo.IsOpen = false;
+
+                    if (!result.IsSuccess)
+                    {
+                        SignInStatus.Text = string.Empty;
+                        ShowError(result.Message ?? "Sign-in failed.");
+                        return;
+                    }
+
+                    _session = result.Session!;
+                    SignInStatus.Text = $"✓ Signed in as {_session.Username}";
+                    SignInButton.Content = "Sign in again";
+                    EnableFolderSection(true);
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                ui.TryEnqueue(() =>
+                {
+                    SetSignInBusy(false);
+                    SignInInfo.IsOpen = false;
+                    SignInStatus.Text = string.Empty;
+                });
+            }
+            catch (Exception ex)
+            {
+                ui.TryEnqueue(() =>
+                {
+                    SetSignInBusy(false);
+                    SignInInfo.IsOpen = false;
+                    ShowError(ex.Message);
+                });
+            }
+        }
 
         private async void OnBrowseClicked(object sender, RoutedEventArgs e)
         {
@@ -47,16 +132,11 @@ namespace PAWS.Views
             }
         }
 
-        private async void OnConnectClicked(object sender, RoutedEventArgs e)
+        private void OnFinishClicked(object sender, RoutedEventArgs e)
         {
-            ErrorBar.IsOpen = false;
-
-            var email = EmailBox.Text?.Trim() ?? string.Empty;
-            var password = PasswordInput.Password ?? string.Empty;
-
-            if (string.IsNullOrWhiteSpace(email) || string.IsNullOrEmpty(password))
+            if (_session is null)
             {
-                ShowError("Enter your Proton email and password.");
+                ShowError("Please sign in first.");
                 return;
             }
 
@@ -66,54 +146,33 @@ namespace PAWS.Views
                 return;
             }
 
-            SetBusy(true);
-            try
+            var pair = new SyncPair
             {
-                var login = new ProtonLoginRequest
-                {
-                    Username = email,
-                    Password = password,
-                    TwoFactorCode = TwoFactorToggle.IsOn ? TwoFactorBox.Text?.Trim() : null,
-                    MailboxPassword = MailboxToggle.IsOn ? MailboxPasswordInput.Password : null,
-                };
+                LocalPath = LocalFolderBox.Text.Trim(),
+                RemotePath = string.IsNullOrWhiteSpace(RemotePathBox.Text) ? "/" : RemotePathBox.Text.Trim(),
+                Mode = (SyncMode)Math.Max(0, ModeBox.SelectedIndex),
+            };
 
-                var pair = new SyncPair
-                {
-                    LocalPath = LocalFolderBox.Text.Trim(),
-                    RemotePath = string.IsNullOrWhiteSpace(RemotePathBox.Text) ? "/" : RemotePathBox.Text.Trim(),
-                    Mode = (SyncMode)Math.Max(0, ModeBox.SelectedIndex),
-                };
+            App.Instance.CreateSetupWorkflow().AddAccount(_session, pair, LabelBox.Text?.Trim());
+            App.Instance.Window?.NavigateToHome();
+        }
 
-                var displayName = LabelBox.Text?.Trim();
-                var result = await App.Instance.CreateSetupWorkflow().AddAccountAsync(login, pair, displayName);
-                if (!result.IsSuccess)
-                {
-                    ShowError($"{result.Auth.Status}: {result.Auth.Message}");
-                    return;
-                }
+        private void EnableFolderSection(bool enabled)
+        {
+            FolderSection.IsEnabled = enabled;
+            FolderSection.Opacity = enabled ? 1.0 : 0.5;
+        }
 
-                App.Instance.Window?.NavigateToHome();
-            }
-            catch (Exception ex)
-            {
-                ShowError(ex.Message);
-            }
-            finally
-            {
-                SetBusy(false);
-            }
+        private void SetSignInBusy(bool busy)
+        {
+            SignInBusy.IsActive = busy;
+            SignInButton.IsEnabled = !busy;
         }
 
         private void ShowError(string message)
         {
             ErrorBar.Message = message;
             ErrorBar.IsOpen = true;
-        }
-
-        private void SetBusy(bool busy)
-        {
-            Busy.IsActive = busy;
-            ConnectButton.IsEnabled = !busy;
         }
     }
 }

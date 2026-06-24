@@ -20,50 +20,50 @@
                 <TextBlock Text="Add a Proton account" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
             </StackPanel>
             <TextBlock
-                Text="Sign in to a Proton account and choose a folder to sync. You can add more accounts and more folders later — even the same account twice."
+                Text="Sign in on Proton's website — passkeys and 2FA are supported, and your password is never entered into PAWS. Then choose a folder to sync."
                 TextWrapping="Wrap"
                 Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
 
             <InfoBar x:Name="ErrorBar" Severity="Error" IsOpen="False" IsClosable="True" />
 
-            <TextBlock Text="Proton account" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-            <TextBox x:Name="EmailBox" Header="Email" PlaceholderText="you@proton.me" />
-            <PasswordBox x:Name="PasswordInput" Header="Password" />
-            <TextBox x:Name="LabelBox" Header="Label for this account (optional)" PlaceholderText="e.g. Work or Personal" />
-
-            <ToggleSwitch x:Name="TwoFactorToggle" Header="Two-factor authentication (2FA) is enabled" Toggled="OnTwoFactorToggled" />
-            <TextBox x:Name="TwoFactorBox" Header="2FA code" MaxLength="8" Visibility="Collapsed" />
-
-            <ToggleSwitch x:Name="MailboxToggle" Header="Account uses a separate (second) mailbox password" Toggled="OnMailboxToggled" />
-            <PasswordBox x:Name="MailboxPasswordInput" Header="Mailbox password" Visibility="Collapsed" />
-
-            <TextBlock Text="Folder to sync" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-            <Grid ColumnSpacing="8">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <TextBox x:Name="LocalFolderBox" Header="Local folder" PlaceholderText="C:\Users\you\ProtonSync" IsReadOnly="True" />
-                <Button Grid.Column="1" Content="Browse…" VerticalAlignment="Bottom" Click="OnBrowseClicked" />
-            </Grid>
-            <TextBox x:Name="RemotePathBox" Header="Proton Drive folder" Text="/" PlaceholderText="/Backup/Desktop" />
-            <ComboBox x:Name="ModeBox" Header="Sync mode" HorizontalAlignment="Stretch" SelectedIndex="0">
-                <ComboBoxItem Content="On-demand — placeholders, download when opened" />
-                <ComboBoxItem Content="Full sync — keep every file local" />
-                <ComboBoxItem Content="Cloud-only — download only when pinned" />
-            </ComboBox>
-
-            <StackPanel Orientation="Horizontal" Spacing="12" HorizontalAlignment="Right" Margin="0,12,0,0">
-                <ProgressRing x:Name="Busy" IsActive="False" Width="24" Height="24" VerticalAlignment="Center" />
-                <Button x:Name="ConnectButton" Content="Add account" Style="{StaticResource AccentButtonStyle}" Click="OnConnectClicked" />
+            <!-- Step 1: sign in via browser -->
+            <TextBlock Text="1 · Sign in" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <Button x:Name="SignInButton" Content="Sign in with Proton" Style="{StaticResource AccentButtonStyle}" Click="OnSignInClicked" />
+                <ProgressRing x:Name="SignInBusy" IsActive="False" Width="22" Height="22" VerticalAlignment="Center" />
+                <TextBlock x:Name="SignInStatus" VerticalAlignment="Center" TextWrapping="Wrap" />
             </StackPanel>
+            <InfoBar x:Name="SignInInfo" IsOpen="False" IsClosable="False" Severity="Informational" />
+
+            <!-- Step 2: folder to sync (enabled after sign-in) -->
+            <ContentControl x:Name="FolderSection" IsEnabled="False" Opacity="0.5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                <StackPanel Spacing="14">
+                <TextBlock Text="2 · Folder to sync" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+                <TextBox x:Name="LabelBox" Header="Label for this account (optional)" PlaceholderText="e.g. Work or Personal" />
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox x:Name="LocalFolderBox" Header="Local folder" PlaceholderText="C:\Users\you\ProtonSync" IsReadOnly="True" />
+                    <Button Grid.Column="1" Content="Browse…" VerticalAlignment="Bottom" Click="OnBrowseClicked" />
+                </Grid>
+                <TextBox x:Name="RemotePathBox" Header="Proton Drive folder" Text="/" PlaceholderText="/Backup/Desktop" />
+                <ComboBox x:Name="ModeBox" Header="Sync mode" HorizontalAlignment="Stretch" SelectedIndex="0">
+                    <ComboBoxItem Content="On-demand — placeholders, download when opened" />
+                    <ComboBoxItem Content="Full sync — keep every file local" />
+                    <ComboBoxItem Content="Cloud-only — download only when pinned" />
+                </ComboBox>
+                <Button x:Name="FinishButton" Content="Add account" Style="{StaticResource AccentButtonStyle}" Click="OnFinishClicked" HorizontalAlignment="Right" Margin="0,12,0,0" />
+                </StackPanel>
+            </ContentControl>
 
             <InfoBar
                 IsOpen="True"
                 IsClosable="False"
                 Severity="Informational"
                 Title="Preview build"
-                Message="This build validates input and securely stores credentials, but does not connect to Proton yet (stub authenticator)." />
+                Message="Sign-in is live against Proton. Syncing is not active yet — this stores the account and a folder mapping." />
         </StackPanel>
     </ScrollViewer>
 </Page>

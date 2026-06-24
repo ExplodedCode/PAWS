@@ -23,7 +23,11 @@ namespace PAWS
             SettingsStore = new JsonSettingsStore(Paths);
             SecretStore = new DpapiSecretStore(Paths);
 
-            // TODO: swap StubProtonAuthenticator for the real Proton.Sdk-backed adapter (PAWS.Proton).
+            // Primary login is browser-based (session forking) — no password handled in-app,
+            // supports passkeys/2FA, and avoids Proton's anti-abuse blocks.
+            WebAuthenticator = new WebProtonAuthenticator();
+
+            // SRP/password path kept as an internal fallback (not surfaced in the UI).
             Authenticator = new StubProtonAuthenticator();
         }
 
@@ -37,6 +41,8 @@ namespace PAWS
         public ISecretStore SecretStore { get; }
 
         public IProtonAuthenticator Authenticator { get; }
+
+        public IWebProtonAuthenticator WebAuthenticator { get; }
 
         public MainWindow? Window => _window;
 
