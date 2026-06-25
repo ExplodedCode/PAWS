@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
+using PAWS.Core.Drive;
 using PAWS.Core.Sync;
 using Vanara.Extensions;
+using Vanara.InteropServices;
 using Vanara.PInvoke;
 using static Vanara.PInvoke.CldApi;
 
@@ -8,9 +10,10 @@ namespace PAWS.CloudFilter;
 
 /// <summary>
 /// <see cref="IPlaceholderEngine"/> over the Win32 Cloud Filter API (cldapi.dll, via Vanara). Registers
-/// a local folder as a cloud sync root and mirrors a remote tree into it as on-demand placeholders.
-/// Each placeholder stores a file-identity blob (the remote node's revision/UID) so the connected
-/// provider can hydrate it on access (handled separately).
+/// a local folder as a cloud sync root and serves it on demand: directory enumeration populates a
+/// folder's placeholders lazily (FETCH_PLACEHOLDERS, answered from the remote snapshot), and opening a
+/// file hydrates it (FETCH_DATA, answered by downloading from Proton Drive). Each placeholder stores a
+/// file-identity blob (the remote node's revision/UID).
 /// </summary>
 public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 {
@@ -37,7 +40,8 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             },
             Population = new CF_POPULATION_POLICY
             {
-                Primary = CF_POPULATION_POLICY_PRIMARY.CF_POPULATION_POLICY_FULL,
+                // Lazy: folders are populated on first enumeration via FETCH_PLACEHOLDERS.
+                Primary = CF_POPULATION_POLICY_PRIMARY.CF_POPULATION_POLICY_PARTIAL,
                 Modifier = CF_POPULATION_POLICY_MODIFIER.CF_POPULATION_POLICY_MODIFIER_NONE,
             },
             InSync = CF_INSYNC_POLICY.CF_INSYNC_POLICY_TRACK_ALL,
@@ -58,8 +62,7 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         var skipped = 0;
 
         // Group entries by their parent folder's relative path (root = ""), so we can create each
-        // folder's children in one CfCreatePlaceholders call. Folders are processed parent-first
-        // (the snapshot is sorted by path) so a subfolder placeholder exists before we populate it.
+        // folder's children in one CfCreatePlaceholders call. Parent-first (the snapshot is sorted).
         var byParent = remoteSnapshot.Entries
             .GroupBy(e => ParentPath(e.RelativePath))
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -67,14 +70,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         foreach (var parentPath in byParent.Keys.OrderBy(p => p, StringComparer.Ordinal))
         {
             var parentFullPath = Path.Combine(localRoot, parentPath.Replace('/', Path.DirectorySeparatorChar));
-            var children = byParent[parentPath];
+            var infos = new List<CF_PLACEHOLDER_CREATE_INFO>();
 
-            var infos = new List<CF_PLACEHOLDER_CREATE_INFO>(children.Count);
-            var allocated = new List<IntPtr>(children.Count);
-
-            foreach (var child in children)
+            foreach (var child in byParent[parentPath])
             {
-                // Skip entries that already exist on disk (e.g. partially synced).
                 var childFullPath = Path.Combine(localRoot, child.RelativePath.Replace('/', Path.DirectorySeparatorChar));
                 if (File.Exists(childFullPath) || Directory.Exists(childFullPath))
                 {
@@ -82,32 +81,7 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                     continue;
                 }
 
-                var identity = child.IsFolder ? child.Uid : child.RevisionUid ?? child.Uid;
-                var identityPtr = Marshal.StringToCoTaskMemUni(identity);
-                allocated.Add(identityPtr);
-
-                var attributes = child.IsFolder ? FileAttributes.Directory : FileAttributes.Normal;
-                var modified = (child.ModifiedUtc ?? DateTimeOffset.UtcNow).UtcDateTime.ToFileTimeStruct();
-
-                infos.Add(new CF_PLACEHOLDER_CREATE_INFO
-                {
-                    RelativeFileName = child.Name,
-                    FileIdentity = identityPtr,
-                    FileIdentityLength = (uint)((identity.Length + 1) * sizeof(char)),
-                    FsMetadata = new CF_FS_METADATA
-                    {
-                        FileSize = child.IsFolder ? 0 : child.Size ?? 0,
-                        BasicInfo = new Kernel32.FILE_BASIC_INFO
-                        {
-                            FileAttributes = (FileFlagsAndAttributes)attributes,
-                            CreationTime = modified,
-                            LastWriteTime = modified,
-                            ChangeTime = modified,
-                            LastAccessTime = modified,
-                        },
-                    },
-                    Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
-                });
+                infos.Add(BuildPlaceholderInfo(child));
             }
 
             try
@@ -128,19 +102,277 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             }
             finally
             {
-                foreach (var ptr in allocated)
-                {
-                    Marshal.FreeCoTaskMem(ptr);
-                }
+                FreeIdentities(infos);
             }
         }
 
         return new PlaceholderResult(created, skipped, errors);
     }
 
+    public IDisposable Connect(string localRoot, RemoteSnapshot snapshot, FetchPlaceholderData fetchData)
+        => new HydrationConnection(localRoot, snapshot, fetchData);
+
+    // Builds a placeholder for one remote entry. Caller must free the returned info's FileIdentity.
+    private static CF_PLACEHOLDER_CREATE_INFO BuildPlaceholderInfo(RemoteEntry child)
+    {
+        var identity = child.IsFolder ? child.Uid : child.RevisionUid ?? child.Uid;
+        var modified = (child.ModifiedUtc ?? DateTimeOffset.UtcNow).UtcDateTime.ToFileTimeStruct();
+
+        return new CF_PLACEHOLDER_CREATE_INFO
+        {
+            RelativeFileName = child.Name,
+            FileIdentity = Marshal.StringToCoTaskMemUni(identity),
+            FileIdentityLength = (uint)((identity.Length + 1) * sizeof(char)),
+            FsMetadata = new CF_FS_METADATA
+            {
+                FileSize = child.IsFolder ? 0 : child.Size ?? 0,
+                BasicInfo = new Kernel32.FILE_BASIC_INFO
+                {
+                    FileAttributes = (FileFlagsAndAttributes)(child.IsFolder ? FileAttributes.Directory : FileAttributes.Normal),
+                    CreationTime = modified,
+                    LastWriteTime = modified,
+                    ChangeTime = modified,
+                    LastAccessTime = modified,
+                },
+            },
+            Flags = CF_PLACEHOLDER_CREATE_FLAGS.CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
+        };
+    }
+
+    private static void FreeIdentities(IEnumerable<CF_PLACEHOLDER_CREATE_INFO> infos)
+    {
+        foreach (var info in infos)
+        {
+            if (info.FileIdentity != IntPtr.Zero)
+            {
+                Marshal.FreeCoTaskMem(info.FileIdentity);
+            }
+        }
+    }
+
     private static string ParentPath(string relativePath)
     {
         var slash = relativePath.LastIndexOf('/');
         return slash < 0 ? string.Empty : relativePath[..slash];
+    }
+
+    /// <summary>
+    /// A live provider connection. Serves FETCH_PLACEHOLDERS (directory enumeration → the folder's
+    /// children from the snapshot) and FETCH_DATA (file open → download via the caller's callback).
+    /// The native callbacks run on Cloud Filter threads; the (network) download is offloaded to a worker.
+    /// </summary>
+    private sealed class HydrationConnection : IDisposable
+    {
+        private const int ChunkSize = 1 << 20; // 1 MiB transfer chunks
+
+        private readonly CF_CALLBACK _fetchDataCallback;          // must outlive the connection (native ref)
+        private readonly CF_CALLBACK _fetchPlaceholdersCallback;  // must outlive the connection
+        private readonly CF_CALLBACK_REGISTRATION[] _callbacks;   // must outlive the connection
+        private readonly FetchPlaceholderData _fetchData;
+        private readonly Dictionary<string, List<RemoteEntry>> _childrenByParent;
+        private readonly string _localRootNormalized;
+        private readonly CF_CONNECTION_KEY _connectionKey;
+
+        // Serializes hydration: the Proton SDK's native crypto is not safe under concurrent downloads,
+        // and a single file open fires several FETCH_DATA (multiple ranges + thumbnail/preview). We
+        // download each file once and cache it, serving every requested range from memory.
+        private readonly SemaphoreSlim _downloadGate = new(1, 1);
+        private string? _cachedIdentity;
+        private byte[]? _cachedData;
+        private bool _disposed;
+
+        public HydrationConnection(string localRoot, RemoteSnapshot snapshot, FetchPlaceholderData fetchData)
+        {
+            _fetchData = fetchData;
+            _childrenByParent = snapshot.Entries
+                .GroupBy(e => ParentPath(e.RelativePath))
+                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+
+            // Cloud Filter callback paths are volume-relative (no drive letter), e.g. "\Folder\Sub".
+            _localRootNormalized = localRoot.Length >= 2 ? localRoot[2..] : localRoot;
+
+            _fetchDataCallback = OnFetchData;
+            _fetchPlaceholdersCallback = OnFetchPlaceholders;
+            _callbacks =
+            [
+                new CF_CALLBACK_REGISTRATION { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS, Callback = _fetchPlaceholdersCallback },
+                new CF_CALLBACK_REGISTRATION { Type = CF_CALLBACK_TYPE.CF_CALLBACK_TYPE_FETCH_DATA, Callback = _fetchDataCallback },
+                CF_CALLBACK_REGISTRATION.CF_CALLBACK_REGISTRATION_END,
+            ];
+
+            CfConnectSyncRoot(
+                localRoot,
+                _callbacks,
+                IntPtr.Zero,
+                CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH | CF_CONNECT_FLAGS.CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO,
+                out _connectionKey).ThrowIfFailed();
+        }
+
+        // Directory enumeration: populate the folder's placeholders from the snapshot (in-memory, fast).
+        private void OnFetchPlaceholders(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParameters)
+        {
+            var operation = CreateOperationInfo(callbackInfo, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
+
+            var relativeFolder = ToRelativeFolder(callbackInfo.NormalizedPath);
+            var children = _childrenByParent.TryGetValue(relativeFolder, out var list) ? list : [];
+            var infos = children.Select(BuildPlaceholderInfo).ToArray();
+
+            using var array = new SafeNativeArray<CF_PLACEHOLDER_CREATE_INFO>(infos);
+            try
+            {
+                var transfer = new CF_OPERATION_PARAMETERS.TRANSFERPLACEHOLDERS
+                {
+                    PlaceholderArray = array,
+                    PlaceholderCount = (uint)infos.Length,
+                    PlaceholderTotalCount = (uint)infos.Length,
+                    // Tell the platform this folder is fully provided — don't ask again.
+                    Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+                    // CompletionStatus left default (STATUS_SUCCESS).
+                };
+                var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
+                CfExecute(operation, ref parameters);
+            }
+            finally
+            {
+                FreeIdentities(infos);
+            }
+        }
+
+        // File open: download the content and feed back the requested byte range.
+        private void OnFetchData(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParameters)
+        {
+            // The callback structs (and the FileIdentity pointer) are only valid for this call, so copy
+            // out everything the worker needs before returning.
+            var operation = CreateOperationInfo(callbackInfo, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_DATA);
+            var identity = Marshal.PtrToStringUni(callbackInfo.FileIdentity) ?? string.Empty;
+            var offset = callbackParameters.FetchData.RequiredFileOffset;
+            var length = callbackParameters.FetchData.RequiredLength;
+
+            _ = Task.Run(() => TransferAsync(operation, identity, offset, length));
+        }
+
+        private async Task TransferAsync(CF_OPERATION_INFO operation, string identity, long offset, long length)
+        {
+            try
+            {
+                // Serialize the whole hydration (download + transfer) — see _downloadGate.
+                await _downloadGate.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (!string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) || _cachedData is null)
+                    {
+                        using var buffer = new MemoryStream();
+                        await _fetchData(identity, buffer, CancellationToken.None).ConfigureAwait(false);
+                        _cachedData = buffer.ToArray(); // exact-sized
+                        _cachedIdentity = identity;
+                    }
+
+                    var data = _cachedData;
+                    var total = data.Length;
+
+                    if (offset > total)
+                    {
+                        offset = total;
+                    }
+
+                    if (offset + length > total)
+                    {
+                        length = total - offset;
+                    }
+
+                    TransferRange(operation, data, offset, length);
+                }
+                finally
+                {
+                    _downloadGate.Release();
+                }
+            }
+            catch
+            {
+                TransferError(operation, offset, length);
+            }
+        }
+
+        private static unsafe void TransferRange(CF_OPERATION_INFO operation, byte[] data, long offset, long length)
+        {
+            if (length <= 0)
+            {
+                return;
+            }
+
+            long sent = 0;
+            while (sent < length)
+            {
+                var chunk = (int)Math.Min(ChunkSize, length - sent);
+                fixed (byte* pointer = &data[(int)(offset + sent)])
+                {
+                    var transfer = new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                    {
+                        Length = chunk,
+                        Offset = offset + sent,
+                        Buffer = (IntPtr)pointer,
+                        Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                    };
+                    var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
+                    CfExecute(operation, ref parameters);
+                }
+
+                sent += chunk;
+            }
+        }
+
+        private static void TransferError(CF_OPERATION_INFO operation, long offset, long length)
+        {
+            var transfer = new CF_OPERATION_PARAMETERS.TRANSFERDATA
+            {
+                Length = Math.Max(1, length),
+                Offset = offset,
+                Buffer = IntPtr.Zero,
+                Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                CompletionStatus = new NTStatus(0xC0000001u), // STATUS_UNSUCCESSFUL
+            };
+            var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
+            CfExecute(operation, ref parameters);
+        }
+
+        private static CF_OPERATION_INFO CreateOperationInfo(in CF_CALLBACK_INFO callbackInfo, CF_OPERATION_TYPE type)
+        {
+            var operation = new CF_OPERATION_INFO
+            {
+                Type = type,
+                ConnectionKey = callbackInfo.ConnectionKey,
+                TransferKey = callbackInfo.TransferKey,
+                CorrelationVector = callbackInfo.CorrelationVector,
+                RequestKey = callbackInfo.RequestKey,
+            };
+            operation.StructSize = (uint)Marshal.SizeOf(operation);
+            return operation;
+        }
+
+        private string ToRelativeFolder(string normalizedPath)
+        {
+            if (normalizedPath.StartsWith(_localRootNormalized, StringComparison.OrdinalIgnoreCase))
+            {
+                return normalizedPath[_localRootNormalized.Length..].TrimStart('\\').Replace('\\', '/');
+            }
+
+            return normalizedPath.Replace('\\', '/');
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            CfDisconnectSyncRoot(_connectionKey);
+            _cachedData = null;
+            _downloadGate.Dispose();
+            GC.KeepAlive(_fetchDataCallback);
+            GC.KeepAlive(_fetchPlaceholdersCallback);
+            GC.KeepAlive(_callbacks);
+        }
     }
 }

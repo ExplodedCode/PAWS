@@ -30,9 +30,98 @@ return mode switch
     "--plantest" or "plantest" => ReconcileSelfTest(),
     "--sync" or "sync" => await SyncAsync(localArg, remoteArg),
     "--placeholders" or "placeholders" => await PlaceholdersAsync(localArg, remoteArg),
+    "--hydrate" or "hydrate" => await HydrateAsync(localArg, remoteArg),
     "--unregister" or "unregister" => Unregister(localArg),
     _ => await DriveAsync(doWrite),
 };
+
+// Phase 3b: full on-demand round-trip — register + placeholders + connect the provider, then READ a
+// placeholder (which triggers hydration: download from Drive and feed it back), and verify the content.
+static async Task<int> HydrateAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --hydrate <localFolder> <remotePath>");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - hydration test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var snapshot = await new RemoteSnapshotBuilder(drive).CaptureAsync(remoteOverride).ConfigureAwait(false);
+    if (snapshot is null)
+    {
+        Console.WriteLine($"  x Remote path is not a folder: {remoteOverride}");
+        return 1;
+    }
+
+    var firstFile = snapshot.Entries.FirstOrDefault(e => e.IsFile && e.RevisionUid is not null);
+    if (firstFile is null)
+    {
+        Console.WriteLine("  x No file in the remote folder to hydrate. Put a file in it and retry.");
+        return 1;
+    }
+
+    engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+
+    // Eagerly create placeholders so the root shows content (the sync root doesn't fire
+    // FETCH_PLACEHOLDERS for its own children); the connected provider still answers FETCH_PLACEHOLDERS
+    // (for safety / sub-population) and FETCH_DATA (download on open).
+    var created = engine.CreatePlaceholders(localOverride, snapshot);
+    Console.WriteLine($"Placeholders: created {created.Created}, errors {created.Errors.Count}");
+
+    using var connection = engine.Connect(localOverride, snapshot, async (identity, output, ct) =>
+    {
+        await drive.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
+    });
+    Console.WriteLine("Provider connected.\n");
+
+    // Enumerate the tree — this triggers FETCH_PLACEHOLDERS (the part that hung Explorer before).
+    Console.WriteLine("Enumerating folder (FETCH_PLACEHOLDERS)…");
+    var entries = Directory.EnumerateFileSystemEntries(localOverride, "*", SearchOption.AllDirectories).Order().ToList();
+    foreach (var entry in entries)
+    {
+        var isDir = (File.GetAttributes(entry) & FileAttributes.Directory) != 0;
+        Console.WriteLine($"   {(isDir ? "DIR " : "file")} {Path.GetRelativePath(localOverride, entry)}");
+    }
+
+    Console.WriteLine($"\n  + Enumerated {entries.Count} entr(ies) without hanging.\n");
+
+    var localFile = entries.FirstOrDefault(e => (File.GetAttributes(e) & FileAttributes.Directory) == 0);
+    if (localFile is not null)
+    {
+        Console.WriteLine($"Reading \"{Path.GetRelativePath(localOverride, localFile)}\" — this triggers a download (FETCH_DATA)…");
+        try
+        {
+            var bytes = await File.ReadAllBytesAsync(localFile).ConfigureAwait(false);
+            var preview = Encoding.UTF8.GetString(bytes, 0, Math.Min(80, bytes.Length)).Replace('\n', ' ');
+            Console.WriteLine($"  + Hydrated {bytes.Length} B.  preview: {preview}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  x Read failed: {ex.Message}");
+        }
+    }
+
+    connection.Dispose();
+    engine.UnregisterSyncRoot(localOverride);
+    Console.WriteLine("\nDisconnected + unregistered.");
+    return 0;
+}
+
+// Rebuilds a minimal RemoteNode from a placeholder's stored identity (a revision uid "vol~link~rev").
+static RemoteNode NodeFromIdentity(string identity)
+{
+    var lastTilde = identity.LastIndexOf('~');
+    var nodeUid = lastTilde > 0 ? identity[..lastTilde] : identity;
+    return new RemoteNode { Uid = nodeUid, RevisionUid = identity, Name = string.Empty, IsFolder = false };
+}
 
 // Tears down a Cloud Filter sync root registration (cleanup for testing).
 static int Unregister(string? localFolder)

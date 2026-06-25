@@ -118,8 +118,18 @@ namespace PAWS.Views
             var snapshot = new Button { Content = "Snapshot", Margin = new Thickness(8, 0, 0, 0) };
             snapshot.Click += async (_, _) => await ShowSnapshotAsync(account, pair);
 
-            var sync = new Button { Content = "Sync now", Margin = new Thickness(8, 0, 0, 0), Style = (Style)Application.Current.Resources["AccentButtonStyle"] };
-            sync.Click += async (_, _) => await SyncNowAsync(account, pair);
+            var accent = (Style)Application.Current.Resources["AccentButtonStyle"];
+            var action = new Button { Margin = new Thickness(8, 0, 0, 0), Style = accent };
+            if (pair.Mode == SyncMode.OnDemand)
+            {
+                action.Content = "Set up on-demand";
+                action.Click += async (_, _) => await SetUpOnDemandAsync(account, pair);
+            }
+            else
+            {
+                action.Content = "Sync now";
+                action.Click += async (_, _) => await SyncNowAsync(account, pair);
+            }
 
             var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
             open.Click += (_, _) =>
@@ -133,6 +143,7 @@ namespace PAWS.Views
             var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
             remove.Click += (_, _) =>
             {
+                App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
                 App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
                 Refresh();
             };
@@ -140,13 +151,62 @@ namespace PAWS.Views
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             buttons.Children.Add(browse);
             buttons.Children.Add(snapshot);
-            buttons.Children.Add(sync);
+            buttons.Children.Add(action);
             buttons.Children.Add(open);
             buttons.Children.Add(remove);
             Grid.SetColumn(buttons, 1);
             row.Children.Add(buttons);
 
             return row;
+        }
+
+        /// <summary>
+        /// Brings a folder online as files-on-demand: registers the Cloud Filter sync root, creates
+        /// placeholders for the remote tree, and connects the hydration provider. Non-destructive —
+        /// placeholders occupy no disk space; files download when opened in Explorer.
+        /// </summary>
+        private async Task SetUpOnDemandAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Setting up files-on-demand…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
+            panel.Children.Add(header);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Files-on-demand: {pair.LocalPath}  ⇄  {pair.RemotePath}",
+                Content = panel,
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    if (!App.Instance.CloudSync.IsSupported)
+                    {
+                        ring.IsActive = false;
+                        status.Text = "Files-on-demand isn't available on this Windows version (needs Windows 10 1809+).";
+                        return;
+                    }
+
+                    var count = await App.Instance.CloudSync.EnableAsync(account.Id, pair);
+                    ring.IsActive = false;
+                    status.Text = $"Ready — {count} remote item(s) available on-demand. Click \"Open\" to browse the folder in Explorer; files download automatically when you open them.";
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Setup failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
         }
 
         /// <summary>
@@ -569,6 +629,12 @@ namespace PAWS.Views
 
             App.Instance.CreateSetupWorkflow().AddSyncPair(account.Id, pair);
             Refresh();
+
+            // For an On-demand folder, bring it online immediately (placeholders + hydration provider).
+            if (pair.Mode == SyncMode.OnDemand)
+            {
+                await SetUpOnDemandAsync(account, pair);
+            }
         }
 
         private static async Task<string?> PickFolderAsync()
