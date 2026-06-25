@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using PAWS.CloudFilter;
 using PAWS.Core.Configuration;
 using PAWS.Core.Drive;
 using PAWS.Core.Sync;
@@ -28,8 +29,32 @@ return mode switch
     "--plan" or "plan" => await PlanAsync(),
     "--plantest" or "plantest" => ReconcileSelfTest(),
     "--sync" or "sync" => await SyncAsync(localArg, remoteArg),
+    "--placeholders" or "placeholders" => await PlaceholdersAsync(localArg, remoteArg),
+    "--unregister" or "unregister" => Unregister(localArg),
     _ => await DriveAsync(doWrite),
 };
+
+// Tears down a Cloud Filter sync root registration (cleanup for testing).
+static int Unregister(string? localFolder)
+{
+    if (localFolder is null)
+    {
+        Console.WriteLine("  x Usage: --unregister <localFolder>");
+        return 1;
+    }
+
+    try
+    {
+        new CloudFilterPlaceholderEngine().UnregisterSyncRoot(localFolder);
+        Console.WriteLine($"  + Unregistered sync root: {localFolder}");
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Unregister failed: {ex.Message}");
+        return 1;
+    }
+}
 
 // Offline: proves the native proton_crypto library loads and runs, without a Proton account.
 static int CryptoCheck()
@@ -168,6 +193,74 @@ static async Task<int> SnapshotAsync(string remotePath)
     Console.WriteLine($"\n  {snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.");
     Console.WriteLine($"  captured {snapshot.CapturedUtc:u}");
     return 0;
+}
+
+// Phase 3: register a Cloud Filter sync root and mirror a remote tree into it as on-demand
+// placeholders. `--placeholders <localFolder> <remotePath>`. (Hydration-on-open is a later step.)
+static async Task<int> PlaceholdersAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --placeholders <localFolder> <remotePath>");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - cloud placeholders\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    if (!engine.IsSupported)
+    {
+        Console.WriteLine("  x Cloud Filter API not supported on this OS.");
+        return 1;
+    }
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var snapshot = await new RemoteSnapshotBuilder(drive).CaptureAsync(remoteOverride).ConfigureAwait(false);
+    if (snapshot is null)
+    {
+        Console.WriteLine($"  x Remote path is not a folder: {remoteOverride}");
+        return 1;
+    }
+
+    Console.WriteLine($"Remote: {snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s).\n");
+
+    try
+    {
+        Console.WriteLine("Registering sync root…");
+        engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+        Console.WriteLine("  + registered");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Register failed: {ex.Message}");
+        return 1;
+    }
+
+    Console.WriteLine("Creating placeholders…");
+    var result = engine.CreatePlaceholders(localOverride, snapshot);
+    Console.WriteLine($"  created {result.Created}, skipped {result.Skipped}, errors {result.Errors.Count}");
+    foreach (var error in result.Errors)
+    {
+        Console.WriteLine($"    {error}");
+    }
+
+    const FileAttributes RecallOnDataAccess = (FileAttributes)0x00400000;
+    Console.WriteLine("\nLocal entries (on-demand = no bytes on disk until opened):");
+    foreach (var path in Directory.EnumerateFileSystemEntries(localOverride, "*", SearchOption.AllDirectories).Order())
+    {
+        var attr = File.GetAttributes(path);
+        var isDir = (attr & FileAttributes.Directory) != 0;
+        var onDemand = (attr & (RecallOnDataAccess | FileAttributes.Offline)) != 0;
+        var size = isDir ? string.Empty : $"  ({new FileInfo(path).Length} B logical)";
+        Console.WriteLine($"  {(isDir ? "DIR " : "file")} {(onDemand ? "[on-demand]" : "[local]    ")} {Path.GetRelativePath(localOverride, path)}{size}");
+    }
+
+    return result.Errors.Count == 0 ? 0 : 1;
 }
 
 // Phase 4b: REAL sync (moves files). Uses the first configured pair, or `--sync <local> <remote>`.

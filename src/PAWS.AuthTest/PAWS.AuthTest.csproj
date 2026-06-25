@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\PAWS.Core\PAWS.Core.csproj" />
+    <ProjectReference Include="..\PAWS.CloudFilter\PAWS.CloudFilter.csproj" />
     <ProjectReference Include="..\PAWS.Infrastructure\PAWS.Infrastructure.csproj" />
     <ProjectReference Include="..\PAWS.Proton\PAWS.Proton.csproj" />
   </ItemGroup>

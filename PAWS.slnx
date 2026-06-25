@@ -6,6 +6,7 @@
   </Configurations>
   <Folder Name="/src/">
     <Project Path="src/PAWS.AuthTest/PAWS.AuthTest.csproj" />
+    <Project Path="src/PAWS.CloudFilter/PAWS.CloudFilter.csproj" />
     <Project Path="src/PAWS.Core/PAWS.Core.csproj" />
     <Project Path="src/PAWS.Infrastructure/PAWS.Infrastructure.csproj" />
     <Project Path="src/PAWS.Proton/PAWS.Proton.csproj" />
