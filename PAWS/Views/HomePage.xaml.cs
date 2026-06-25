@@ -118,8 +118,8 @@ namespace PAWS.Views
             var snapshot = new Button { Content = "Snapshot", Margin = new Thickness(8, 0, 0, 0) };
             snapshot.Click += async (_, _) => await ShowSnapshotAsync(account, pair);
 
-            var preview = new Button { Content = "Preview sync", Margin = new Thickness(8, 0, 0, 0) };
-            preview.Click += async (_, _) => await PreviewSyncAsync(account, pair);
+            var sync = new Button { Content = "Sync now", Margin = new Thickness(8, 0, 0, 0), Style = (Style)Application.Current.Resources["AccentButtonStyle"] };
+            sync.Click += async (_, _) => await SyncNowAsync(account, pair);
 
             var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
             open.Click += (_, _) =>
@@ -140,7 +140,7 @@ namespace PAWS.Views
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             buttons.Children.Add(browse);
             buttons.Children.Add(snapshot);
-            buttons.Children.Add(preview);
+            buttons.Children.Add(sync);
             buttons.Children.Add(open);
             buttons.Children.Add(remove);
             Grid.SetColumn(buttons, 1);
@@ -150,10 +150,11 @@ namespace PAWS.Views
         }
 
         /// <summary>
-        /// Phase 4 in the UI: capture remote + local snapshots, reconcile against an empty (first-sync)
-        /// state, and show the planned operations. Pure dry run — no files are moved.
+        /// Phase 4b in the UI: compute the sync plan (capture + reconcile against persisted state) and
+        /// show it. Files move only if the user clicks the primary "Sync N items" button — Close cancels
+        /// (so it doubles as a dry-run preview). After applying, the new last-known state is persisted.
         /// </summary>
-        private async Task PreviewSyncAsync(ProtonAccount account, SyncPair pair)
+        private async Task SyncNowAsync(ProtonAccount account, SyncPair pair)
         {
             var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
             var status = new TextBlock { Text = "Comparing local and remote…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
@@ -169,47 +170,29 @@ namespace PAWS.Views
 
             var dialog = new ContentDialog
             {
-                Title = $"Sync preview: {pair.LocalPath}  ⇄  {pair.RemotePath}",
+                Title = $"Sync: {pair.LocalPath}  ⇄  {pair.RemotePath}",
                 Content = new ScrollViewer { Content = panel, MaxHeight = 480 },
                 CloseButtonText = "Close",
                 XamlRoot = XamlRoot,
             };
 
+            SyncPlan? plan = null;
+
             dialog.Opened += async (_, _) =>
             {
                 try
                 {
-                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
-
-                    var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath);
-                    if (remote is null)
-                    {
-                        ring.IsActive = false;
-                        status.Text = $"\"{pair.RemotePath}\" is not a folder on Drive.";
-                        return;
-                    }
-
-                    var local = await Task.Run(() => new LocalSnapshotBuilder().Capture(pair.LocalPath));
-                    if (local is null)
-                    {
-                        ring.IsActive = false;
-                        status.Text = $"Local folder not found: {pair.LocalPath}";
-                        return;
-                    }
-
-                    var ops = new Reconciler().Reconcile(remote, local, SyncState.Empty(pair.Id));
-
+                    plan = await App.Instance.SyncEngine.PlanAsync(account.Id, pair);
                     ring.IsActive = false;
 
-                    if (ops.Count == 0)
+                    if (plan.Operations.Count == 0)
                     {
                         status.Text = "Already in sync — nothing to do.";
                         return;
                     }
 
-                    status.Text = $"{ops.Count} planned operation(s). Preview only — no files moved.";
-
-                    foreach (var op in ops)
+                    status.Text = $"{plan.Operations.Count} planned operation(s). Review, then Sync — or Close to cancel.";
+                    foreach (var op in plan.Operations)
                     {
                         results.Children.Add(new TextBlock
                         {
@@ -217,11 +200,59 @@ namespace PAWS.Views
                             TextWrapping = TextWrapping.Wrap,
                         });
                     }
+
+                    dialog.PrimaryButtonText = $"Sync {plan.Operations.Count} item(s)";
+                    dialog.DefaultButton = ContentDialogButton.Primary;
                 }
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
-                    status.Text = $"Preview failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                    status.Text = $"Could not plan: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            dialog.PrimaryButtonClick += async (_, e) =>
+            {
+                if (plan is null || plan.Operations.Count == 0)
+                {
+                    return;
+                }
+
+                // Keep the dialog open to show progress and the result.
+                var deferral = e.GetDeferral();
+                e.Cancel = true;
+                dialog.IsPrimaryButtonEnabled = false;
+                dialog.IsEnabled = true;
+                results.Children.Clear();
+                ring.IsActive = true;
+                status.Text = "Applying…";
+
+                try
+                {
+                    var progress = new Progress<SyncProgress>(p =>
+                        status.Text = $"Applying… [{p.Completed + 1}/{p.Total}] {OperationGlyph(p.Current.Kind)} {p.Current.RelativePath}");
+
+                    var result = await App.Instance.SyncEngine.ApplyAsync(account.Id, plan, progress);
+
+                    ring.IsActive = false;
+                    status.Text = $"Done — {result.Completed} applied, {result.Skipped} skipped (conflicts), {result.Failures.Count} failed.";
+
+                    foreach (var failure in result.Failures)
+                    {
+                        results.Children.Add(new TextBlock { Text = $"⚠ {failure.Operation.RelativePath}: {failure.Error}", TextWrapping = TextWrapping.Wrap });
+                    }
+
+                    dialog.PrimaryButtonText = string.Empty; // sync finished — only Close remains
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Sync failed: {ex.Message}";
+                    dialog.IsPrimaryButtonEnabled = true;
+                }
+                finally
+                {
+                    deferral.Complete();
                 }
             };
 

@@ -18,7 +18,22 @@ public sealed class PawsPaths
 
     public string SecretsDirectory { get; }
 
+    /// <summary>Non-secret per-pair sync state (last-known snapshot), e.g. <c>state\{pairId}.json</c>.</summary>
+    public string StateDirectory => Path.Combine(Root, "state");
+
     public string SettingsFile => Path.Combine(Root, "settings.json");
+
+    /// <summary>Per-sync-pair last-known state file.</summary>
+    public string StateFileFor(string pairId)
+    {
+        var safe = new string(pairId.Where(char.IsLetterOrDigit).ToArray());
+        if (string.IsNullOrEmpty(safe))
+        {
+            throw new ArgumentException("Pair id must contain alphanumeric characters.", nameof(pairId));
+        }
+
+        return Path.Combine(StateDirectory, safe + ".json");
+    }
 
     /// <summary>Per-account encrypted secret blob, e.g. <c>secrets\{accountId}.bin</c>.</summary>
     public string SecretsFileFor(string accountId)

@@ -40,13 +40,26 @@ public interface IProtonDriveClient : IAsyncDisposable
     Task DownloadAsync(RemoteNode file, Stream destination, IProgress<TransferProgress>? progress = null, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Uploads <paramref name="content"/> as a child of <paramref name="parentFolder"/>. If a file with
-    /// that name already exists, this creates a new revision of it; otherwise a new file. Returns the
-    /// resulting node. <paramref name="content"/> must be readable and seekable (its length is needed).
+    /// Uploads <paramref name="content"/> as a NEW file named <paramref name="name"/> under
+    /// <paramref name="parentFolder"/>. Throws if a file with that name already exists — use
+    /// <see cref="UploadRevisionAsync"/> to update an existing file. <paramref name="content"/> must be
+    /// readable and seekable (its length is needed).
     /// </summary>
     Task<RemoteNode> UploadAsync(
         RemoteNode parentFolder,
         string name,
+        Stream content,
+        DateTimeOffset? lastModifiedUtc = null,
+        IProgress<TransferProgress>? progress = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Uploads <paramref name="content"/> as a new revision of an existing file (<paramref name="existingFile"/>
+    /// must carry a current <see cref="RemoteNode.RevisionUid"/>). Use this for the "local file changed"
+    /// case, where the remote node already exists.
+    /// </summary>
+    Task<RemoteNode> UploadRevisionAsync(
+        RemoteNode existingFile,
         Stream content,
         DateTimeOffset? lastModifiedUtc = null,
         IProgress<TransferProgress>? progress = null,

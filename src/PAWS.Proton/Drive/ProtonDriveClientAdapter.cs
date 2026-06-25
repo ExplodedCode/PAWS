@@ -121,11 +121,10 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
         var size = content.Length;
         var metadata = new FileUploadMetadata { LastModificationTime = lastModifiedUtc };
 
-        using var uploader = await _client.GetFileUploaderAsync(
+        var uploader = await _client.GetFileUploaderAsync(
             parentUid, name, GuessMediaType(name), size, metadata, overrideExistingDraftByOtherClient: false, cancellationToken).ConfigureAwait(false);
 
-        await using var controller = uploader.UploadFromStream(content, [], UploadProgress(progress), expectedSha1Provider: null, forPhotos: false, cancellationToken);
-        var result = await controller.Completion.ConfigureAwait(false);
+        var result = await CompleteUploadAsync(uploader, content, progress, cancellationToken).ConfigureAwait(false);
 
         return new RemoteNode
         {
@@ -137,6 +136,57 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
             ModifiedUtc = lastModifiedUtc,
             RevisionUid = result.RevisionUid.ToString(),
         };
+    }
+
+    public async Task<RemoteNode> UploadRevisionAsync(
+        RemoteNode existingFile,
+        Stream content,
+        DateTimeOffset? lastModifiedUtc = null,
+        IProgress<TransferProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureConnected();
+
+        if (existingFile.RevisionUid is null)
+        {
+            throw new InvalidOperationException($"'{existingFile.Name}' has no current revision to update.");
+        }
+
+        if (!content.CanSeek)
+        {
+            throw new ArgumentException("Upload content stream must be seekable (its length is needed up front).", nameof(content));
+        }
+
+        var size = content.Length;
+        var metadata = new FileUploadMetadata { LastModificationTime = lastModifiedUtc };
+        var currentRevision = RevisionUid.Parse(existingFile.RevisionUid);
+
+        // Uploads a NEW revision of the existing node (vs. GetFileUploaderAsync, which creates a new
+        // file and would collide with the existing name — NodeWithSameNameExistsException).
+        var uploader = await _client.GetFileRevisionUploaderAsync(currentRevision, size, metadata, cancellationToken).ConfigureAwait(false);
+
+        var result = await CompleteUploadAsync(uploader, content, progress, cancellationToken).ConfigureAwait(false);
+
+        return new RemoteNode
+        {
+            Uid = result.NodeUid.ToString(),
+            ParentUid = existingFile.ParentUid,
+            Name = existingFile.Name,
+            IsFolder = false,
+            Size = size,
+            ModifiedUtc = lastModifiedUtc,
+            RevisionUid = result.RevisionUid.ToString(),
+        };
+    }
+
+    private static async Task<UploadResult> CompleteUploadAsync(
+        FileUploader uploader, Stream content, IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
+    {
+        using (uploader)
+        {
+            await using var controller = uploader.UploadFromStream(content, [], UploadProgress(progress), expectedSha1Provider: null, forPhotos: false, cancellationToken);
+            return await controller.Completion.ConfigureAwait(false);
+        }
     }
 
     public async Task<RemoteNode> CreateFolderAsync(RemoteNode parentFolder, string name, CancellationToken cancellationToken = default)

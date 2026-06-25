@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using PAWS.Core.Configuration;
 using PAWS.Core.Drive;
 using PAWS.Core.Sync;
 using PAWS.Infrastructure.Proton;
@@ -15,6 +16,10 @@ var doWrite = args.Contains("--write", StringComparer.OrdinalIgnoreCase);
 // First non-flag argument after the mode (e.g. a remote path for --snapshot); defaults to the root.
 var pathArg = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : "/";
 
+// Optional explicit local + remote for `--sync <local> <remote>` (safe testing of an arbitrary pair).
+var localArg = args.Length > 1 && !args[1].StartsWith("--", StringComparison.Ordinal) ? args[1] : null;
+var remoteArg = args.Length > 2 && !args[2].StartsWith("--", StringComparison.Ordinal) ? args[2] : null;
+
 return mode switch
 {
     "--cryptocheck" or "cryptocheck" => CryptoCheck(),
@@ -22,6 +27,7 @@ return mode switch
     "--trash" or "trash" => await TrashPathAsync(pathArg),
     "--plan" or "plan" => await PlanAsync(),
     "--plantest" or "plantest" => ReconcileSelfTest(),
+    "--sync" or "sync" => await SyncAsync(localArg, remoteArg),
     _ => await DriveAsync(doWrite),
 };
 
@@ -162,6 +168,75 @@ static async Task<int> SnapshotAsync(string remotePath)
     Console.WriteLine($"\n  {snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.");
     Console.WriteLine($"  captured {snapshot.CapturedUtc:u}");
     return 0;
+}
+
+// Phase 4b: REAL sync (moves files). Uses the first configured pair, or `--sync <local> <remote>`.
+static async Task<int> SyncAsync(string? localOverride, string? remoteOverride)
+{
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured. Add one in the PAWS app first.");
+        return 1;
+    }
+
+    SyncPair pair;
+    if (localOverride is not null && remoteOverride is not null)
+    {
+        pair = new SyncPair { Id = "harnesstest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.FullSync };
+        Console.WriteLine("  (using explicit local/remote override — stable test pair 'harnesstest')");
+    }
+    else
+    {
+        var configured = account.SyncPairs.FirstOrDefault();
+        if (configured is null)
+        {
+            Console.WriteLine("  x No folder configured. Pass: --sync <localPath> <remotePath>");
+            return 1;
+        }
+
+        pair = configured;
+    }
+
+    Console.WriteLine($"PAWS - sync\n  local  : {pair.LocalPath}\n  remote : {pair.RemotePath}\n");
+
+    var engine = new SyncEngine(new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+
+    SyncPlan plan;
+    try
+    {
+        plan = await engine.PlanAsync(account.Id, pair);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Plan failed: {ex.Message}");
+        return 1;
+    }
+
+    Console.WriteLine($"Plan: {plan.Operations.Count} operation(s)");
+    foreach (var op in plan.Operations)
+    {
+        Console.WriteLine($"  {op.Kind,-18} {op.RelativePath}{(op.IsFolder ? "/" : string.Empty)}");
+    }
+
+    if (plan.Operations.Count == 0)
+    {
+        Console.WriteLine("\nAlready in sync — nothing to do.");
+        return 0;
+    }
+
+    Console.WriteLine("\nApplying…");
+    var progress = new Progress<SyncProgress>(p => Console.WriteLine($"  [{p.Completed + 1}/{p.Total}] {p.Current.Kind} {p.Current.RelativePath}"));
+    var result = await engine.ApplyAsync(account.Id, plan, progress);
+
+    Console.WriteLine($"\nDone: {result.Completed} applied, {result.Skipped} skipped (conflicts), {result.Failures.Count} failed.");
+    foreach (var f in result.Failures)
+    {
+        Console.WriteLine($"  FAIL {f.Operation.Kind} {f.Operation.RelativePath}: {f.Error}");
+    }
+
+    return result.AllSucceeded ? 0 : 1;
 }
 
 // Phase 4: offline self-test of the reconciler diff — fabricated remote/local/last-known snapshots

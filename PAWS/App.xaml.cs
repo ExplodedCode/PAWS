@@ -3,6 +3,7 @@ using PAWS.Core.Abstractions;
 using PAWS.Core.Drive;
 using PAWS.Core.Proton;
 using PAWS.Core.Setup;
+using PAWS.Core.Sync;
 using PAWS.Infrastructure.Proton;
 using PAWS.Infrastructure.Storage;
 using PAWS.Proton.Drive;
@@ -31,6 +32,10 @@ namespace PAWS
 
             // Builds a connected Proton Drive client for an account by resuming its stored session.
             DriveClientFactory = new ProtonDriveClientFactory(SecretStore);
+
+            // Sync engine: plan + apply, persisting last-known state per pair.
+            SyncStateStore = new JsonSyncStateStore(Paths);
+            SyncEngine = new SyncEngine(DriveClientFactory, SyncStateStore);
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -45,6 +50,10 @@ namespace PAWS
         public IWebProtonAuthenticator WebAuthenticator { get; }
 
         public IProtonDriveClientFactory DriveClientFactory { get; }
+
+        public ISyncStateStore SyncStateStore { get; }
+
+        public SyncEngine SyncEngine { get; }
 
         public MainWindow? Window => _window;
 
