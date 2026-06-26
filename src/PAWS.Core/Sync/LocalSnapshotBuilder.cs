@@ -30,8 +30,10 @@ public sealed class LocalSnapshotBuilder
 
             foreach (var info in folder.EnumerateFileSystemInfos())
             {
-                // Skip reparse points (symlinks/junctions) to avoid cycles.
-                if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                // Skip symlinks/junctions (cycle risk) — but NOT Cloud Filter placeholders, which are
+                // also reparse points yet are real files we must sync. Symlinks report a LinkTarget;
+                // cloud placeholders do not.
+                if (info.LinkTarget is not null)
                 {
                     continue;
                 }

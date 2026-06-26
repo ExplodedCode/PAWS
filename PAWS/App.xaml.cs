@@ -42,7 +42,7 @@ namespace PAWS
             SyncEngine = new SyncEngine(DriveClientFactory, SyncStateStore);
 
             // Files-on-demand: registers sync roots + serves hydration for On-demand pairs.
-            CloudSync = new CloudSyncService(new CloudFilterPlaceholderEngine(), DriveClientFactory);
+            CloudSync = new CloudSyncService(new CloudFilterPlaceholderEngine(), DriveClientFactory, SyncStateStore);
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>

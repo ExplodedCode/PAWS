@@ -31,6 +31,7 @@ return mode switch
     "--sync" or "sync" => await SyncAsync(localArg, remoteArg),
     "--placeholders" or "placeholders" => await PlaceholdersAsync(localArg, remoteArg),
     "--hydrate" or "hydrate" => await HydrateAsync(localArg, remoteArg),
+    "--pushtest" or "pushtest" => await PushTestAsync(localArg, remoteArg),
     "--unregister" or "unregister" => Unregister(localArg),
     _ => await DriveAsync(doWrite),
 };
@@ -121,6 +122,69 @@ static RemoteNode NodeFromIdentity(string identity)
     var lastTilde = identity.LastIndexOf('~');
     var nodeUid = lastTilde > 0 ? identity[..lastTilde] : identity;
     return new RemoteNode { Uid = nodeUid, RevisionUid = identity, Name = string.Empty, IsFolder = false };
+}
+
+// Phase 3c: two-way on-demand. Enable on-demand on a folder, add a new local file, push changes up,
+// and verify it reached Drive. `--pushtest <localFolder> <remotePath>`.
+static async Task<int> PushTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --pushtest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - on-demand push test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    var pair = new SyncPair { Id = "pushtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
+
+    Console.WriteLine("Enabling on-demand…");
+    var count = await cloud.EnableAsync(account.Id, pair);
+    Console.WriteLine($"  + enabled ({count} remote item(s)).");
+
+    var newName = $"pushed-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    var content = $"Pushed up from an on-demand folder at {DateTime.UtcNow:O}";
+    File.WriteAllText(Path.Combine(localOverride, newName), content);
+    Console.WriteLine($"\nAdded local file: {newName}\nPushing changes up…");
+
+    var result = await cloud.SyncChangesAsync(account.Id, pair);
+    Console.WriteLine($"  applied {result.Completed}, skipped {result.Skipped}, failed {result.Failures.Count}");
+    foreach (var failure in result.Failures)
+    {
+        Console.WriteLine($"    FAIL {failure.Operation.Kind} {failure.Operation.RelativePath}: {failure.Error}");
+    }
+
+    cloud.Disable(pair.Id);
+
+    // Verify + clean up via a fresh client.
+    await using var verify = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (verify is not null)
+    {
+        var snapshot = await new RemoteSnapshotBuilder(verify).CaptureAsync(remoteOverride).ConfigureAwait(false);
+        var found = snapshot?.Entries.Any(e => e.Name == newName) ?? false;
+        Console.WriteLine($"\n  Remote now contains \"{newName}\": {(found ? "YES" : "NO")}");
+
+        var node = await verify.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await verify.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("  cleaned up the remote test file.");
+        }
+    }
+
+    engine.UnregisterSyncRoot(localOverride);
+    new JsonSyncStateStore(paths).Clear(pair.Id);
+    return result.AllSucceeded ? 0 : 1;
 }
 
 // Tears down a Cloud Filter sync root registration (cleanup for testing).

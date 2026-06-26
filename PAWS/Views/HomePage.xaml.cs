@@ -122,8 +122,9 @@ namespace PAWS.Views
             var action = new Button { Margin = new Thickness(8, 0, 0, 0), Style = accent };
             if (pair.Mode == SyncMode.OnDemand)
             {
-                action.Content = "Set up on-demand";
-                action.Click += async (_, _) => await SetUpOnDemandAsync(account, pair);
+                // Always available — the handler sets up on-demand on first use, then pushes local changes.
+                action.Content = "Sync up";
+                action.Click += async (_, _) => await SyncUpAsync(account, pair);
             }
             else
             {
@@ -203,6 +204,66 @@ namespace PAWS.Views
                 {
                     ring.IsActive = false;
                     status.Text = $"Setup failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        /// <summary>
+        /// Pushes local changes in an on-demand folder up to Drive (new files, edits, deletes). Remote
+        /// changes aren't pulled here — they appear as placeholders. Safe: hydration isn't seen as a change.
+        /// </summary>
+        private async Task SyncUpAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Pushing local changes to Proton Drive…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var results = new StackPanel { Spacing = 2 };
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
+            panel.Children.Add(header);
+            panel.Children.Add(results);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Sync up: {pair.LocalPath}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    // First use this session: register the sync root + placeholders + provider.
+                    if (!App.Instance.CloudSync.IsEnabled(pair.Id))
+                    {
+                        status.Text = "Setting up files-on-demand…";
+                        await App.Instance.CloudSync.EnableAsync(account.Id, pair);
+                    }
+
+                    status.Text = "Pushing local changes to Proton Drive…";
+                    var result = await App.Instance.CloudSync.SyncChangesAsync(account.Id, pair);
+                    ring.IsActive = false;
+
+                    status.Text = result.Total == 0
+                        ? "No local changes to push — already up to date."
+                        : $"Pushed {result.Completed} change(s) up.{(result.Failures.Count > 0 ? $" {result.Failures.Count} failed." : string.Empty)}";
+
+                    foreach (var failure in result.Failures)
+                    {
+                        results.Children.Add(new TextBlock { Text = $"⚠ {failure.Operation.RelativePath}: {failure.Error}", TextWrapping = TextWrapping.Wrap });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Sync up failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
                 }
             };
 
