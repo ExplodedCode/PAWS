@@ -34,6 +34,8 @@ return mode switch
     "--pushtest" or "pushtest" => await PushTestAsync(localArg, remoteArg),
     "--watchtest" or "watchtest" => await WatchTestAsync(localArg, remoteArg),
     "--pulltest" or "pulltest" => await PullTestAsync(localArg, remoteArg),
+    "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
+    "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
     _ => await DriveAsync(doWrite),
 };
@@ -346,10 +348,9 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
     }
     ok = ok && pull.Created >= 1 && appeared;
 
-    // Delete it on Drive and pull again. NOTE: the Proton SDK caches already-seen nodes process-wide, so
-    // a single running process won't notice the deletion until it restarts — this is informational here,
-    // not a pass/fail (a fresh process, e.g. `--snapshot`, does see it gone). We still trash for cleanup.
-    Console.WriteLine("\nTrashing the file on Drive, then pulling again (delete detection is informational)…");
+    // Delete it on Drive and pull again — the placeholder should disappear. PullChangesAsync resumes a
+    // fresh session so it sees the deletion; allow a window for Proton's eventual consistency to surface it.
+    Console.WriteLine("\nTrashing the file on Drive, then pulling until the deletion surfaces…");
     await using (var author = await ConnectFromStoredAsync().ConfigureAwait(false))
     {
         var node = author is null ? null : await author.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
@@ -360,12 +361,20 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
         }
     }
 
-    var pull2 = await cloud.PullChangesAsync(account.Id, pair);
-    var removedInProcess = !File.Exists(localFile);
-    Console.WriteLine($"  in-process pull: deleted {pull2.Deleted}; placeholder gone: {(removedInProcess ? "YES" : "NO (expected — SDK process cache; clears on app restart)")}");
+    var removed = false;
+    for (var attempt = 1; attempt <= 12 && !removed; attempt++)
+    {
+        var pull2 = await cloud.PullChangesAsync(account.Id, pair);
+        removed = !File.Exists(localFile);
+        Console.WriteLine($"  attempt {attempt,2}: deleted {pull2.Deleted}; placeholder gone: {(removed ? "YES" : "no")}");
+        if (!removed)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10));
+        }
+    }
+    ok = ok && removed;
 
-    // Best-effort local cleanup of the leftover placeholder so the temp folder is tidy.
-    if (!removedInProcess && File.Exists(localFile))
+    if (File.Exists(localFile))
     {
         try { File.Delete(localFile); } catch { /* ignore */ }
     }
@@ -374,10 +383,155 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
     engine.UnregisterSyncRoot(localOverride);
     new JsonSyncStateStore(paths).Clear(pair.Id);
 
-    // The verified capability in-process is the CREATE/pull path; delete/update detection is gated by the
-    // SDK's process cache and verified separately (fresh process).
-    Console.WriteLine($"\n  RESULT: {(ok ? "PASS (create-pull verified)" : "FAIL")}");
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS (create + delete pull verified)" : "FAIL")}");
     return ok ? 0 : 1;
+}
+
+// Diagnostic: does a LONG-LIVED client (the one a running app keeps) ever notice a remote deletion, or
+// does it stay blind until process restart? Enables on-demand, uploads + pulls a file, trashes it on
+// Drive, then polls PullChangesAsync on the SAME CloudSyncService every 15s for up to 5 minutes, printing
+// when (if ever) the deletion is detected. Settles server-eventual-consistency vs. permanent client cache.
+static async Task<int> DeleteConsistencyTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --deltest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - delete-consistency diagnostic\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    var pair = new SyncPair { Id = "deltest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
+
+    await cloud.EnableAsync(account.Id, pair);
+    var newName = $"deltest-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    var localFile = Path.Combine(localOverride, newName);
+
+    await using (var author = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        var folder = author is null ? null : await author.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+        using var content = new MemoryStream(Encoding.UTF8.GetBytes("delete-consistency probe"));
+        if (folder is not null)
+        {
+            await author!.UploadAsync(folder, newName, content).ConfigureAwait(false);
+        }
+    }
+
+    await cloud.PullChangesAsync(account.Id, pair); // bring it down as a placeholder
+    Console.WriteLine($"  placeholder present after create-pull: {File.Exists(localFile)}");
+
+    var trashUtc = DateTime.UtcNow;
+    await using (var author = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        var node = author is null ? null : await author.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await author!.TrashAsync(node).ConfigureAwait(false);
+        }
+    }
+    Console.WriteLine($"  trashed on Drive at {trashUtc:HH:mm:ss}Z — polling the long-lived client every 15s (max 5 min)…\n");
+
+    var detected = false;
+    for (var attempt = 1; attempt <= 20 && !detected; attempt++)
+    {
+        var pull = await cloud.PullChangesAsync(account.Id, pair);
+        detected = !File.Exists(localFile);
+        var elapsed = (DateTime.UtcNow - trashUtc).TotalSeconds;
+        Console.WriteLine($"  +{elapsed,5:F0}s  attempt {attempt,2}: deleted {pull.Deleted}; gone: {(detected ? "YES" : "no")}");
+        if (!detected)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+        }
+    }
+
+    Console.WriteLine(detected
+        ? "\n  => Long-lived client DID detect the deletion (server eventual consistency; periodic pull suffices)."
+        : "\n  => Long-lived client did NOT detect it within 5 min (needs cache invalidation or restart).");
+
+    if (File.Exists(localFile))
+    {
+        try { File.Delete(localFile); } catch { /* ignore */ }
+    }
+
+    cloud.Disable(pair.Id);
+    engine.UnregisterSyncRoot(localOverride);
+    new JsonSyncStateStore(paths).Clear(pair.Id);
+    return 0;
+}
+
+// Diagnostic: does a FRESH client created per poll (new session each time, in the SAME process) see a
+// remote deletion, or is the staleness process-wide (only a new process clears it)? Uploads a file,
+// trashes it, then polls by creating a brand-new client each iteration and snapshotting. If fresh
+// in-process clients detect it (like a new process does) → per-session cache, an evict-per-pull fixes it.
+// If they don't → the cache is process-wide and only a restart helps.
+static async Task<int> FreshClientPollTestAsync(string remotePath)
+{
+    Console.WriteLine($"PAWS - fresh-client poll diagnostic on \"{remotePath}\"\n");
+
+    var newName = $"freshpoll-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+
+    await using (var author = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (author is null)
+        {
+            return 1;
+        }
+
+        var folder = await author.ResolvePathAsync(remotePath).ConfigureAwait(false);
+        if (folder is null)
+        {
+            Console.WriteLine($"  x Remote folder not found: {remotePath}");
+            return 1;
+        }
+
+        using var content = new MemoryStream(Encoding.UTF8.GetBytes("fresh-client poll probe"));
+        await author.UploadAsync(folder, newName, content).ConfigureAwait(false);
+        Console.WriteLine($"  uploaded {newName}");
+    }
+
+    var trashUtc = DateTime.UtcNow;
+    await using (var author = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        var node = author is null ? null : await author.ResolvePathAsync($"{remotePath.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await author!.TrashAsync(node).ConfigureAwait(false);
+        }
+    }
+    Console.WriteLine($"  trashed at {trashUtc:HH:mm:ss}Z — polling with a NEW client each time (15s, max 5 min)…\n");
+
+    var detected = false;
+    for (var attempt = 1; attempt <= 20 && !detected; attempt++)
+    {
+        await using (var probe = await ConnectFromStoredAsync().ConfigureAwait(false))
+        {
+            var snapshot = probe is null ? null : await new RemoteSnapshotBuilder(probe).CaptureAsync(remotePath).ConfigureAwait(false);
+            var present = snapshot?.Entries.Any(e => e.Name == newName) ?? true;
+            detected = !present;
+            var elapsed = (DateTime.UtcNow - trashUtc).TotalSeconds;
+            Console.WriteLine($"  +{elapsed,5:F0}s  attempt {attempt,2}: file present: {(present ? "yes" : "NO (gone)")}");
+        }
+
+        if (!detected)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+        }
+    }
+
+    Console.WriteLine(detected
+        ? "\n  => A FRESH in-process client DID detect the deletion → per-session cache; evict-per-pull would fix it."
+        : "\n  => Even fresh in-process clients did NOT detect it within 5 min → process-wide cache; only a restart clears it.");
+    return 0;
 }
 
 // Tears down a Cloud Filter sync root registration (cleanup for testing).

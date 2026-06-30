@@ -37,6 +37,8 @@ namespace PAWS.Views
         {
             App.Instance.CloudSync.AutoSyncStarted += OnAutoSyncStarted;
             App.Instance.CloudSync.AutoSyncCompleted += OnAutoSyncCompleted;
+            App.Instance.CloudSync.AutoPullStarted += OnAutoPullStarted;
+            App.Instance.CloudSync.AutoPullCompleted += OnAutoPullCompleted;
             Refresh();
         }
 
@@ -44,6 +46,8 @@ namespace PAWS.Views
         {
             App.Instance.CloudSync.AutoSyncStarted -= OnAutoSyncStarted;
             App.Instance.CloudSync.AutoSyncCompleted -= OnAutoSyncCompleted;
+            App.Instance.CloudSync.AutoPullStarted -= OnAutoPullStarted;
+            App.Instance.CloudSync.AutoPullCompleted -= OnAutoPullCompleted;
         }
 
         private void Refresh()
@@ -186,7 +190,7 @@ namespace PAWS.Views
 
                 // IsChecked is set before the handlers are attached so the initial state doesn't fire them.
                 var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
-                ToolTipService.SetToolTip(auto, "Automatically push local changes to Proton Drive a few seconds after they settle.");
+                ToolTipService.SetToolTip(auto, "Keep this folder in sync automatically: push local changes up a few seconds after they settle, and periodically pull changes made on Proton Drive down.");
                 auto.Checked += async (_, _) => await EnableAutoSyncAsync(account, pair);
                 auto.Unchecked += (_, _) => DisableAutoSync(account, pair);
                 buttons.Children.Add(auto);
@@ -207,7 +211,7 @@ namespace PAWS.Views
             };
             if (pair.Mode == SyncMode.OnDemand && pair.AutoSync)
             {
-                status.Text = "Auto-sync on — watching for changes.";
+                status.Text = "Auto-sync on — watching local changes and polling Drive.";
                 status.Visibility = Visibility.Visible;
             }
 
@@ -237,7 +241,7 @@ namespace PAWS.Views
                 }
 
                 App.Instance.CloudSync.StartAutoSync(account.Id, pair);
-                SetPairStatus(pair.Id, "Auto-sync on — watching for changes.");
+                SetPairStatus(pair.Id, "Auto-sync on — watching local changes and polling Drive.");
             }
             catch (Exception ex)
             {
@@ -272,6 +276,27 @@ namespace PAWS.Views
                 SetPairStatus(e.PairId, result.Total == 0
                     ? $"Auto-sync: up to date · {when}"
                     : $"Auto-sync: pushed {result.Completed} change(s){(result.Failures.Count > 0 ? $", {result.Failures.Count} failed" : string.Empty)} · {when}");
+            });
+        }
+
+        private void OnAutoPullStarted(string pairId)
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: checking Drive for changes…"));
+
+        private void OnAutoPullCompleted(AutoPullEventArgs e)
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (!e.Succeeded)
+                {
+                    SetPairStatus(e.PairId, $"Auto-sync (pull) error: {e.Error!.Message}");
+                    return;
+                }
+
+                var result = e.Result!;
+                var when = DateTime.Now.ToString("t");
+                SetPairStatus(e.PairId, result.Total == 0
+                    ? $"Auto-sync: up to date · {when}"
+                    : $"Auto-sync: pulled {result.Created} new, {result.Updated} changed, {result.Deleted} removed · {when}");
             });
         }
 

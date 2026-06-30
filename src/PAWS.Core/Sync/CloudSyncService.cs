@@ -18,9 +18,16 @@ public sealed class CloudSyncService(
     // Stable provider identity for PAWS sync roots.
     private const string ProviderId = "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64";
 
+    // How often auto-sync polls Drive for remote-side changes (the watcher only sees LOCAL changes), and
+    // the short delay before the first poll so launch isn't slowed by an immediate pull.
+    private static readonly TimeSpan AutoPullInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan AutoPullStartDelay = TimeSpan.FromSeconds(30);
+
     private readonly Dictionary<string, IDisposable> _connections = new(StringComparer.Ordinal); // pairId -> provider
     private readonly Dictionary<string, IProtonDriveClient> _clients = new(StringComparer.Ordinal); // accountId -> client
-    private readonly Dictionary<string, FolderWatcher> _watchers = new(StringComparer.Ordinal); // pairId -> auto-sync watcher
+    private readonly Dictionary<string, FolderWatcher> _watchers = new(StringComparer.Ordinal); // pairId -> auto push watcher
+    private readonly Dictionary<string, Timer> _pullTimers = new(StringComparer.Ordinal); // pairId -> periodic pull timer
+    private readonly HashSet<string> _pullInFlight = new(StringComparer.Ordinal); // pairIds with a pull running
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     // The Drive client (and its native crypto) is shared across folders and is NOT concurrency-safe, so
@@ -35,6 +42,12 @@ public sealed class CloudSyncService(
 
     /// <summary>Raised (off the UI thread) when a watcher-triggered push for a pair finishes.</summary>
     public event Action<AutoSyncEventArgs>? AutoSyncCompleted;
+
+    /// <summary>Raised (off the UI thread) when a periodic auto-pull for a pair begins.</summary>
+    public event Action<string>? AutoPullStarted;
+
+    /// <summary>Raised (off the UI thread) when a periodic auto-pull for a pair finishes.</summary>
+    public event Action<AutoPullEventArgs>? AutoPullCompleted;
 
     public bool IsSupported => placeholderEngine.IsSupported;
 
@@ -179,27 +192,29 @@ public sealed class CloudSyncService(
     /// locally. <b>No content is downloaded</b> (it stays on-demand). Local-only changes are left untouched
     /// (push them with <see cref="SyncChangesAsync"/>), and conflicts (changed on both sides) are skipped,
     /// so a pull can never clobber an unpushed local edit. The provider is (re)connected with the refreshed
-    /// tree afterwards, so the folder shows the new contents.
-    /// <para><b>SDK caveat:</b> the Proton SDK caches nodes process-wide, so a running app sees newly-added
-    /// remote files immediately but only picks up deletions / new revisions of already-seen files on the
-    /// next launch (cold process). See the note inside the method.</para>
+    /// tree afterwards (only if something changed), so the folder shows the new contents.
+    /// <para>To see Drive-side deletions/revisions reliably the pull resumes a fresh Drive session (the
+    /// SDK's per-session cache otherwise hides changes to already-seen files); detection still follows
+    /// Proton's eventual consistency (a just-trashed file can take seconds to surface).</para>
     /// </summary>
     public async Task<PullResult> PullChangesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
-        var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
-
         RemoteSnapshot remote;
         PullResult result;
 
         await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // NOTE (SDK limitation, confirmed 2026-06-30): the Proton SDK keeps a process-wide cache of
-            // nodes it has already seen, which survives even disposing+resuming the session. So within a
-            // running app a pull reliably surfaces NEW remote files (cache miss → fetched) but does NOT
-            // notice files deleted or re-revisioned on Drive after they were first seen — those changes
-            // appear on the next app launch (cold process). The reconcile/placeholder logic below is
-            // correct; it's gated only by what the SDK reports as the current remote tree.
+            // The SDK serves each child's metadata from its per-session entity cache, so a long-lived
+            // client keeps returning a node exactly as it first saw it — it picks up brand-new children
+            // (cache miss → fetched) but NEVER notices a file trashed or re-revisioned on Drive after it
+            // was first seen. Diagnostics (2026-06-30) confirmed this: a cached client missed a deletion
+            // for 5 min, while a fresh client saw it within ~7s. So drop the cached client and resume a
+            // fresh one with a cold cache to read current Drive truth; it becomes the new cached client so
+            // hydration reuses the same single session afterwards.
+            await EvictClientAsync(accountId).ConfigureAwait(false);
+            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+
             remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
             var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
@@ -228,9 +243,15 @@ public sealed class CloudSyncService(
             // changed files.
             placeholderEngine.CreatePlaceholders(pair.LocalPath, remote);
 
+            // Re-capture the local tree so the new state records each pulled placeholder's ACTUAL on-disk
+            // size/mtime. Using the remote entry's values would mismatch when the remote modified-time is
+            // unknown (the placeholder then gets "now"), making the next reconcile see a phantom local edit
+            // and treat a later remote delete as a conflict instead of applying it.
+            var localAfter = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
+
             // Merge the pulled paths into last-known state surgically — paths we didn't touch (e.g. files
             // with unpushed local edits) keep their old baseline, so the next push still detects them.
-            stateStore.Save(MergePulledState(lastKnown, pair.Id, pullOperations));
+            stateStore.Save(MergePulledState(lastKnown, pair.Id, pullOperations, localAfter));
 
             var created = pullOperations.Count(o =>
                 o.Kind == SyncOperationKind.CreateLocalFolder ||
@@ -245,18 +266,26 @@ public sealed class CloudSyncService(
         }
 
         // (Re)connect the provider with the refreshed tree so Explorer shows the new contents and
-        // sub-folder enumeration uses up-to-date data. Done OUTSIDE the client gate so a hydration that is
-        // mid-flight on the old connection can drain before it's disconnected (avoids a callback deadlock).
-        await ReconnectAsync(accountId, pair, remote, cancellationToken).ConfigureAwait(false);
+        // sub-folder enumeration uses up-to-date data. We must connect if not yet connected (first-time
+        // pull → make the folder browsable); if already connected, only reconnect when something actually
+        // changed, so an idle periodic poll doesn't needlessly churn the connection. Done OUTSIDE the
+        // client gate so a hydration mid-flight on the old connection can drain before it's disconnected
+        // (avoids a callback deadlock).
+        if (!IsEnabled(pair.Id) || result.Total > 0)
+        {
+            await ReconnectAsync(accountId, pair, remote, cancellationToken).ConfigureAwait(false);
+        }
 
         return result;
     }
 
     /// <summary>
-    /// Starts (if not already running) a debounced watcher on the pair's local folder that automatically
-    /// pushes settled changes up via <see cref="SyncChangesAsync"/>. Idempotent per pair. The pair should
-    /// already be enabled (so a state baseline exists); the watcher's first push is a no-op if nothing
-    /// changed. Progress is reported through <see cref="AutoSyncStarted"/>/<see cref="AutoSyncCompleted"/>.
+    /// Starts (if not already running) automatic two-way sync for a pair: a debounced watcher pushes
+    /// settled LOCAL changes up via <see cref="SyncChangesAsync"/>, and a periodic timer pulls REMOTE
+    /// changes down via <see cref="PullChangesAsync"/> (the watcher can't see Drive-side changes).
+    /// Idempotent per pair. The pair should already be enabled (so a state baseline exists). Progress is
+    /// reported through <see cref="AutoSyncStarted"/>/<see cref="AutoSyncCompleted"/> (push) and
+    /// <see cref="AutoPullStarted"/>/<see cref="AutoPullCompleted"/> (pull).
     /// </summary>
     public void StartAutoSync(string accountId, SyncPair pair)
     {
@@ -287,21 +316,68 @@ public sealed class CloudSyncService(
 
             _watchers[pair.Id] = watcher;
         }
+
+        lock (_pullTimers)
+        {
+            if (_disposed || _pullTimers.ContainsKey(pair.Id))
+            {
+                return;
+            }
+
+            var timer = new Timer(_ => _ = RunAutoPullAsync(accountId, pair), null, AutoPullStartDelay, AutoPullInterval);
+            _pullTimers[pair.Id] = timer;
+        }
     }
 
-    /// <summary>Stops auto-sync for a pair (the on-demand provider, if any, is left connected).</summary>
+    /// <summary>Stops auto-sync (push watcher + periodic pull) for a pair. The provider stays connected.</summary>
     public void StopAutoSync(string pairId)
     {
         FolderWatcher? watcher;
         lock (_watchers)
         {
-            if (!_watchers.Remove(pairId, out watcher))
+            _watchers.Remove(pairId, out watcher);
+        }
+
+        watcher?.Dispose();
+
+        Timer? timer;
+        lock (_pullTimers)
+        {
+            _pullTimers.Remove(pairId, out timer);
+        }
+
+        timer?.Dispose();
+    }
+
+    // Runs one periodic pull for a pair, guarding against overlap (a slow pull must not pile up behind the
+    // timer). Swallows errors — it's best-effort background work; the next tick retries.
+    private async Task RunAutoPullAsync(string accountId, SyncPair pair)
+    {
+        lock (_pullInFlight)
+        {
+            if (_disposed || !_pullInFlight.Add(pair.Id))
             {
                 return;
             }
         }
 
-        watcher.Dispose();
+        try
+        {
+            AutoPullStarted?.Invoke(pair.Id);
+            var result = await PullChangesAsync(accountId, pair).ConfigureAwait(false);
+            AutoPullCompleted?.Invoke(new AutoPullEventArgs(pair.Id, result, null));
+        }
+        catch (Exception ex)
+        {
+            AutoPullCompleted?.Invoke(new AutoPullEventArgs(pair.Id, null, ex));
+        }
+        finally
+        {
+            lock (_pullInFlight)
+            {
+                _pullInFlight.Remove(pair.Id);
+            }
+        }
     }
 
     /// <summary>True if a watcher is currently auto-syncing this pair.</summary>
@@ -374,11 +450,16 @@ public sealed class CloudSyncService(
     }
 
     // Updates last-known state for ONLY the pulled paths: removes deleted ones and upserts created/changed
-    // ones from their (new) remote entry. Untouched paths keep their existing baseline, so a later push
+    // ones. Remote identity (Uid/RevisionUid) comes from the remote entry; local Size/mtime come from the
+    // freshly-captured placeholder (<paramref name="localAfter"/>) so state matches what the reconciler
+    // will read next time — otherwise a placeholder created with a "now" mtime (remote time unknown) looks
+    // like a local edit on the next pass. Untouched paths keep their existing baseline, so a later push
     // still sees any unpushed local edits as changes.
-    private static SyncState MergePulledState(SyncState current, string pairId, IReadOnlyList<SyncOperation> pulledOperations)
+    private static SyncState MergePulledState(
+        SyncState current, string pairId, IReadOnlyList<SyncOperation> pulledOperations, LocalSnapshot? localAfter)
     {
         var byPath = current.Entries.ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
+        var localByPath = (localAfter?.Entries ?? []).ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
 
         foreach (var op in pulledOperations)
         {
@@ -393,14 +474,18 @@ public sealed class CloudSyncService(
                 continue;
             }
 
+            // The placeholder we just created/updated, if it's actually on disk. Fall back to the remote
+            // values only if the local capture missed it (e.g. a creation that failed).
+            var hasLocal = localByPath.TryGetValue(r.RelativePath, out var l);
+
             byPath[r.RelativePath] = new SyncStateEntry
             {
                 RelativePath = r.RelativePath,
                 IsFolder = r.IsFolder,
                 RemoteUid = r.Uid,
                 RemoteRevisionUid = r.RevisionUid,
-                Size = r.IsFolder ? null : r.Size,
-                LocalModifiedUtc = r.IsFolder ? null : r.ModifiedUtc,
+                Size = r.IsFolder ? null : (hasLocal ? l!.Size : r.Size),
+                LocalModifiedUtc = r.IsFolder ? null : (hasLocal ? l!.ModifiedUtc : r.ModifiedUtc),
             };
         }
 
@@ -429,6 +514,29 @@ public sealed class CloudSyncService(
         {
             _clientGate.Release();
         }
+    }
+
+    // Drops and disposes the cached client for an account so the next GetClientAsync resumes a fresh
+    // session with a COLD entity cache (which reads current Drive state — see PullChangesAsync). Existing
+    // connections keep working: their hydration callback re-resolves the client lazily. Call only while
+    // holding _clientUseGate so no hydration is mid-flight on the client being disposed.
+    private async Task EvictClientAsync(string accountId)
+    {
+        IProtonDriveClient? client;
+        await _clientGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!_clients.Remove(accountId, out client))
+            {
+                return;
+            }
+        }
+        finally
+        {
+            _clientGate.Release();
+        }
+
+        await client.DisposeAsync().ConfigureAwait(false);
     }
 
     private void DisposeConnection(string pairId)
@@ -466,6 +574,18 @@ public sealed class CloudSyncService(
         foreach (var watcher in watchers)
         {
             watcher.Dispose();
+        }
+
+        List<Timer> pullTimers;
+        lock (_pullTimers)
+        {
+            pullTimers = [.. _pullTimers.Values];
+            _pullTimers.Clear();
+        }
+
+        foreach (var timer in pullTimers)
+        {
+            timer.Dispose();
         }
 
         List<IDisposable> connections;
