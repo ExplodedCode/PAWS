@@ -32,6 +32,7 @@ return mode switch
     "--placeholders" or "placeholders" => await PlaceholdersAsync(localArg, remoteArg),
     "--hydrate" or "hydrate" => await HydrateAsync(localArg, remoteArg),
     "--pushtest" or "pushtest" => await PushTestAsync(localArg, remoteArg),
+    "--watchtest" or "watchtest" => await WatchTestAsync(localArg, remoteArg),
     "--unregister" or "unregister" => Unregister(localArg),
     _ => await DriveAsync(doWrite),
 };
@@ -185,6 +186,94 @@ static async Task<int> PushTestAsync(string? localOverride, string? remoteOverri
     engine.UnregisterSyncRoot(localOverride);
     new JsonSyncStateStore(paths).Clear(pair.Id);
     return result.AllSucceeded ? 0 : 1;
+}
+
+// Phase 5: automatic background sync. Enable on-demand, start the debounced FolderWatcher, drop a new
+// local file, and verify the watcher pushes it up on its own (no manual SyncChangesAsync call). Then
+// verify it reached Drive and clean up. `--watchtest <localFolder> <remotePath>`.
+static async Task<int> WatchTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --watchtest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - auto-sync watch test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    var pair = new SyncPair { Id = "watchtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
+
+    // Fires when an auto-sync run actually pushed something up.
+    var pushed = new TaskCompletionSource<SyncResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+    cloud.AutoSyncStarted += id => Console.WriteLine($"  [auto] change detected — syncing…");
+    cloud.AutoSyncCompleted += e =>
+    {
+        if (!e.Succeeded)
+        {
+            Console.WriteLine($"  [auto] error: {e.Error!.Message}");
+        }
+        else
+        {
+            Console.WriteLine($"  [auto] done — pushed {e.Result!.Completed}, total {e.Result.Total}");
+            if (e.Result.Total > 0)
+            {
+                pushed.TrySetResult(e.Result);
+            }
+        }
+    };
+
+    Console.WriteLine("Enabling on-demand…");
+    var count = await cloud.EnableAsync(account.Id, pair);
+    Console.WriteLine($"  + enabled ({count} remote item(s)).");
+
+    cloud.StartAutoSync(account.Id, pair);
+    Console.WriteLine("Auto-sync watcher started (debounced). Adding a local file…");
+
+    var newName = $"watched-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    File.WriteAllText(Path.Combine(localOverride, newName), $"Auto-pushed by the watcher at {DateTime.UtcNow:O}");
+    Console.WriteLine($"  wrote {newName} — waiting for the watcher to push it (≤30s)…\n");
+
+    var finished = await Task.WhenAny(pushed.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+    var timedOut = finished != pushed.Task;
+    if (timedOut)
+    {
+        Console.WriteLine("  x Timed out — the watcher did not push the change.");
+    }
+
+    cloud.StopAutoSync(pair.Id);
+    cloud.Disable(pair.Id);
+
+    // Verify + clean up via a fresh client.
+    var ok = !timedOut;
+    await using var verify = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (verify is not null)
+    {
+        var snapshot = await new RemoteSnapshotBuilder(verify).CaptureAsync(remoteOverride).ConfigureAwait(false);
+        var found = snapshot?.Entries.Any(e => e.Name == newName) ?? false;
+        Console.WriteLine($"  Remote now contains \"{newName}\": {(found ? "YES" : "NO")}");
+        ok = ok && found;
+
+        var node = await verify.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await verify.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("  cleaned up the remote test file.");
+        }
+    }
+
+    engine.UnregisterSyncRoot(localOverride);
+    new JsonSyncStateStore(paths).Clear(pair.Id);
+    return ok ? 0 : 1;
 }
 
 // Tears down a Cloud Filter sync root registration (cleanup for testing).

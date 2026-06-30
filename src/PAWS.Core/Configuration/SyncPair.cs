@@ -18,4 +18,11 @@ public sealed class SyncPair
     public SyncMode Mode { get; set; } = SyncMode.OnDemand;
 
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// When true, PAWS watches the local folder and automatically pushes changes up to Drive shortly
+    /// after they settle (on-demand pairs), instead of waiting for a manual "Sync up". Persisted so the
+    /// watcher is re-established on the next launch.
+    /// </summary>
+    public bool AutoSync { get; set; }
 }

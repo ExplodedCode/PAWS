@@ -99,6 +99,12 @@ namespace PAWS
                     try
                     {
                         await CloudSync.EnableAsync(account.Id, pair);
+
+                        // Re-establish the background watcher for folders the user left on auto-sync.
+                        if (pair.AutoSync)
+                        {
+                            CloudSync.StartAutoSync(account.Id, pair);
+                        }
                     }
                     catch
                     {

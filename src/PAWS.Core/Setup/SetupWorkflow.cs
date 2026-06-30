@@ -106,6 +106,22 @@ public sealed class SetupWorkflow
         _settings.Save(settings);
     }
 
+    /// <summary>Updates the auto-sync preference for a folder mapping and persists it.</summary>
+    public void SetPairAutoSync(string accountId, string pairId, bool autoSync)
+    {
+        var settings = _settings.Load();
+        var pair = settings.Accounts
+            .FirstOrDefault(a => a.Id == accountId)?.SyncPairs
+            .FirstOrDefault(p => p.Id == pairId);
+        if (pair is null)
+        {
+            return;
+        }
+
+        pair.AutoSync = autoSync;
+        _settings.Save(settings);
+    }
+
     /// <summary>Removes a single folder mapping from an account.</summary>
     public void RemoveSyncPair(string accountId, string pairId)
     {

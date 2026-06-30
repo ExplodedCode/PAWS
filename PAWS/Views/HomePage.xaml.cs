@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -7,6 +8,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using PAWS.Core.Configuration;
 using PAWS.Core.Sync;
 using Windows.Storage.Pickers;
@@ -20,15 +22,34 @@ namespace PAWS.Views
     /// </summary>
     public sealed partial class HomePage : Page
     {
+        // Per-pair status line for auto-sync, rebuilt on each Refresh and updated from the (background)
+        // CloudSync auto-sync events, marshalled back to the UI thread.
+        private readonly Dictionary<string, TextBlock> _pairStatus = new(StringComparer.Ordinal);
+
         public HomePage()
         {
             InitializeComponent();
-            Loaded += (_, _) => Refresh();
+            Loaded += OnLoaded;
+            Unloaded += OnUnloaded;
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            App.Instance.CloudSync.AutoSyncStarted += OnAutoSyncStarted;
+            App.Instance.CloudSync.AutoSyncCompleted += OnAutoSyncCompleted;
+            Refresh();
+        }
+
+        private void OnUnloaded(object sender, RoutedEventArgs e)
+        {
+            App.Instance.CloudSync.AutoSyncStarted -= OnAutoSyncStarted;
+            App.Instance.CloudSync.AutoSyncCompleted -= OnAutoSyncCompleted;
         }
 
         private void Refresh()
         {
             AccountsPanel.Children.Clear();
+            _pairStatus.Clear();
             var settings = App.Instance.SettingsStore.Load();
 
             if (settings.Accounts.Count == 0)
@@ -99,7 +120,7 @@ namespace PAWS.Views
             };
         }
 
-        private Grid BuildPairRow(ProtonAccount account, SyncPair pair)
+        private FrameworkElement BuildPairRow(ProtonAccount account, SyncPair pair)
         {
             var row = new Grid();
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -144,6 +165,7 @@ namespace PAWS.Views
             var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
             remove.Click += (_, _) =>
             {
+                App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the background watcher, if any
                 App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
                 App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
                 Refresh();
@@ -153,12 +175,108 @@ namespace PAWS.Views
             buttons.Children.Add(browse);
             buttons.Children.Add(snapshot);
             buttons.Children.Add(action);
+
+            // On-demand folders can run a background watcher that auto-pushes local changes.
+            if (pair.Mode == SyncMode.OnDemand)
+            {
+                // IsChecked is set before the handlers are attached so the initial state doesn't fire them.
+                var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
+                ToolTipService.SetToolTip(auto, "Automatically push local changes to Proton Drive a few seconds after they settle.");
+                auto.Checked += async (_, _) => await EnableAutoSyncAsync(account, pair);
+                auto.Unchecked += (_, _) => DisableAutoSync(account, pair);
+                buttons.Children.Add(auto);
+            }
+
             buttons.Children.Add(open);
             buttons.Children.Add(remove);
             Grid.SetColumn(buttons, 1);
             row.Children.Add(buttons);
 
-            return row;
+            var status = new TextBlock
+            {
+                FontSize = 12,
+                Opacity = 0.7,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 2, 0, 0),
+                Visibility = Visibility.Collapsed,
+            };
+            if (pair.Mode == SyncMode.OnDemand && pair.AutoSync)
+            {
+                status.Text = "Auto-sync on — watching for changes.";
+                status.Visibility = Visibility.Visible;
+            }
+
+            _pairStatus[pair.Id] = status;
+
+            var container = new StackPanel();
+            container.Children.Add(row);
+            container.Children.Add(status);
+            return container;
+        }
+
+        /// <summary>
+        /// Turns on background auto-sync for an on-demand pair: persists the preference, makes sure the
+        /// folder is set up (placeholders + provider), then starts the debounced watcher.
+        /// </summary>
+        private async Task EnableAutoSyncAsync(ProtonAccount account, SyncPair pair)
+        {
+            pair.AutoSync = true;
+            App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, true);
+            SetPairStatus(pair.Id, "Auto-sync: setting up…");
+
+            try
+            {
+                if (!App.Instance.CloudSync.IsEnabled(pair.Id))
+                {
+                    await App.Instance.CloudSync.EnableAsync(account.Id, pair);
+                }
+
+                App.Instance.CloudSync.StartAutoSync(account.Id, pair);
+                SetPairStatus(pair.Id, "Auto-sync on — watching for changes.");
+            }
+            catch (Exception ex)
+            {
+                SetPairStatus(pair.Id, $"Auto-sync setup failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>Turns off background auto-sync for a pair (the on-demand provider stays connected).</summary>
+        private void DisableAutoSync(ProtonAccount account, SyncPair pair)
+        {
+            pair.AutoSync = false;
+            App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, false);
+            App.Instance.CloudSync.StopAutoSync(pair.Id);
+            SetPairStatus(pair.Id, "Auto-sync off.");
+        }
+
+        private void OnAutoSyncStarted(string pairId)
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: syncing…"));
+
+        private void OnAutoSyncCompleted(AutoSyncEventArgs e)
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (!e.Succeeded)
+                {
+                    SetPairStatus(e.PairId, $"Auto-sync error: {e.Error!.Message}");
+                    return;
+                }
+
+                var result = e.Result!;
+                var when = DateTime.Now.ToString("t");
+                SetPairStatus(e.PairId, result.Total == 0
+                    ? $"Auto-sync: up to date · {when}"
+                    : $"Auto-sync: pushed {result.Completed} change(s){(result.Failures.Count > 0 ? $", {result.Failures.Count} failed" : string.Empty)} · {when}");
+            });
+        }
+
+        private void SetPairStatus(string pairId, string text)
+        {
+            if (_pairStatus.TryGetValue(pairId, out var tb))
+            {
+                tb.Text = text;
+                tb.Visibility = Visibility.Visible;
+            }
         }
 
         /// <summary>

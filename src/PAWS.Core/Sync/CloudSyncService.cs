@@ -20,11 +20,21 @@ public sealed class CloudSyncService(
 
     private readonly Dictionary<string, IDisposable> _connections = new(StringComparer.Ordinal); // pairId -> provider
     private readonly Dictionary<string, IProtonDriveClient> _clients = new(StringComparer.Ordinal); // accountId -> client
+    private readonly Dictionary<string, FolderWatcher> _watchers = new(StringComparer.Ordinal); // pairId -> auto-sync watcher
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly SemaphoreSlim _clientGate = new(1, 1);
-    // The Drive client (and its native crypto) is shared across folders — serialize all hydration
-    // downloads so two on-demand folders can't drive concurrent downloads on the same client.
-    private readonly SemaphoreSlim _downloadGate = new(1, 1);
+    // The Drive client (and its native crypto) is shared across folders and is NOT concurrency-safe, so
+    // serialize every operation that touches it — hydration downloads, snapshot captures, and uploads —
+    // against each other. This also keeps two on-demand folders (or auto-sync vs. a manual push) off the
+    // client at the same time.
+    private readonly SemaphoreSlim _clientUseGate = new(1, 1);
+    private bool _disposed;
+
+    /// <summary>Raised (off the UI thread) when a watcher-triggered push for a pair begins.</summary>
+    public event Action<string>? AutoSyncStarted;
+
+    /// <summary>Raised (off the UI thread) when a watcher-triggered push for a pair finishes.</summary>
+    public event Action<AutoSyncEventArgs>? AutoSyncCompleted;
 
     public bool IsSupported => placeholderEngine.IsSupported;
 
@@ -51,8 +61,18 @@ public sealed class CloudSyncService(
             placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
 
             var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
-            var snapshot = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+
+            RemoteSnapshot snapshot;
+            await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false); // capture uses native crypto
+            try
+            {
+                snapshot = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+            }
+            finally
+            {
+                _clientUseGate.Release();
+            }
 
             // Create placeholders so the folder shows content (the sync root itself doesn't fire
             // FETCH_PLACEHOLDERS for its children); the connected provider then serves enumeration of
@@ -70,14 +90,14 @@ public sealed class CloudSyncService(
             var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, async (identity, output, ct) =>
             {
                 var downloadClient = await GetClientAsync(accountId, ct).ConfigureAwait(false);
-                await _downloadGate.WaitAsync(ct).ConfigureAwait(false);
+                await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
                     await downloadClient.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
                 }
                 finally
                 {
-                    _downloadGate.Release();
+                    _clientUseGate.Release();
                 }
             });
 
@@ -104,43 +124,106 @@ public sealed class CloudSyncService(
     {
         var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
 
-        var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-        var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
-        var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
-            ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
-
-        var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
-        var operations = new Reconciler().Reconcile(remote, local, lastKnown);
-
-        // On-demand pushes local->remote only; new/updated remote content stays as on-demand placeholders.
-        var pushOperations = operations
-            .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote)
-            .ToList();
-
-        SyncResult result;
-        await _downloadGate.WaitAsync(cancellationToken).ConfigureAwait(false); // serialize vs. hydration (native crypto)
+        // Hold the client gate for the entire operation: capture, upload, and re-capture all use the
+        // shared client's native crypto (not concurrency-safe), and this serializes a push against
+        // hydration, against other pairs on the same account, and against overlapping auto-sync runs.
+        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            result = await new SyncExecutor(client)
+            var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
+                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+
+            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+            var operations = new Reconciler().Reconcile(remote, local, lastKnown);
+
+            // On-demand pushes local->remote only; new/updated remote content stays as on-demand placeholders.
+            var pushOperations = operations
+                .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote)
+                .ToList();
+
+            var result = await new SyncExecutor(client)
                 .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+
+            // Re-capture and persist state so the next run starts from a clean baseline.
+            var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
+            if (newRemote is not null && newLocal is not null)
+            {
+                stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
+            }
+
+            return result;
         }
         finally
         {
-            _downloadGate.Release();
+            _clientUseGate.Release();
         }
+    }
 
-        // Re-capture and persist state so the next run starts from a clean baseline.
-        var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
-        var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
-        if (newRemote is not null && newLocal is not null)
+    /// <summary>
+    /// Starts (if not already running) a debounced watcher on the pair's local folder that automatically
+    /// pushes settled changes up via <see cref="SyncChangesAsync"/>. Idempotent per pair. The pair should
+    /// already be enabled (so a state baseline exists); the watcher's first push is a no-op if nothing
+    /// changed. Progress is reported through <see cref="AutoSyncStarted"/>/<see cref="AutoSyncCompleted"/>.
+    /// </summary>
+    public void StartAutoSync(string accountId, SyncPair pair)
+    {
+        lock (_watchers)
         {
-            stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
+            if (_disposed || _watchers.ContainsKey(pair.Id))
+            {
+                return;
+            }
+
+            var watcher = new FolderWatcher(pair.LocalPath, async ct =>
+            {
+                AutoSyncStarted?.Invoke(pair.Id);
+                try
+                {
+                    var result = await SyncChangesAsync(accountId, pair, ct).ConfigureAwait(false);
+                    AutoSyncCompleted?.Invoke(new AutoSyncEventArgs(pair.Id, result, null));
+                }
+                catch (OperationCanceledException)
+                {
+                    // Watcher disposed mid-run — nothing to report.
+                }
+                catch (Exception ex)
+                {
+                    AutoSyncCompleted?.Invoke(new AutoSyncEventArgs(pair.Id, null, ex));
+                }
+            });
+
+            _watchers[pair.Id] = watcher;
+        }
+    }
+
+    /// <summary>Stops auto-sync for a pair (the on-demand provider, if any, is left connected).</summary>
+    public void StopAutoSync(string pairId)
+    {
+        FolderWatcher? watcher;
+        lock (_watchers)
+        {
+            if (!_watchers.Remove(pairId, out watcher))
+            {
+                return;
+            }
         }
 
-        return result;
+        watcher.Dispose();
+    }
+
+    /// <summary>True if a watcher is currently auto-syncing this pair.</summary>
+    public bool IsAutoSyncing(string pairId)
+    {
+        lock (_watchers)
+        {
+            return _watchers.ContainsKey(pairId);
+        }
     }
 
     /// <summary>Disconnects the provider for a pair (placeholders and registration are left in place).</summary>
@@ -190,6 +273,19 @@ public sealed class CloudSyncService(
 
     public async ValueTask DisposeAsync()
     {
+        List<FolderWatcher> watchers;
+        lock (_watchers)
+        {
+            _disposed = true;
+            watchers = [.. _watchers.Values];
+            _watchers.Clear();
+        }
+
+        foreach (var watcher in watchers)
+        {
+            watcher.Dispose();
+        }
+
         List<IDisposable> connections;
         lock (_connections)
         {

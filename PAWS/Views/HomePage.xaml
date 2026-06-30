@@ -32,7 +32,7 @@
                 IsClosable="False"
                 Severity="Informational"
                 Title="Preview build"
-                Message="Sign-in and Proton Drive access are live — use &quot;Browse remote&quot; on a folder to list it from your Drive. Automatic two-way syncing is not active yet; this screen manages accounts and folders." />
+                Message="Sign-in and Proton Drive access are live. On-demand folders show as placeholders and download on open; turn on &quot;Auto&quot; to push local changes up automatically, or use &quot;Sync up&quot;/&quot;Sync now&quot; to sync manually. Pulling remote changes still needs a manual refresh." />
         </StackPanel>
     </ScrollViewer>
 </Page>
