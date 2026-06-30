@@ -176,9 +176,14 @@ namespace PAWS.Views
             buttons.Children.Add(snapshot);
             buttons.Children.Add(action);
 
-            // On-demand folders can run a background watcher that auto-pushes local changes.
+            // On-demand folders: pull remote changes down and run a background watcher that auto-pushes.
             if (pair.Mode == SyncMode.OnDemand)
             {
+                var syncDown = new Button { Content = "Sync down", Margin = new Thickness(8, 0, 0, 0) };
+                ToolTipService.SetToolTip(syncDown, "Bring changes made on Proton Drive (new, changed, or deleted files) down into this folder as placeholders.");
+                syncDown.Click += async (_, _) => await SyncDownAsync(account, pair);
+                buttons.Children.Add(syncDown);
+
                 // IsChecked is set before the handlers are attached so the initial state doesn't fire them.
                 var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
                 ToolTipService.SetToolTip(auto, "Automatically push local changes to Proton Drive a few seconds after they settle.");
@@ -277,6 +282,52 @@ namespace PAWS.Views
                 tb.Text = text;
                 tb.Visibility = Visibility.Visible;
             }
+        }
+
+        /// <summary>
+        /// Pulls changes made on Proton Drive (new, changed, deleted files/folders) down into an on-demand
+        /// folder as placeholders — no content is downloaded. Local-only changes and conflicts are left
+        /// alone, so this never discards unpushed local work.
+        /// </summary>
+        private async Task SyncDownAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Checking Proton Drive for changes…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
+            panel.Children.Add(header);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Sync down: {pair.RemotePath}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    var result = await App.Instance.CloudSync.PullChangesAsync(account.Id, pair);
+                    ring.IsActive = false;
+
+                    status.Text = result.Total == 0
+                        ? "No remote changes — already up to date."
+                        : $"Pulled remote changes: {result.Created} new, {result.Updated} changed, {result.Deleted} removed. "
+                          + "New and changed files appear as on-demand placeholders (open them to download).";
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Sync down failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                }
+            };
+
+            await dialog.ShowAsync();
         }
 
         /// <summary>

@@ -87,19 +87,7 @@ public sealed class CloudSyncService(
                 stateStore.Save(SyncStateBuilder.Build(pair.Id, snapshot, localState));
             }
 
-            var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, async (identity, output, ct) =>
-            {
-                var downloadClient = await GetClientAsync(accountId, ct).ConfigureAwait(false);
-                await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
-                try
-                {
-                    await downloadClient.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
-                }
-                finally
-                {
-                    _clientUseGate.Release();
-                }
-            });
+            var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, CreateFetchCallback(accountId));
 
             lock (_connections)
             {
@@ -113,6 +101,25 @@ public sealed class CloudSyncService(
             _enableGate.Release();
         }
     }
+
+    /// <summary>
+    /// The hydration callback for a connected provider: on file open, download the whole file from Drive
+    /// into <c>output</c>. Serialized behind <see cref="_clientUseGate"/> because the shared client's
+    /// native crypto is not concurrency-safe (see the class remarks).
+    /// </summary>
+    private FetchPlaceholderData CreateFetchCallback(string accountId) => async (identity, output, ct) =>
+    {
+        var downloadClient = await GetClientAsync(accountId, ct).ConfigureAwait(false);
+        await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await downloadClient.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+    };
 
     /// <summary>
     /// Pushes local changes in an on-demand folder up to Drive — new files, edits, and deletes, detected
@@ -163,6 +170,86 @@ public sealed class CloudSyncService(
         {
             _clientUseGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Pulls remote-side changes for an on-demand pair down into the local folder as placeholders — new
+    /// remote files/folders appear as on-demand placeholders, files changed on Drive are reset to fresh
+    /// placeholders (so the next open downloads the new content), and items deleted on Drive are removed
+    /// locally. <b>No content is downloaded</b> (it stays on-demand). Local-only changes are left untouched
+    /// (push them with <see cref="SyncChangesAsync"/>), and conflicts (changed on both sides) are skipped,
+    /// so a pull can never clobber an unpushed local edit. The provider is (re)connected with the refreshed
+    /// tree afterwards, so the folder shows the new contents.
+    /// <para><b>SDK caveat:</b> the Proton SDK caches nodes process-wide, so a running app sees newly-added
+    /// remote files immediately but only picks up deletions / new revisions of already-seen files on the
+    /// next launch (cold process). See the note inside the method.</para>
+    /// </summary>
+    public async Task<PullResult> PullChangesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
+    {
+        var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+
+        RemoteSnapshot remote;
+        PullResult result;
+
+        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // NOTE (SDK limitation, confirmed 2026-06-30): the Proton SDK keeps a process-wide cache of
+            // nodes it has already seen, which survives even disposing+resuming the session. So within a
+            // running app a pull reliably surfaces NEW remote files (cache miss → fetched) but does NOT
+            // notice files deleted or re-revisioned on Drive after they were first seen — those changes
+            // appear on the next app launch (cold process). The reconcile/placeholder logic below is
+            // correct; it's gated only by what the SDK reports as the current remote tree.
+            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
+                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+
+            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+            var operations = new Reconciler().Reconcile(remote, local, lastKnown);
+
+            // Pull is remote->local only: bring down creations/changes/deletions. Uploads and conflicts
+            // are deliberately ignored here so local work is never discarded.
+            var pullOperations = operations
+                .Where(o => o.Kind is SyncOperationKind.DownloadFile or SyncOperationKind.CreateLocalFolder or SyncOperationKind.DeleteLocal)
+                .ToList();
+
+            // Deletions: remote-deleted items, plus changed files (delete the stale placeholder so the
+            // recreate below points it at the new revision). Apply child-first (the ops are sorted so).
+            foreach (var op in pullOperations.Where(o =>
+                o.Kind == SyncOperationKind.DeleteLocal ||
+                (o.Kind == SyncOperationKind.DownloadFile && o.Local is not null)))
+            {
+                DeleteLocalPlaceholder(pair.LocalPath, op.RelativePath, op.IsFolder);
+            }
+
+            // Creations + recreations: CreatePlaceholders adds every entry now missing on disk (it skips
+            // ones that already exist), which covers both brand-new remote items and the just-deleted
+            // changed files.
+            placeholderEngine.CreatePlaceholders(pair.LocalPath, remote);
+
+            // Merge the pulled paths into last-known state surgically — paths we didn't touch (e.g. files
+            // with unpushed local edits) keep their old baseline, so the next push still detects them.
+            stateStore.Save(MergePulledState(lastKnown, pair.Id, pullOperations));
+
+            var created = pullOperations.Count(o =>
+                o.Kind == SyncOperationKind.CreateLocalFolder ||
+                (o.Kind == SyncOperationKind.DownloadFile && o.Local is null));
+            var updated = pullOperations.Count(o => o.Kind == SyncOperationKind.DownloadFile && o.Local is not null);
+            var deleted = pullOperations.Count(o => o.Kind == SyncOperationKind.DeleteLocal);
+            result = new PullResult(created, updated, deleted);
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+
+        // (Re)connect the provider with the refreshed tree so Explorer shows the new contents and
+        // sub-folder enumeration uses up-to-date data. Done OUTSIDE the client gate so a hydration that is
+        // mid-flight on the old connection can drain before it's disconnected (avoids a callback deadlock).
+        await ReconnectAsync(accountId, pair, remote, cancellationToken).ConfigureAwait(false);
+
+        return result;
     }
 
     /// <summary>
@@ -228,6 +315,101 @@ public sealed class CloudSyncService(
 
     /// <summary>Disconnects the provider for a pair (placeholders and registration are left in place).</summary>
     public void Disable(string pairId) => DisposeConnection(pairId);
+
+    // Disconnects any existing provider for the pair and connects a fresh one over the given snapshot.
+    // Registration is idempotent. Holds only _enableGate (NOT _clientUseGate) so disposing the old
+    // connection can wait for an in-flight hydration callback to finish acquiring/releasing _clientUseGate.
+    private async Task ReconnectAsync(string accountId, SyncPair pair, RemoteSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        await _enableGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            DisposeConnection(pair.Id);
+            placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
+            var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, CreateFetchCallback(accountId));
+
+            lock (_connections)
+            {
+                _connections[pair.Id] = connection;
+            }
+        }
+        finally
+        {
+            _enableGate.Release();
+        }
+    }
+
+    // Removes a local placeholder whose remote node was deleted (or that we're about to recreate). Plain
+    // filesystem delete — un-hydrated placeholders are 0 bytes on disk. In-use/missing paths are ignored;
+    // the next pull retries.
+    private static void DeleteLocalPlaceholder(string localRoot, string relativePath, bool isFolder)
+    {
+        var fullPath = Path.Combine(localRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        try
+        {
+            if (isFolder)
+            {
+                if (Directory.Exists(fullPath))
+                {
+                    Directory.Delete(fullPath, recursive: true);
+                }
+            }
+            else if (File.Exists(fullPath))
+            {
+                File.Delete(fullPath);
+            }
+        }
+        catch (IOException)
+        {
+            // Open / mid-hydration — leave it; the next pull will retry.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    // Updates last-known state for ONLY the pulled paths: removes deleted ones and upserts created/changed
+    // ones from their (new) remote entry. Untouched paths keep their existing baseline, so a later push
+    // still sees any unpushed local edits as changes.
+    private static SyncState MergePulledState(SyncState current, string pairId, IReadOnlyList<SyncOperation> pulledOperations)
+    {
+        var byPath = current.Entries.ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
+
+        foreach (var op in pulledOperations)
+        {
+            if (op.Kind == SyncOperationKind.DeleteLocal)
+            {
+                byPath.Remove(op.RelativePath);
+                continue;
+            }
+
+            if (op.Remote is not { } r)
+            {
+                continue;
+            }
+
+            byPath[r.RelativePath] = new SyncStateEntry
+            {
+                RelativePath = r.RelativePath,
+                IsFolder = r.IsFolder,
+                RemoteUid = r.Uid,
+                RemoteRevisionUid = r.RevisionUid,
+                Size = r.IsFolder ? null : r.Size,
+                LocalModifiedUtc = r.IsFolder ? null : r.ModifiedUtc,
+            };
+        }
+
+        var entries = byPath.Values
+            .OrderBy(e => e.RelativePath, StringComparer.Ordinal)
+            .ToList();
+
+        return new SyncState { PairId = pairId, LastSyncUtc = DateTimeOffset.UtcNow, Entries = entries };
+    }
 
     private async Task<IProtonDriveClient> GetClientAsync(string accountId, CancellationToken cancellationToken)
     {
