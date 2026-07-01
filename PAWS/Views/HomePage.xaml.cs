@@ -39,6 +39,8 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoSyncCompleted += OnAutoSyncCompleted;
             App.Instance.CloudSync.AutoPullStarted += OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted += OnAutoPullCompleted;
+            App.Instance.FullSync.SyncStarted += OnFullSyncStarted;
+            App.Instance.FullSync.SyncCompleted += OnFullSyncCompleted;
             Refresh();
         }
 
@@ -48,6 +50,8 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoSyncCompleted -= OnAutoSyncCompleted;
             App.Instance.CloudSync.AutoPullStarted -= OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted -= OnAutoPullCompleted;
+            App.Instance.FullSync.SyncStarted -= OnFullSyncStarted;
+            App.Instance.FullSync.SyncCompleted -= OnFullSyncCompleted;
         }
 
         private void Refresh()
@@ -169,7 +173,8 @@ namespace PAWS.Views
             var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
             remove.Click += (_, _) =>
             {
-                App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the background watcher, if any
+                App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the on-demand watcher/poll, if any
+                App.Instance.FullSync.StopAutoSync(pair.Id); // stop the full-sync watcher/poll, if any
                 App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
                 App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
                 Refresh();
@@ -195,6 +200,15 @@ namespace PAWS.Views
                 auto.Unchecked += (_, _) => DisableAutoSync(account, pair);
                 buttons.Children.Add(auto);
             }
+            else if (pair.Mode == SyncMode.FullSync)
+            {
+                // Full two-way auto-sync: watch local + poll Drive, applying the full plan automatically.
+                var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
+                ToolTipService.SetToolTip(auto, "Keep this folder mirrored with Proton Drive automatically both ways. Large deletions are held for you to review with \"Sync now\" rather than applied unattended.");
+                auto.Checked += async (_, _) => await EnableFullAutoSyncAsync(account, pair);
+                auto.Unchecked += (_, _) => DisableFullAutoSync(account, pair);
+                buttons.Children.Add(auto);
+            }
 
             buttons.Children.Add(open);
             buttons.Children.Add(remove);
@@ -209,7 +223,7 @@ namespace PAWS.Views
                 Margin = new Thickness(0, 2, 0, 0),
                 Visibility = Visibility.Collapsed,
             };
-            if (pair.Mode == SyncMode.OnDemand && pair.AutoSync)
+            if (pair.AutoSync && pair.Mode is SyncMode.OnDemand or SyncMode.FullSync)
             {
                 status.Text = "Auto-sync on — watching local changes and polling Drive.";
                 status.Visibility = Visibility.Visible;
@@ -256,6 +270,61 @@ namespace PAWS.Views
             App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, false);
             App.Instance.CloudSync.StopAutoSync(pair.Id);
             SetPairStatus(pair.Id, "Auto-sync off.");
+        }
+
+        /// <summary>Turns on automatic two-way sync for a full-sync pair (local watcher + Drive poll).</summary>
+        private Task EnableFullAutoSyncAsync(ProtonAccount account, SyncPair pair)
+        {
+            pair.AutoSync = true;
+            App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, true);
+
+            try
+            {
+                App.Instance.FullSync.StartAutoSync(account.Id, pair);
+                SetPairStatus(pair.Id, "Auto-sync on — watching local changes and polling Drive.");
+            }
+            catch (Exception ex)
+            {
+                SetPairStatus(pair.Id, $"Auto-sync setup failed: {ex.Message}");
+            }
+
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Turns off automatic two-way sync for a full-sync pair.</summary>
+        private void DisableFullAutoSync(ProtonAccount account, SyncPair pair)
+        {
+            pair.AutoSync = false;
+            App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, false);
+            App.Instance.FullSync.StopAutoSync(pair.Id);
+            SetPairStatus(pair.Id, "Auto-sync off.");
+        }
+
+        private void OnFullSyncStarted(string pairId)
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: syncing…"));
+
+        private void OnFullSyncCompleted(FullSyncEventArgs e)
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (e.NeedsReview)
+                {
+                    SetPairStatus(e.PairId, $"Auto-sync paused: {e.PendingDeletes} deletions detected — review with \"Sync now\".");
+                    return;
+                }
+
+                if (!e.Succeeded)
+                {
+                    SetPairStatus(e.PairId, $"Auto-sync error: {e.Error!.Message}");
+                    return;
+                }
+
+                var result = e.Result!;
+                var when = DateTime.Now.ToString("t");
+                SetPairStatus(e.PairId, result.Total == 0
+                    ? $"Auto-sync: up to date · {when}"
+                    : $"Auto-sync: {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s)" : string.Empty)}{(result.Failures.Count > 0 ? $", {result.Failures.Count} failed" : string.Empty)} · {when}");
+            });
         }
 
         private void OnAutoSyncStarted(string pairId)

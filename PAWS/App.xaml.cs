@@ -1,4 +1,5 @@
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using PAWS.CloudFilter;
@@ -21,6 +22,7 @@ namespace PAWS
     public partial class App : Application
     {
         private MainWindow? _window;
+        private readonly SemaphoreSlim _driveGate;
 
         public App()
         {
@@ -37,12 +39,20 @@ namespace PAWS
             // Builds a connected Proton Drive client for an account by resuming its stored session.
             DriveClientFactory = new ProtonDriveClientFactory(SecretStore);
 
+            // Shared across every Drive-touching service: the native crypto (proton_crypto.dll) is
+            // process-global and not concurrency-safe, so on-demand hydration/push/pull and full-sync
+            // plan/apply must all serialize on this one gate.
+            _driveGate = new SemaphoreSlim(1, 1);
+
             // Sync engine: plan + apply, persisting last-known state per pair.
             SyncStateStore = new JsonSyncStateStore(Paths);
-            SyncEngine = new SyncEngine(DriveClientFactory, SyncStateStore);
+            SyncEngine = new SyncEngine(DriveClientFactory, SyncStateStore, _driveGate);
 
             // Files-on-demand: registers sync roots + serves hydration for On-demand pairs.
-            CloudSync = new CloudSyncService(new CloudFilterPlaceholderEngine(), DriveClientFactory, SyncStateStore);
+            CloudSync = new CloudSyncService(new CloudFilterPlaceholderEngine(), DriveClientFactory, SyncStateStore, _driveGate);
+
+            // Automatic two-way sync for Full-sync pairs (over the shared SyncEngine).
+            FullSync = new FullSyncService(SyncEngine);
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -64,6 +74,8 @@ namespace PAWS
 
         public CloudSyncService CloudSync { get; }
 
+        public FullSyncService FullSync { get; }
+
         public MainWindow? Window => _window;
 
         public SetupWorkflow CreateSetupWorkflow() => new(SettingsStore, SecretStore);
@@ -78,6 +90,31 @@ namespace PAWS
 
             // Bring any On-demand folders online in the background (placeholders + hydration provider).
             _ = StartOnDemandPairsAsync();
+
+            // Resume automatic two-way sync for Full-sync folders the user left on auto.
+            StartFullSyncPairs();
+        }
+
+        /// <summary>
+        /// Re-establishes automatic two-way sync (watcher + poll) for every enabled Full-sync pair with
+        /// auto-sync on. Best-effort and per-pair isolated — e.g. a missing local folder is skipped.
+        /// </summary>
+        private void StartFullSyncPairs()
+        {
+            foreach (var account in SettingsStore.Load().Accounts)
+            {
+                foreach (var pair in account.SyncPairs.Where(p => p.Enabled && p.Mode == SyncMode.FullSync && p.AutoSync))
+                {
+                    try
+                    {
+                        FullSync.StartAutoSync(account.Id, pair);
+                    }
+                    catch
+                    {
+                        // e.g. the local folder no longer exists; the user can re-enable from the card.
+                    }
+                }
+            }
         }
 
         /// <summary>

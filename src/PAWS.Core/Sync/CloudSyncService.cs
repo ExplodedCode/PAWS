@@ -13,7 +13,8 @@ namespace PAWS.Core.Sync;
 public sealed class CloudSyncService(
     IPlaceholderEngine placeholderEngine,
     IProtonDriveClientFactory clientFactory,
-    ISyncStateStore stateStore) : IAsyncDisposable
+    ISyncStateStore stateStore,
+    SemaphoreSlim driveGate) : IAsyncDisposable
 {
     // Stable provider identity for PAWS sync roots.
     private const string ProviderId = "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64";
@@ -30,11 +31,11 @@ public sealed class CloudSyncService(
     private readonly HashSet<string> _pullInFlight = new(StringComparer.Ordinal); // pairIds with a pull running
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly SemaphoreSlim _clientGate = new(1, 1);
-    // The Drive client (and its native crypto) is shared across folders and is NOT concurrency-safe, so
-    // serialize every operation that touches it — hydration downloads, snapshot captures, and uploads —
-    // against each other. This also keeps two on-demand folders (or auto-sync vs. a manual push) off the
-    // client at the same time.
-    private readonly SemaphoreSlim _clientUseGate = new(1, 1);
+    // The native crypto (proton_crypto.dll) is process-global and NOT concurrency-safe, so serialize every
+    // operation that touches it — hydration downloads, snapshot captures, uploads — against each other AND
+    // against full-sync work. This is the SAME shared gate the SyncEngine uses (injected), so on-demand and
+    // full-sync never call the SDK concurrently.
+    private readonly SemaphoreSlim _clientUseGate = driveGate;
     private bool _disposed;
 
     /// <summary>Raised (off the UI thread) when a watcher-triggered push for a pair begins.</summary>

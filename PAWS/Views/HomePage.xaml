@@ -32,7 +32,7 @@
                 IsClosable="False"
                 Severity="Informational"
                 Title="Preview build"
-                Message="Sign-in and Proton Drive access are live. On-demand folders show as placeholders and download on open; turn on &quot;Auto&quot; to push local changes up automatically, or use &quot;Sync up&quot;/&quot;Sync now&quot; to sync manually. Pulling remote changes still needs a manual refresh." />
+                Message="Sign-in and Proton Drive access are live. On-demand folders show as placeholders and download on open (&quot;Sync up&quot;/&quot;Sync down&quot; to push/pull manually); full-sync folders mirror both ways (&quot;Sync now&quot;). Turn on &quot;Auto&quot; on any folder to sync it automatically in the background. Manual syncs still let you review changes first." />
         </StackPanel>
     </ScrollViewer>
 </Page>

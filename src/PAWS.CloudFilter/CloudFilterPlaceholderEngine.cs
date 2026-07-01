@@ -253,12 +253,25 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
         private async Task TransferAsync(CF_OPERATION_INFO operation, string identity, long offset, long length)
         {
+            // Bail before touching the connection if it's being torn down (reconnect / disable): running
+            // CfExecute against a disconnected connection key is an access violation.
+            if (_disposed)
+            {
+                return;
+            }
+
             try
             {
                 // Serialize the whole hydration (download + transfer) — see _downloadGate.
                 await _downloadGate.WaitAsync().ConfigureAwait(false);
                 try
                 {
+                    // Dispose() may have run while we were queued on the gate; the key is now dead.
+                    if (_disposed)
+                    {
+                        return;
+                    }
+
                     if (!string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) || _cachedData is null)
                     {
                         using var buffer = new MemoryStream();
@@ -287,9 +300,16 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                     _downloadGate.Release();
                 }
             }
-            catch
+            catch (Exception) when (!_disposed)
             {
+                // A real failure (e.g. the download errored) while the connection is still live — tell the
+                // platform the fetch failed so the open returns an error instead of hanging. If we're
+                // disposing, skip this: CfExecute on the dead key would itself fault.
                 TransferError(operation, offset, length);
+            }
+            catch (Exception)
+            {
+                // Torn down mid-transfer — nothing safe to report.
             }
         }
 
@@ -366,10 +386,28 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 return;
             }
 
+            // Mark disposed FIRST so any transfer still queued on the gate bails instead of running
+            // CfExecute against the connection we're about to disconnect.
             _disposed = true;
-            CfDisconnectSyncRoot(_connectionKey);
+
+            // Wait for an in-flight transfer to finish (it holds the gate) so its CfExecute completes on the
+            // still-connected key before we disconnect. Bounded so a stuck download can't hang teardown.
+            var drained = _downloadGate.Wait(TimeSpan.FromSeconds(60));
+            try
+            {
+                CfDisconnectSyncRoot(_connectionKey);
+            }
+            finally
+            {
+                if (drained)
+                {
+                    _downloadGate.Release();
+                }
+            }
+
+            // Intentionally not disposing _downloadGate: a late transfer could still touch it, and a
+            // disposed SemaphoreSlim throws. Let the GC reclaim it.
             _cachedData = null;
-            _downloadGate.Dispose();
             GC.KeepAlive(_fetchDataCallback);
             GC.KeepAlive(_fetchPlaceholdersCallback);
             GC.KeepAlive(_callbacks);

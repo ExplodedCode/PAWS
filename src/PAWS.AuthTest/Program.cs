@@ -34,6 +34,7 @@ return mode switch
     "--pushtest" or "pushtest" => await PushTestAsync(localArg, remoteArg),
     "--watchtest" or "watchtest" => await WatchTestAsync(localArg, remoteArg),
     "--pulltest" or "pulltest" => await PullTestAsync(localArg, remoteArg),
+    "--fullautotest" or "fullautotest" => await FullAutoTestAsync(localArg, remoteArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -149,7 +150,7 @@ static async Task<int> PushTestAsync(string? localOverride, string? remoteOverri
     Console.WriteLine($"PAWS - on-demand push test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "pushtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     Console.WriteLine("Enabling on-demand…");
@@ -213,7 +214,7 @@ static async Task<int> WatchTestAsync(string? localOverride, string? remoteOverr
     Console.WriteLine($"PAWS - auto-sync watch test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "watchtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     // Fires when an auto-sync run actually pushed something up.
@@ -301,7 +302,7 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
     Console.WriteLine($"PAWS - on-demand pull test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "pulltest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     Console.WriteLine("Enabling on-demand (sets the baseline)…");
@@ -387,6 +388,91 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
     return ok ? 0 : 1;
 }
 
+// Phase 9: automatic FULL two-way sync. Start FullSyncService auto on a full-sync pair, drop a local file,
+// and verify the watcher triggers a full sync that uploads it to Drive. `--fullautotest <local> <remote>`.
+static async Task<int> FullAutoTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --fullautotest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - full-sync auto test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var stateStore = new JsonSyncStateStore(paths);
+    var engine = new SyncEngine(new ProtonDriveClientFactory(new DpapiSecretStore(paths)), stateStore, new SemaphoreSlim(1, 1));
+    using var full = new FullSyncService(engine);
+    var pair = new SyncPair { Id = "fullautotest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.FullSync };
+
+    var done = new TaskCompletionSource<FullSyncEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+    full.SyncStarted += _ => Console.WriteLine("  [auto] full sync started…");
+    full.SyncCompleted += e =>
+    {
+        if (e.Error is not null)
+        {
+            Console.WriteLine($"  [auto] error: {e.Error.Message}");
+        }
+        else if (e.NeedsReview)
+        {
+            Console.WriteLine($"  [auto] held for review: {e.PendingDeletes} deletions");
+        }
+        else
+        {
+            Console.WriteLine($"  [auto] done: {e.Result!.Completed} applied, {e.Result.Skipped} skipped, {e.Result.Failures.Count} failed");
+        }
+
+        done.TrySetResult(e);
+    };
+
+    // Start auto FIRST so the watcher is live, then create the local file so it's actually caught.
+    full.StartAutoSync(account.Id, pair);
+    await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+    var newName = $"fullauto-{DateTime.UtcNow:yyyyMMdd-HHmmss}.txt";
+    File.WriteAllText(Path.Combine(localOverride, newName), $"Auto full-synced at {DateTime.UtcNow:O}");
+    Console.WriteLine($"  wrote {newName} — waiting for the watcher to trigger a full sync (≤40s)…\n");
+
+    var finished = await Task.WhenAny(done.Task, Task.Delay(TimeSpan.FromSeconds(40)));
+    var timedOut = finished != done.Task;
+    full.StopAutoSync(pair.Id);
+    if (timedOut)
+    {
+        Console.WriteLine("  x Timed out — the watcher did not trigger a sync.");
+    }
+
+    var ok = !timedOut;
+    await using (var verify = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (verify is not null)
+        {
+            var snapshot = await new RemoteSnapshotBuilder(verify).CaptureAsync(remoteOverride).ConfigureAwait(false);
+            var found = snapshot?.Entries.Any(e => e.Name == newName) ?? false;
+            Console.WriteLine($"  Remote now contains \"{newName}\": {(found ? "YES" : "NO")}");
+            ok = ok && found;
+
+            var node = await verify.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+            if (node is not null)
+            {
+                await verify.TrashAsync(node).ConfigureAwait(false);
+                Console.WriteLine("  cleaned up the remote test file.");
+            }
+        }
+    }
+
+    stateStore.Clear(pair.Id);
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
 // Diagnostic: does a LONG-LIVED client (the one a running app keeps) ever notice a remote deletion, or
 // does it stay blind until process restart? Enables on-demand, uploads + pulls a file, trashes it on
 // Drive, then polls PullChangesAsync on the SAME CloudSyncService every 15s for up to 5 minutes, printing
@@ -410,7 +496,7 @@ static async Task<int> DeleteConsistencyTestAsync(string? localOverride, string?
     Console.WriteLine($"PAWS - delete-consistency diagnostic\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "deltest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     await cloud.EnableAsync(account.Id, pair);
@@ -794,7 +880,7 @@ static async Task<int> SyncAsync(string? localOverride, string? remoteOverride)
 
     Console.WriteLine($"PAWS - sync\n  local  : {pair.LocalPath}\n  remote : {pair.RemotePath}\n");
 
-    var engine = new SyncEngine(new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths));
+    var engine = new SyncEngine(new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
 
     SyncPlan plan;
     try
