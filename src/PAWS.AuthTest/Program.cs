@@ -31,6 +31,9 @@ return mode switch
     "--sync" or "sync" => await SyncAsync(localArg, remoteArg),
     "--placeholders" or "placeholders" => await PlaceholdersAsync(localArg, remoteArg),
     "--hydrate" or "hydrate" => await HydrateAsync(localArg, remoteArg),
+    "--streamtest" or "streamtest" => await StreamTestAsync(localArg, remoteArg),
+    "--uploadtest" or "uploadtest" => await UploadTestAsync(localArg, remoteArg),
+    "--drafttest" or "drafttest" => await DraftTestAsync(localArg),
     "--pushtest" or "pushtest" => await PushTestAsync(localArg, remoteArg),
     "--watchtest" or "watchtest" => await WatchTestAsync(localArg, remoteArg),
     "--pulltest" or "pulltest" => await PullTestAsync(localArg, remoteArg),
@@ -119,6 +122,257 @@ static async Task<int> HydrateAsync(string? localOverride, string? remoteOverrid
     engine.UnregisterSyncRoot(localOverride);
     Console.WriteLine("\nDisconnected + unregistered.");
     return 0;
+}
+
+// Streaming-hydration correctness: upload a multi-MB random file (size deliberately NOT a multiple of the
+// 1 MiB transfer chunk), hydrate it through the streaming provider, and verify every byte round-trips
+// (SHA-256). Exercises the multi-chunk / running-offset path that a tiny file can't. `--streamtest <local> <remote>`.
+static async Task<int> StreamTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --streamtest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - streaming hydration test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    // ~5 MB, offset by a non-round amount so chunk boundaries don't line up on 1 MiB.
+    var payload = new byte[(5 * 1024 * 1024) + 12345];
+    Random.Shared.NextBytes(payload);
+    var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(payload));
+    var newName = $"streamtest-{DateTime.UtcNow:yyyyMMdd-HHmmss}.bin";
+
+    var folder = await drive.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+    if (folder is null)
+    {
+        Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+        return 1;
+    }
+
+    using (var content = new MemoryStream(payload))
+    {
+        await drive.UploadAsync(folder, newName, content).ConfigureAwait(false);
+    }
+
+    Console.WriteLine($"  uploaded {newName} ({payload.Length:N0} B), sha256 {expected[..16]}…");
+
+    var snapshot = await new RemoteSnapshotBuilder(drive).CaptureAsync(remoteOverride).ConfigureAwait(false);
+    if (snapshot is null || snapshot.Entries.All(e => e.Name != newName))
+    {
+        Console.WriteLine("  x Uploaded file didn't appear in the snapshot.");
+        return 1;
+    }
+
+    engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+    engine.CreatePlaceholders(localOverride, snapshot);
+    using var connection = engine.Connect(localOverride, snapshot, async (identity, output, ct) =>
+    {
+        await drive.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
+    });
+
+    var localFile = Path.Combine(localOverride, newName);
+    Console.WriteLine("  reading the placeholder (streaming hydration)…");
+    var ok = false;
+    try
+    {
+        var read = await File.ReadAllBytesAsync(localFile).ConfigureAwait(false);
+        var actual = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(read));
+        ok = read.Length == payload.Length && string.Equals(actual, expected, StringComparison.Ordinal);
+        Console.WriteLine($"  read {read.Length:N0} B, sha256 {actual[..16]}… → {(ok ? "MATCH" : "MISMATCH")}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Read failed: {ex.Message}");
+    }
+
+    connection.Dispose();
+    engine.UnregisterSyncRoot(localOverride);
+
+    await using (var verify = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (verify is not null)
+        {
+            var node = await verify.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{newName}").ConfigureAwait(false);
+            if (node is not null)
+            {
+                await verify.TrashAsync(node).ConfigureAwait(false);
+                Console.WriteLine("  cleaned up the remote test file.");
+            }
+        }
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Reproduces the orphaned-draft collision: start an upload and cancel it mid-flight (leaves an incomplete
+// DRAFT node holding the name, which listings hide), then re-upload the SAME name. With the
+// overrideExistingDraftByOtherClient fix the retry should SUCCEED instead of throwing
+// NodeWithSameNameExistsException. `--drafttest <remotePath>`.
+static async Task<int> DraftTestAsync(string? remoteOverride)
+{
+    if (remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --drafttest <remotePath>");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - draft-collision test\n  remote : {remoteOverride}\n");
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var folder = await drive.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+    if (folder is null)
+    {
+        Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+        return 1;
+    }
+
+    var name = $"drafttest-{DateTime.UtcNow:HHmmss}.bin";
+    var temp = Path.Combine(Path.GetTempPath(), name);
+    var block = new byte[1024 * 1024];
+    Random.Shared.NextBytes(block);
+    await using (var fs = File.Create(temp))
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            await fs.WriteAsync(block).ConfigureAwait(false);
+        }
+    }
+
+    // Attempt 1: cancel mid-upload to leave a draft.
+    using (var cts = new CancellationTokenSource())
+    {
+        var upload = Task.Run(async () =>
+        {
+            await using var content = File.OpenRead(temp);
+            await drive.UploadAsync(folder, name, content, cancellationToken: cts.Token).ConfigureAwait(false);
+        });
+
+        await Task.Delay(TimeSpan.FromMilliseconds(1200)).ConfigureAwait(false);
+        cts.Cancel();
+        try
+        {
+            await upload.ConfigureAwait(false);
+            Console.WriteLine("  (attempt 1 finished before cancel took effect)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  interrupted attempt 1 ({ex.GetType().Name}) — an orphaned draft may now hold \"{name}\".");
+        }
+    }
+
+    // Attempt 2: same name — should override the orphaned draft and succeed.
+    var ok = false;
+    try
+    {
+        await using var content = File.OpenRead(temp);
+        await drive.UploadAsync(folder, name, content).ConfigureAwait(false);
+        Console.WriteLine("  + Attempt 2 (same name) SUCCEEDED — draft override works.");
+        ok = true;
+
+        var node = await drive.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{name}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await drive.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("  cleaned up.");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Attempt 2 FAILED: {ex.GetType().Name}: {ex.Message}");
+    }
+    finally
+    {
+        try { File.Delete(temp); } catch { /* ignore */ }
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Repro tool for large-file upload failures: upload a temp file of a given size straight through the Drive
+// client (no sync machinery) and print the FULL exception if it fails. `--uploadtest <remotePath> [sizeMB]`.
+static async Task<int> UploadTestAsync(string? remoteOverride, string? sizeArg)
+{
+    if (remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --uploadtest <remotePath> [sizeMB]");
+        return 1;
+    }
+
+    var sizeMb = int.TryParse(sizeArg, out var parsed) && parsed > 0 ? parsed : 50;
+    Console.WriteLine($"PAWS - upload test\n  remote : {remoteOverride}\n  size   : {sizeMb} MB\n");
+
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var folder = await drive.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+    if (folder is null)
+    {
+        Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+        return 1;
+    }
+
+    var name = $"uploadtest-{sizeMb}MB-{DateTime.UtcNow:HHmmss}.bin";
+    var temp = Path.Combine(Path.GetTempPath(), name);
+
+    Console.WriteLine($"  writing {sizeMb} MB temp file…");
+    var block = new byte[1024 * 1024];
+    Random.Shared.NextBytes(block);
+    await using (var fs = File.Create(temp))
+    {
+        for (var i = 0; i < sizeMb; i++)
+        {
+            await fs.WriteAsync(block).ConfigureAwait(false);
+        }
+    }
+
+    var ok = false;
+    try
+    {
+        var sw = Stopwatch.StartNew();
+        await using (var content = File.OpenRead(temp))
+        {
+            await drive.UploadAsync(folder, name, content).ConfigureAwait(false);
+        }
+
+        sw.Stop();
+        Console.WriteLine($"  + Upload OK in {sw.Elapsed.TotalSeconds:F1}s ({sizeMb / Math.Max(0.1, sw.Elapsed.TotalSeconds):F1} MB/s).");
+        ok = true;
+
+        var node = await drive.ResolvePathAsync($"{remoteOverride.TrimEnd('/')}/{name}").ConfigureAwait(false);
+        if (node is not null)
+        {
+            await drive.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("  cleaned up the remote test file.");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x UPLOAD FAILED (full detail):\n{ex}");
+    }
+    finally
+    {
+        try { File.Delete(temp); } catch { /* ignore */ }
+    }
+
+    return ok ? 0 : 1;
 }
 
 // Rebuilds a minimal RemoteNode from a placeholder's stored identity (a revision uid "vol~link~rev").

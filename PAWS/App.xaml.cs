@@ -5,6 +5,7 @@ using Microsoft.UI.Xaml;
 using PAWS.CloudFilter;
 using PAWS.Core.Abstractions;
 using PAWS.Core.Configuration;
+using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 using PAWS.Core.Proton;
 using PAWS.Core.Setup;
@@ -29,6 +30,12 @@ namespace PAWS
             InitializeComponent();
 
             Paths = new PawsPaths();
+
+            // Route Core/sync diagnostics to a dated log file so background sync failures are recoverable.
+            Log = new FileSyncLog(Paths);
+            PawsLog.Writer = Log.Append;
+            PawsLog.Write($"PAWS started (log at {Log.CurrentFile}).");
+
             SettingsStore = new JsonSettingsStore(Paths);
             SecretStore = new DpapiSecretStore(Paths);
 
@@ -59,6 +66,8 @@ namespace PAWS
         public static App Instance => (App)Current;
 
         public PawsPaths Paths { get; }
+
+        public FileSyncLog Log { get; }
 
         public ISettingsStore SettingsStore { get; }
 

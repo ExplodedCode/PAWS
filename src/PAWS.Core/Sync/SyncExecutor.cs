@@ -1,3 +1,4 @@
+using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 
 namespace PAWS.Core.Sync;
@@ -55,11 +56,26 @@ public sealed class SyncExecutor(IProtonDriveClient client)
             }
             catch (Exception ex)
             {
-                failures.Add(new SyncFailure(op, ex.Message));
+                // Full detail (type + message chain + stack) to the log; a concise chain to the UI.
+                PawsLog.Write($"Sync op FAILED: {op.Kind} \"{op.RelativePath}\"{Environment.NewLine}{ex}");
+                failures.Add(new SyncFailure(op, Describe(ex)));
             }
         }
 
         return new SyncResult { Completed = completed, Skipped = skipped, Failures = failures };
+    }
+
+    // A concise one-line description that follows the InnerException chain — the top-level message alone
+    // (e.g. "Error while copying content to a stream") usually hides the real cause underneath.
+    private static string Describe(Exception ex)
+    {
+        var parts = new List<string>();
+        for (Exception? e = ex; e is not null; e = e.InnerException)
+        {
+            parts.Add($"{e.GetType().Name}: {e.Message}");
+        }
+
+        return string.Join(" → ", parts);
     }
 
     private async Task ApplyAsync(

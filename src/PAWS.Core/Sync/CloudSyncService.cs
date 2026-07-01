@@ -281,6 +281,62 @@ public sealed class CloudSyncService(
     }
 
     /// <summary>
+    /// Captures the recursive remote snapshot of a folder for the UI ("check drive status"), serialized on
+    /// the shared drive gate so it can never overlap a sync/hydration (two concurrent high-level SDK
+    /// operations corrupt the transfer). Uses a fresh session so it reflects current Drive truth. Returns
+    /// null if the path is not a folder.
+    /// </summary>
+    public Task<RemoteSnapshot?> CaptureSnapshotAsync(string accountId, string remotePath, CancellationToken cancellationToken = default)
+        => WithFreshClientAsync(
+            accountId,
+            (client, ct) => new RemoteSnapshotBuilder(client).CaptureAsync(remotePath, cancellationToken: ct),
+            cancellationToken);
+
+    /// <summary>
+    /// Lists a remote folder's immediate children for the UI, serialized on the shared drive gate (see
+    /// <see cref="CaptureSnapshotAsync"/>). Returns null if the folder does not exist.
+    /// </summary>
+    public Task<IReadOnlyList<RemoteNode>?> ListChildrenAsync(string accountId, string remotePath, CancellationToken cancellationToken = default)
+        => WithFreshClientAsync<IReadOnlyList<RemoteNode>?>(
+            accountId,
+            async (client, ct) =>
+            {
+                var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false);
+                if (folder is null)
+                {
+                    return null;
+                }
+
+                var children = new List<RemoteNode>();
+                await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+                {
+                    children.Add(child);
+                }
+
+                return children;
+            },
+            cancellationToken);
+
+    // Runs a read against a FRESH Drive session, holding the shared drive gate for the whole thing so it
+    // can't overlap any other Drive operation. Fresh session = current Drive truth (the SDK's per-session
+    // cache would otherwise hide remote deletions/revisions); it becomes the new cached client.
+    private async Task<T> WithFreshClientAsync<T>(
+        string accountId, Func<IProtonDriveClient, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await EvictClientAsync(accountId).ConfigureAwait(false);
+            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+            return await operation(client, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+    }
+
+    /// <summary>
     /// Starts (if not already running) automatic two-way sync for a pair: a debounced watcher pushes
     /// settled LOCAL changes up via <see cref="SyncChangesAsync"/>, and a periodic timer pulls REMOTE
     /// changes down via <see cref="PullChangesAsync"/> (the watcher can't see Drive-side changes).

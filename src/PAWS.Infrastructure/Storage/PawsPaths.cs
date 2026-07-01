@@ -21,6 +21,9 @@ public sealed class PawsPaths
     /// <summary>Non-secret per-pair sync state (last-known snapshot), e.g. <c>state\{pairId}.json</c>.</summary>
     public string StateDirectory => Path.Combine(Root, "state");
 
+    /// <summary>Diagnostic logs (sync activity + failures), e.g. <c>logs\paws-20260701.log</c>.</summary>
+    public string LogsDirectory => Path.Combine(Root, "logs");
+
     public string SettingsFile => Path.Combine(Root, "settings.json");
 
     /// <summary>Per-sync-pair last-known state file.</summary>

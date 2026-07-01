@@ -121,8 +121,15 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
         var size = content.Length;
         var metadata = new FileUploadMetadata { LastModificationTime = lastModifiedUtc };
 
+        // overrideExistingDraftByOtherClient: true — an upload interrupted earlier (a crash, a lost
+        // connection, a killed process) leaves an incomplete DRAFT node on Drive holding this name. Drafts
+        // are invisible to our listings, so the reconciler keeps treating the file as new and re-calls this
+        // create-new-file path; with `false` it would collide forever with the orphaned draft
+        // (NodeWithSameNameExistsException). `true` lets the retry take over the stale draft. It does NOT
+        // affect a COMPLETED file of the same name (that still requires a revision upload), so it can't
+        // clobber real remote content.
         var uploader = await _client.GetFileUploaderAsync(
-            parentUid, name, GuessMediaType(name), size, metadata, overrideExistingDraftByOtherClient: false, cancellationToken).ConfigureAwait(false);
+            parentUid, name, GuessMediaType(name), size, metadata, overrideExistingDraftByOtherClient: true, cancellationToken).ConfigureAwait(false);
 
         var result = await CompleteUploadAsync(uploader, content, progress, cancellationToken).ConfigureAwait(false);
 

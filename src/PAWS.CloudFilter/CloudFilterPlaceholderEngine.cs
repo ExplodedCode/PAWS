@@ -272,28 +272,34 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                         return;
                     }
 
-                    if (!string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) || _cachedData is null)
+                    if (string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) && _cachedData is { } cached)
                     {
-                        using var buffer = new MemoryStream();
-                        await _fetchData(identity, buffer, CancellationToken.None).ConfigureAwait(false);
-                        _cachedData = buffer.ToArray(); // exact-sized
-                        _cachedIdentity = identity;
+                        // Already downloaded (e.g. a later range of the same open) — serve from memory.
+                        var total = cached.Length;
+                        if (offset > total)
+                        {
+                            offset = total;
+                        }
+
+                        if (offset + length > total)
+                        {
+                            length = total - offset;
+                        }
+
+                        TransferRange(operation, cached, offset, length);
+                        return;
                     }
 
-                    var data = _cachedData;
-                    var total = data.Length;
-
-                    if (offset > total)
-                    {
-                        offset = total;
-                    }
-
-                    if (offset + length > total)
-                    {
-                        length = total - offset;
-                    }
-
-                    TransferRange(operation, data, offset, length);
+                    // First access: STREAM the download straight to the platform as bytes arrive, so a slow
+                    // (e.g. throttled) transfer keeps reporting progress via CfExecute instead of buffering
+                    // the whole file and only then sending it — which would blow Cloud Filter's hydration
+                    // timeout on a large/slow download. The sink forwards the bytes falling in the requested
+                    // range as they download, and keeps the full content so any other range of the same open
+                    // is served from memory without re-downloading.
+                    using var sink = new CfHydrationSink(operation, offset, offset + length);
+                    await _fetchData(identity, sink, CancellationToken.None).ConfigureAwait(false);
+                    _cachedData = sink.ToArray();
+                    _cachedIdentity = identity;
                 }
                 finally
                 {
@@ -353,6 +359,110 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             };
             var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
             CfExecute(operation, ref parameters);
+        }
+
+        /// <summary>
+        /// A write-only <see cref="Stream"/> the downloader writes into: as bytes arrive it forwards the
+        /// portion overlapping the requested range [<c>sendStart</c>, <c>sendEnd</c>) to the platform via
+        /// <c>CfExecute(TRANSFER_DATA)</c> at the correct file offset — so hydration reports progress
+        /// continuously during a slow download instead of stalling until the whole file is buffered. Every
+        /// byte is also accumulated so the caller can cache the full content for other ranges of the open.
+        /// </summary>
+        private sealed class CfHydrationSink(CF_OPERATION_INFO operation, long sendStart, long sendEnd) : Stream
+        {
+            private readonly MemoryStream _accumulated = new();
+
+            public override bool CanWrite => true;
+
+            public override bool CanRead => false;
+
+            public override bool CanSeek => false;
+
+            public override long Length => _accumulated.Length;
+
+            public override long Position
+            {
+                get => _accumulated.Length;
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush()
+            {
+            }
+
+            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count) => Emit(buffer.AsSpan(offset, count));
+
+            public override void Write(ReadOnlySpan<byte> buffer) => Emit(buffer);
+
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                Emit(buffer.AsSpan(offset, count));
+                return Task.CompletedTask;
+            }
+
+            public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                Emit(buffer.Span);
+                return ValueTask.CompletedTask;
+            }
+
+            public byte[] ToArray() => _accumulated.ToArray();
+
+            private void Emit(ReadOnlySpan<byte> data)
+            {
+                var fileStart = _accumulated.Length; // file offset of this write's first byte
+                _accumulated.Write(data);            // keep everything for the caller's cache
+                var fileEnd = fileStart + data.Length;
+
+                // The slice of this write that the platform is actually waiting on.
+                var from = Math.Max(fileStart, sendStart);
+                var to = Math.Min(fileEnd, sendEnd);
+                if (to <= from)
+                {
+                    return;
+                }
+
+                SendChunks(operation, data.Slice((int)(from - fileStart), (int)(to - from)), from);
+            }
+
+            private static unsafe void SendChunks(CF_OPERATION_INFO op, ReadOnlySpan<byte> data, long fileOffset)
+            {
+                var sent = 0;
+                while (sent < data.Length)
+                {
+                    var chunk = Math.Min(ChunkSize, data.Length - sent);
+                    fixed (byte* pointer = &data[sent])
+                    {
+                        var transfer = new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                        {
+                            Length = chunk,
+                            Offset = fileOffset + sent,
+                            Buffer = (IntPtr)pointer,
+                            Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                        };
+                        var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
+                        CfExecute(op, ref parameters);
+                    }
+
+                    sent += chunk;
+                }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    _accumulated.Dispose();
+                }
+
+                base.Dispose(disposing);
+            }
         }
 
         private static CF_OPERATION_INFO CreateOperationInfo(in CF_CALLBACK_INFO callbackInfo, CF_OPERATION_TYPE type)

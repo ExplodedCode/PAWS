@@ -321,9 +321,15 @@ namespace PAWS.Views
 
                 var result = e.Result!;
                 var when = DateTime.Now.ToString("t");
+                if (result.Failures.Count > 0)
+                {
+                    SetPairStatus(e.PairId, $"Auto-sync: {result.Completed} applied, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
+                    return;
+                }
+
                 SetPairStatus(e.PairId, result.Total == 0
                     ? $"Auto-sync: up to date · {when}"
-                    : $"Auto-sync: {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s)" : string.Empty)}{(result.Failures.Count > 0 ? $", {result.Failures.Count} failed" : string.Empty)} · {when}");
+                    : $"Auto-sync: {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s)" : string.Empty)} · {when}");
             });
         }
 
@@ -342,9 +348,16 @@ namespace PAWS.Views
 
                 var result = e.Result!;
                 var when = DateTime.Now.ToString("t");
+                if (result.Failures.Count > 0)
+                {
+                    // Show the actual reason (first failure); full detail + stack is in the log file.
+                    SetPairStatus(e.PairId, $"Auto-sync: {result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
+                    return;
+                }
+
                 SetPairStatus(e.PairId, result.Total == 0
                     ? $"Auto-sync: up to date · {when}"
-                    : $"Auto-sync: pushed {result.Completed} change(s){(result.Failures.Count > 0 ? $", {result.Failures.Count} failed" : string.Empty)} · {when}");
+                    : $"Auto-sync: pushed {result.Completed} change(s) · {when}");
             });
         }
 
@@ -686,9 +699,9 @@ namespace PAWS.Views
             {
                 try
                 {
-                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
-
-                    var snapshot = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath);
+                    // Goes through CloudSync so it serializes on the shared drive gate — a "check status"
+                    // must never run a second SDK operation concurrently with a sync/hydration.
+                    var snapshot = await App.Instance.CloudSync.CaptureSnapshotAsync(account.Id, pair.RemotePath);
                     if (snapshot is null)
                     {
                         ring.IsActive = false;
@@ -749,26 +762,23 @@ namespace PAWS.Views
             {
                 try
                 {
-                    await using var client = await App.Instance.DriveClientFactory.CreateAsync(account.Id);
-
-                    var folder = await client.ResolvePathAsync(pair.RemotePath);
-                    if (folder is null)
+                    // Goes through CloudSync so it serializes on the shared drive gate (see ShowSnapshotAsync).
+                    var children = await App.Instance.CloudSync.ListChildrenAsync(account.Id, pair.RemotePath);
+                    if (children is null)
                     {
                         ring.IsActive = false;
                         status.Text = $"Folder not found on Drive: {pair.RemotePath}";
                         return;
                     }
 
-                    var count = 0;
-                    await foreach (var child in client.ListChildrenAsync(folder))
+                    foreach (var child in children)
                     {
                         var size = child.Size is { } s ? $"   ({FormatSize(s)})" : string.Empty;
                         results.Children.Add(new TextBlock { Text = $"{(child.IsFolder ? "📁" : "📄")}  {child.Name}{size}" });
-                        count++;
                     }
 
                     ring.IsActive = false;
-                    status.Text = count == 0 ? "This folder is empty." : $"{count} item(s).";
+                    status.Text = children.Count == 0 ? "This folder is empty." : $"{children.Count} item(s).";
                 }
                 catch (Exception ex)
                 {
