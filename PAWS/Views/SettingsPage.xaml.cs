@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using PAWS.Infrastructure.Startup;
 using PAWS.Infrastructure.Storage;
 
 namespace PAWS.Views
@@ -43,7 +44,9 @@ namespace PAWS.Views
         private void OnBackClicked(object sender, RoutedEventArgs e)
             => App.Instance.Window?.NavigateToHome();
 
-        // One handler for all three behavior switches — they persist together.
+        // One handler for all three behavior switches — they persist together. Run-on-startup applies to
+        // the Windows registry right away; the other two are consulted where they act (window close,
+        // app launch), so persisting is all they need.
         private void OnBehaviorToggled(object sender, RoutedEventArgs e)
         {
             if (_loading)
@@ -56,6 +59,8 @@ namespace PAWS.Views
             settings.RunInBackground = BackgroundToggle.IsOn;
             settings.AutoSyncOnLaunch = AutoSyncStartToggle.IsOn;
             App.Instance.SettingsStore.Save(settings);
+
+            StartupRegistration.Apply(settings.RunOnStartup);
         }
 
         private void OnUploadLimitToggled(object sender, RoutedEventArgs e)
@@ -73,7 +78,8 @@ namespace PAWS.Views
         private void OnLimitValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
             => SaveLimits();
 
-        // Load-modify-save so the accounts list is never clobbered by a stale in-memory copy.
+        // Load-modify-save so the accounts list is never clobbered by a stale in-memory copy. The live
+        // throttle is updated too, so the new limit applies immediately — including mid-transfer.
         private void SaveLimits()
         {
             if (_loading)
@@ -85,6 +91,9 @@ namespace PAWS.Views
             settings.UploadLimitKBps = UploadLimitToggle.IsOn ? ToKBps(UploadLimitBox.Value) : null;
             settings.DownloadLimitKBps = DownloadLimitToggle.IsOn ? ToKBps(DownloadLimitBox.Value) : null;
             App.Instance.SettingsStore.Save(settings);
+
+            App.Instance.Throttle.UploadLimitKBps = settings.UploadLimitKBps;
+            App.Instance.Throttle.DownloadLimitKBps = settings.DownloadLimitKBps;
         }
 
         // NumberBox reports NaN while empty; fall back to a sensible default.

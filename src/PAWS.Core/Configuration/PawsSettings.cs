@@ -18,30 +18,32 @@ public sealed class PawsSettings
     public List<ProtonAccount> Accounts { get; set; } = new();
 
     /// <summary>
-    /// Start PAWS automatically when the user signs in to Windows. NOT YET ENFORCED — autostart
-    /// registration (StartupTask) is planned; the preference is captured now.
+    /// Start PAWS automatically when the user signs in to Windows. Applied via the per-user Run registry
+    /// entry (see <c>StartupRegistration</c>), kept in sync at launch and when toggled in Settings.
     /// </summary>
     public bool RunOnStartup { get; set; } = true;
 
     /// <summary>
-    /// Keep running in the tray (background sync) when the window is closed or minimized. The tray
-    /// behavior is currently always on; this preference will control it in an upcoming build.
+    /// Keep running in the tray (background sync continues) when the window is closed. When off, closing
+    /// the window exits the app. Consulted by the main window's closing handler.
     /// </summary>
     public bool RunInBackground { get; set; } = true;
 
     /// <summary>
-    /// Automatically start syncing all accounts when the app starts. Launch auto-sync currently follows
-    /// each folder's own auto-sync flag; this app-wide switch will gate it in an upcoming build.
+    /// Start background auto-sync (watchers + Drive polling) for EVERY enabled folder when the app
+    /// starts — pausing a folder is session-scoped; launch flips it back to auto. When off, pause states
+    /// persist across restarts and nothing syncs in the background until started manually (on-demand
+    /// folders still connect so they stay browsable/hydratable).
     /// </summary>
     public bool AutoSyncOnLaunch { get; set; } = true;
 
     /// <summary>
-    /// Upload speed cap in KB/s; null = unlimited. Persisted app-wide. NOT YET ENFORCED — the transfer
-    /// throttle is planned; the setting exists so the UI can capture the preference now.
+    /// Upload speed cap in KB/s; null = unlimited. Enforced by <c>TransferThrottle</c> in every upload
+    /// path; changes apply immediately, including to in-flight transfers.
     /// </summary>
     public int? UploadLimitKBps { get; set; }
 
-    /// <summary>Download speed cap in KB/s; null = unlimited. Same not-yet-enforced caveat as upload.</summary>
+    /// <summary>Download speed cap in KB/s; null = unlimited. Enforced like the upload cap, including on-demand hydration.</summary>
     public int? DownloadLimitKBps { get; set; }
 
     /// <summary>True once at least one account has been added.</summary>

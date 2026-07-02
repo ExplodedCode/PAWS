@@ -15,7 +15,8 @@ public sealed class CloudSyncService(
     IProtonDriveClientFactory clientFactory,
     ISyncStateStore stateStore,
     IPopulatedFolderStore populatedStore,
-    SemaphoreSlim driveGate) : IAsyncDisposable
+    SemaphoreSlim driveGate,
+    TransferThrottle? throttle = null) : IAsyncDisposable
 {
     // Stable provider identity for PAWS sync roots.
     private const string ProviderId = "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64";
@@ -214,7 +215,11 @@ public sealed class CloudSyncService(
         await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await downloadClient.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
+            // Hydration honors the download speed limit too. leaveOpen: the hydration connection owns
+            // the sink; the wrapper holds no state of its own. Throttled hydration stays timeout-safe —
+            // the sink streams each chunk to Cloud Filter as it arrives, so progress keeps reporting.
+            var destination = throttle?.WrapDownloadDestination(output, leaveOpen: true) ?? output;
+            await downloadClient.DownloadAsync(NodeFromIdentity(identity), destination, cancellationToken: ct).ConfigureAwait(false);
         }
         finally
         {
@@ -261,7 +266,7 @@ public sealed class CloudSyncService(
                 .Where(o => o.Kind != SyncOperationKind.DeleteRemote || populated.Contains(ParentFolderOf(o.RelativePath)))
                 .ToList();
 
-            var result = await new SyncExecutor(client)
+            var result = await new SyncExecutor(client, throttle)
                 .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
 

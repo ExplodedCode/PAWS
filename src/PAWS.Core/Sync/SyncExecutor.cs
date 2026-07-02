@@ -12,7 +12,7 @@ namespace PAWS.Core.Sync;
 /// Safety: downloads are written to a temp file and atomically moved into place, so a failed download
 /// never leaves a half-written file. First sync (empty state) yields no deletes.
 /// </summary>
-public sealed class SyncExecutor(IProtonDriveClient client)
+public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? throttle = null)
 {
     public async Task<SyncResult> ExecuteAsync(
         string localRoot,
@@ -96,7 +96,7 @@ public sealed class SyncExecutor(IProtonDriveClient client)
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
 
                 var temp = target + ".paws-partial";
-                using (var stream = File.Create(temp))
+                using (var stream = ThrottledWrite(File.Create(temp)))
                 {
                     await client.DownloadAsync(ToNode(op.Remote!), stream, cancellationToken: cancellationToken).ConfigureAwait(false);
                 }
@@ -122,7 +122,7 @@ public sealed class SyncExecutor(IProtonDriveClient client)
             case SyncOperationKind.UploadFile:
             {
                 var source = LocalPath(localRoot, op.RelativePath);
-                using var stream = File.OpenRead(source);
+                using var stream = ThrottledRead(File.OpenRead(source));
 
                 if (op.Remote is { RevisionUid: not null } existing)
                 {
@@ -162,6 +162,12 @@ public sealed class SyncExecutor(IProtonDriveClient client)
                 break;
         }
     }
+
+    // Apply the app-wide speed limits (when configured) to the streams a transfer actually moves bytes
+    // through: uploads read from the local file, downloads write to the temp file.
+    private Stream ThrottledRead(Stream source) => throttle?.WrapUploadSource(source) ?? source;
+
+    private Stream ThrottledWrite(Stream destination) => throttle?.WrapDownloadDestination(destination) ?? destination;
 
     private static RemoteNode ToNode(RemoteEntry e) => new()
     {

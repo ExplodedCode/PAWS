@@ -13,7 +13,8 @@ namespace PAWS.Core.Sync;
 /// native crypto (proton_crypto.dll) is not concurrency-safe, so full-sync work must never run at the same
 /// time as on-demand hydration/push/pull (which share the same gate).</para>
 /// </summary>
-public sealed class SyncEngine(IProtonDriveClientFactory clientFactory, ISyncStateStore stateStore, SemaphoreSlim driveGate)
+public sealed class SyncEngine(
+    IProtonDriveClientFactory clientFactory, ISyncStateStore stateStore, SemaphoreSlim driveGate, TransferThrottle? throttle = null)
 {
     /// <summary>Captures both trees and reconciles them against last-known state — no files are moved.</summary>
     public async Task<SyncPlan> PlanAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
@@ -59,7 +60,7 @@ public sealed class SyncEngine(IProtonDriveClientFactory clientFactory, ISyncSta
         {
             await using var client = await clientFactory.CreateAsync(accountId, cancellationToken).ConfigureAwait(false);
 
-            var executor = new SyncExecutor(client);
+            var executor = new SyncExecutor(client, throttle);
             var result = await executor.ExecuteAsync(
                 plan.Pair.LocalPath, plan.RemoteRoot, plan.RemoteSnapshot, plan.Operations, progress, cancellationToken).ConfigureAwait(false);
 

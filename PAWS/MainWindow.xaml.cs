@@ -74,7 +74,15 @@ namespace PAWS
                 return;
             }
 
-            // Don't exit — just hide. The sync engine (once added) keeps running in the background.
+            // "Keep running in the background" off → closing the window really exits the app.
+            if (!App.Instance.SettingsStore.Load().RunInBackground)
+            {
+                _allowClose = true;
+                TrayIcon.Dispose();
+                return;
+            }
+
+            // Don't exit — just hide. Background sync keeps running; the tray icon reopens the window.
             e.Cancel = true;
             sender.Hide();
         }

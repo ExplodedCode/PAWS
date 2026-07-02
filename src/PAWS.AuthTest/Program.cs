@@ -41,6 +41,8 @@ return mode switch
     "--lazytest" or "lazytest" => await LazyTestAsync(localArg, remoteArg),
     "--dirtest" or "dirtest" => DirTest(localArg, remoteArg),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
+    "--throttletest" or "throttletest" => await ThrottleTestAsync(),
+    "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -516,6 +518,199 @@ static async Task<int> LazyTestAsync(string? localOverride, string? remoteOverri
         }
     }
 
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Reproduces the user's "pause mid-upload" crash scenario headlessly: enable an on-demand pair with a
+// throttled uploader, drop a file big enough that the auto-push takes ~15s, then StopAutoSync (the exact
+// pause path: FolderWatcher.Dispose → CTS.Cancel mid-HTTP) while the upload is in flight. Unhandled and
+// unobserved exceptions are reported; the test passes if the process survives and a resumed auto-sync
+// then completes the upload. `--pausetest <localFolder> <remotePath>`.
+static async Task<int> PauseTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --pausetest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        Console.WriteLine($"\n  [UNHANDLED — this is what crashes the app]\n{e.ExceptionObject}");
+    TaskScheduler.UnobservedTaskException += (_, e) =>
+        Console.WriteLine($"\n  [UNOBSERVED TASK EXCEPTION]\n{e.Exception}");
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+    var testRoot = $"{remoteOverride.TrimEnd('/')}/_pausetest_{stamp}";
+
+    await using (var setup = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (setup is null)
+        {
+            return 1;
+        }
+
+        var parent = await setup.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+        if (parent is null)
+        {
+            Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+            return 1;
+        }
+
+        await setup.CreateFolderAsync(parent, $"_pausetest_{stamp}").ConfigureAwait(false);
+    }
+
+    Console.WriteLine($"PAWS - pause-mid-upload test\n  local  : {localOverride}\n  remote : {testRoot}\n");
+
+    Directory.CreateDirectory(localOverride);
+    var engine = new CloudFilterPlaceholderEngine();
+    // Throttle the upload to 512 KB/s so an 8 MB file reliably takes ~16s — plenty of window to pause
+    // mid-transfer. This also matches the app, where ThrottledStream is always in the stream chain.
+    var throttle = new TransferThrottle { UploadLimitKBps = 512 };
+    await using var cloud = new CloudSyncService(
+        engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths),
+        new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1), throttle);
+    var pair = new SyncPair { Id = $"pausetest{stamp}", LocalPath = localOverride, RemotePath = testRoot, Mode = SyncMode.OnDemand };
+
+    var syncStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var pushed = new TaskCompletionSource<SyncResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+    cloud.AutoSyncStarted += _ =>
+    {
+        Console.WriteLine($"  [auto] sync started ({DateTime.Now:HH:mm:ss})");
+        syncStarted.TrySetResult();
+    };
+    cloud.AutoSyncCompleted += e =>
+    {
+        Console.WriteLine(e.Succeeded
+            ? $"  [auto] completed — pushed {e.Result!.Completed}, failed {e.Result.Failures.Count} ({DateTime.Now:HH:mm:ss})"
+            : $"  [auto] error: {e.Error!.GetType().Name}: {e.Error.Message} ({DateTime.Now:HH:mm:ss})");
+        if (e.Succeeded && e.Result!.Completed > 0 && e.Result.Failures.Count == 0)
+        {
+            pushed.TrySetResult(e.Result);
+        }
+    };
+
+    var ok = true;
+    try
+    {
+        await cloud.EnableAsync(account.Id, pair);
+        cloud.StartAutoSync(account.Id, pair);
+
+        // 8 MB of random bytes → ~16s upload at 512 KB/s.
+        var payload = new byte[8 * 1024 * 1024];
+        Random.Shared.NextBytes(payload);
+        var fileName = $"bigfile-{stamp}.bin";
+        await File.WriteAllBytesAsync(Path.Combine(localOverride, fileName), payload);
+        Console.WriteLine($"  wrote {fileName} (8 MB) — waiting for auto-sync to start…");
+
+        if (await Task.WhenAny(syncStarted.Task, Task.Delay(TimeSpan.FromSeconds(30))) != syncStarted.Task)
+        {
+            Console.WriteLine("  x auto-sync never started.");
+            return 1;
+        }
+
+        // Let the upload get well underway, then pause exactly like the UI's ⏸ button does.
+        await Task.Delay(TimeSpan.FromSeconds(6));
+        Console.WriteLine($"  PAUSING mid-upload (StopAutoSync) ({DateTime.Now:HH:mm:ss})…");
+        cloud.StopAutoSync(pair.Id);
+        Console.WriteLine("  StopAutoSync returned — waiting 10s for any delayed fallout…");
+
+        await Task.Delay(TimeSpan.FromSeconds(10));
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Console.WriteLine("  process is still alive after the pause. Resuming to verify recovery…");
+
+        // Resume — the watcher should retry the (aborted) upload and finish it.
+        cloud.StartAutoSync(account.Id, pair);
+        File.SetLastWriteTimeUtc(Path.Combine(localOverride, fileName), DateTime.UtcNow); // nudge the watcher
+        var finished = await Task.WhenAny(pushed.Task, Task.Delay(TimeSpan.FromSeconds(90)));
+        var resumed = finished == pushed.Task;
+        Console.WriteLine($"  resumed upload completed: {(resumed ? "YES" : "NO (timed out)")}");
+        ok = resumed;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Test error: {ex.GetType().Name}: {ex.Message}");
+        ok = false;
+    }
+    finally
+    {
+        cloud.StopAutoSync(pair.Id);
+        cloud.Disable(pair.Id);
+        try { engine.UnregisterSyncRoot(localOverride); } catch { }
+        new JsonSyncStateStore(paths).Clear(pair.Id);
+        new JsonPopulatedFolderStore(paths).Clear(pair.Id);
+
+        await using var cleanup = await ConnectFromStoredAsync().ConfigureAwait(false);
+        var node = cleanup is null ? null : await cleanup.ResolvePathAsync(testRoot).ConfigureAwait(false);
+        if (node is not null)
+        {
+            await cleanup!.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("  cleaned up the remote test folder.");
+        }
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE timing test for the transfer speed limiter: pushes a known payload through ThrottledStream
+// at a fixed rate and asserts elapsed time matches the budget (write/download path, read/upload path,
+// and unlimited passthrough). `--throttletest`.
+static async Task<int> ThrottleTestAsync()
+{
+    const int limitKBps = 256;
+    var payload = new byte[768 * 1024]; // 3 seconds of budget at 256 KB/s
+
+    // Download path: throttled writes.
+    var downloadThrottle = new TransferThrottle { DownloadLimitKBps = limitKBps };
+    var sw = Stopwatch.StartNew();
+    await using (var dest = downloadThrottle.WrapDownloadDestination(new MemoryStream()))
+    {
+        await dest.WriteAsync(payload);
+    }
+
+    sw.Stop();
+    var writeOk = sw.Elapsed.TotalSeconds is >= 2.0 and <= 5.0;
+    Console.WriteLine($"  throttled WRITE  768 KB @ {limitKBps} KB/s: {sw.Elapsed.TotalSeconds:0.00}s (expect ~3s)  -> {(writeOk ? "PASS" : "FAIL")}");
+
+    // Upload path: throttled reads.
+    var uploadThrottle = new TransferThrottle { UploadLimitKBps = limitKBps };
+    sw.Restart();
+    await using (var source = uploadThrottle.WrapUploadSource(new MemoryStream(payload)))
+    {
+        var buffer = new byte[81920];
+        while (await source.ReadAsync(buffer) > 0)
+        {
+        }
+    }
+
+    sw.Stop();
+    var readOk = sw.Elapsed.TotalSeconds is >= 2.0 and <= 5.0;
+    Console.WriteLine($"  throttled READ   768 KB @ {limitKBps} KB/s: {sw.Elapsed.TotalSeconds:0.00}s (expect ~3s)  -> {(readOk ? "PASS" : "FAIL")}");
+
+    // No limit set: passthrough must be effectively instant.
+    var unlimited = new TransferThrottle();
+    sw.Restart();
+    await using (var dest = unlimited.WrapDownloadDestination(new MemoryStream()))
+    {
+        await dest.WriteAsync(payload);
+    }
+
+    sw.Stop();
+    var passOk = sw.Elapsed.TotalSeconds < 0.5;
+    Console.WriteLine($"  unlimited WRITE  768 KB:                    {sw.Elapsed.TotalSeconds:0.00}s (expect ~0s)  -> {(passOk ? "PASS" : "FAIL")}");
+
+    var ok = writeOk && readOk && passOk;
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
 }

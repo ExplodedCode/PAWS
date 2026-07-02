@@ -326,6 +326,11 @@ namespace PAWS.Views
                         }
                     }
                 }
+                catch (Exception ex)
+                {
+                    // This handler is async void — an escaping exception would take the app down.
+                    SetPairStatus(pair.Id, PairState.Attention, $"Pause/resume failed: {ex.Message}");
+                }
                 finally
                 {
                     playPause.IsEnabled = true;

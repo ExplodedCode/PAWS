@@ -26,9 +26,6 @@
                 Padding="20,16">
                 <StackPanel Spacing="12">
                     <TextBlock Text="App behavior" Style="{StaticResource SubtitleTextBlockStyle}" />
-                    <TextBlock
-                        Text="Preferences are saved now; full wiring lands in an upcoming build."
-                        FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
 
                     <ToggleSwitch
                         x:Name="StartupToggle"
@@ -41,6 +38,7 @@
                     <ToggleSwitch
                         x:Name="AutoSyncStartToggle"
                         Header="Start syncing all accounts when PAWS starts"
+                        ToolTipService.ToolTip="Background sync resumes for every folder at launch — including folders you paused. Turn this off to keep pause states across restarts."
                         Toggled="OnBehaviorToggled" />
                 </StackPanel>
             </Border>
@@ -55,7 +53,7 @@
                 <StackPanel Spacing="12">
                     <TextBlock Text="Sync speed" Style="{StaticResource SubtitleTextBlockStyle}" />
                     <TextBlock
-                        Text="Cap how much of your connection PAWS uses. Limits are saved now and will take effect once the transfer throttle ships in an upcoming build."
+                        Text="Cap how much of your connection PAWS uses. Applies to uploads, downloads, and opening on-demand files; changes take effect immediately, even mid-transfer."
                         FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
 
                     <Grid ColumnSpacing="16" RowSpacing="10">
