@@ -14,6 +14,7 @@ public sealed class CloudSyncService(
     IPlaceholderEngine placeholderEngine,
     IProtonDriveClientFactory clientFactory,
     ISyncStateStore stateStore,
+    IPopulatedFolderStore populatedStore,
     SemaphoreSlim driveGate) : IAsyncDisposable
 {
     // Stable provider identity for PAWS sync roots.
@@ -29,6 +30,10 @@ public sealed class CloudSyncService(
     private readonly Dictionary<string, FolderWatcher> _watchers = new(StringComparer.Ordinal); // pairId -> auto push watcher
     private readonly Dictionary<string, Timer> _pullTimers = new(StringComparer.Ordinal); // pairId -> periodic pull timer
     private readonly HashSet<string> _pullInFlight = new(StringComparer.Ordinal); // pairIds with a pull running
+    // Folders (relative, '/'-separated, "" = root) that have been POPULATED (materialized locally), per
+    // pair. Loaded from populatedStore, grows as folders are browsed. Push/pull scope to this so lazy
+    // population is never mistaken for a local deletion. Guarded by its own lock.
+    private readonly Dictionary<string, HashSet<string>> _populated = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _enableGate = new(1, 1);
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     // The native crypto (proton_crypto.dll) is process-global and NOT concurrency-safe, so serialize every
@@ -61,9 +66,10 @@ public sealed class CloudSyncService(
     }
 
     /// <summary>
-    /// Sets up (or refreshes) on-demand for a pair: register the sync root, capture the remote tree, and
-    /// connect the provider (folders populate lazily on enumeration; files hydrate on open). Re-entrant —
-    /// replaces any existing connection for the pair. Returns the number of remote items available.
+    /// Sets up (or refreshes) on-demand for a pair with SCALABLE, lazy population: only the root's direct
+    /// children are materialized up front (the sync root doesn't fire FETCH_PLACEHOLDERS for its own
+    /// children); every sub-folder is populated on first browse via the connected provider. Re-entrant —
+    /// replaces any existing connection. Returns the number of items at the root.
     /// </summary>
     public async Task<int> EnableAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
@@ -74,46 +80,127 @@ public sealed class CloudSyncService(
 
             placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
 
-            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+            var fetchChildren = CreateFetchChildren(accountId, pair);
 
-            RemoteSnapshot snapshot;
-            await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false); // capture uses native crypto
-            try
+            // Materialize only the root's direct children (one folder listing, not the whole tree). This
+            // also marks "" populated. Sub-folders come in lazily on browse via the provider.
+            var rootChildren = await fetchChildren(string.Empty, cancellationToken).ConfigureAwait(false);
+            var rootSnapshot = new RemoteSnapshot
             {
-                snapshot = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
-                    ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            }
-            finally
-            {
-                _clientUseGate.Release();
-            }
+                RootPath = pair.RemotePath,
+                CapturedUtc = DateTimeOffset.UtcNow,
+                Entries = rootChildren,
+            };
+            placeholderEngine.CreatePlaceholders(pair.LocalPath, rootSnapshot);
 
-            // Create placeholders so the folder shows content (the sync root itself doesn't fire
-            // FETCH_PLACEHOLDERS for its children); the connected provider then serves enumeration of
-            // sub-folders and hydrates files on open.
-            placeholderEngine.CreatePlaceholders(pair.LocalPath, snapshot);
-
-            // Record the synced state (placeholders == remote) so a later SyncChangesAsync can tell what
-            // the user changed locally. Hydration doesn't alter size/mtime, so it won't look like a change.
-            var localState = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
+            // Record the synced state for just what's materialized (the root) — a later SyncChangesAsync
+            // compares against this. It grows as folders are browsed and synced.
+            var localState = new LocalSnapshotBuilder().Capture(pair.LocalPath, GetPopulated(pair.Id), cancellationToken);
             if (localState is not null)
             {
-                stateStore.Save(SyncStateBuilder.Build(pair.Id, snapshot, localState));
+                stateStore.Save(SyncStateBuilder.Build(pair.Id, rootSnapshot, localState));
             }
 
-            var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, CreateFetchCallback(accountId));
+            var connection = placeholderEngine.Connect(pair.LocalPath, fetchChildren, CreateFetchCallback(accountId));
 
             lock (_connections)
             {
                 _connections[pair.Id] = connection;
             }
 
-            return snapshot.Entries.Count;
+            return rootChildren.Count;
         }
         finally
         {
             _enableGate.Release();
         }
+    }
+
+    // Builds the lazy per-folder listing callback for a pair: lists ONE remote folder's children (relative
+    // to the sync root; "" = root), maps them to sync-root-relative RemoteEntry, and marks that folder
+    // populated (persisted). Serialized on the shared client gate (native crypto). This is the engine that
+    // makes population scalable — only browsed folders are ever listed/materialized.
+    private FetchFolderChildren CreateFetchChildren(string accountId, SyncPair pair) => async (relativeFolder, ct) =>
+    {
+        var remotePath = string.IsNullOrEmpty(relativeFolder)
+            ? pair.RemotePath
+            : $"{pair.RemotePath.TrimEnd('/')}/{relativeFolder}";
+
+        var client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
+
+        var entries = new List<RemoteEntry>();
+        await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote folder not found: {remotePath}");
+
+            await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+            {
+                var relativePath = string.IsNullOrEmpty(relativeFolder) ? child.Name : $"{relativeFolder}/{child.Name}";
+                entries.Add(new RemoteEntry
+                {
+                    RelativePath = relativePath,
+                    Name = child.Name,
+                    IsFolder = child.IsFolder,
+                    Size = child.Size,
+                    ModifiedUtc = child.ModifiedUtc,
+                    Uid = child.Uid,
+                    ParentUid = child.ParentUid,
+                    RevisionUid = child.RevisionUid,
+                });
+            }
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+
+        MarkPopulated(pair.Id, relativeFolder);
+        return entries;
+    };
+
+    // The live populated set for a pair (loaded on first use; the root "" is always populated). Caller
+    // must hold the _populated lock.
+    private HashSet<string> GetOrLoadPopulated(string pairId)
+    {
+        if (!_populated.TryGetValue(pairId, out var set))
+        {
+            set = new HashSet<string>(populatedStore.Load(pairId), StringComparer.Ordinal) { string.Empty };
+            _populated[pairId] = set;
+        }
+
+        return set;
+    }
+
+    /// <summary>A snapshot of the populated-folder set for a pair (safe to read while it's being updated).</summary>
+    private IReadOnlySet<string> GetPopulated(string pairId)
+    {
+        lock (_populated)
+        {
+            return new HashSet<string>(GetOrLoadPopulated(pairId), StringComparer.Ordinal);
+        }
+    }
+
+    private void MarkPopulated(string pairId, string relativeFolder)
+    {
+        bool added;
+        lock (_populated)
+        {
+            added = GetOrLoadPopulated(pairId).Add(relativeFolder);
+        }
+
+        if (added)
+        {
+            populatedStore.Save(pairId, GetPopulated(pairId));
+        }
+    }
+
+    // Parent folder (relative, '/'-separated) of a relative path; "" for a root-level item.
+    private static string ParentFolderOf(string relativePath)
+    {
+        var slash = relativePath.LastIndexOf('/');
+        return slash < 0 ? string.Empty : relativePath[..slash];
     }
 
     /// <summary>
@@ -151,11 +238,16 @@ public sealed class CloudSyncService(
         await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            var populated = GetPopulated(pair.Id);
+
             var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
             var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
+            // Scope the local walk to populated folders: un-browsed folders aren't materialized, so walking
+            // them would (a) trigger on-demand population and (b) make the reconciler see their remote
+            // contents as "deleted locally". Their contents are therefore never in this snapshot.
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
                 ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
 
             var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
@@ -164,15 +256,20 @@ public sealed class CloudSyncService(
             // On-demand pushes local->remote only; new/updated remote content stays as on-demand placeholders.
             var pushOperations = operations
                 .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote)
+                // Hard safety guard: only trash on Drive when the item's parent folder is actually
+                // populated (fully materialized) locally, so lazy population can never be read as a delete.
+                .Where(o => o.Kind != SyncOperationKind.DeleteRemote || populated.Contains(ParentFolderOf(o.RelativePath)))
                 .ToList();
 
             var result = await new SyncExecutor(client)
                 .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
 
-            // Re-capture and persist state so the next run starts from a clean baseline.
+            // Re-capture and persist state so the next run starts from a clean baseline. Local is again
+            // scoped to populated folders, which keeps the saved state "materialized-only" — the property
+            // that makes un-browsed remote content read as new (ignored by push), never as a deletion.
             var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
-            var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
+            var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
             if (newRemote is not null && newLocal is not null)
             {
                 stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
@@ -216,18 +313,22 @@ public sealed class CloudSyncService(
             await EvictClientAsync(accountId).ConfigureAwait(false);
             var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
 
+            var populated = GetPopulated(pair.Id);
+
             remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
                 ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
 
             var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
             var operations = new Reconciler().Reconcile(remote, local, lastKnown);
 
-            // Pull is remote->local only: bring down creations/changes/deletions. Uploads and conflicts
-            // are deliberately ignored here so local work is never discarded.
+            // Pull is remote->local only: bring down creations/changes/deletions. Uploads and conflicts are
+            // ignored (local work is never discarded). Restricted to POPULATED folders so we don't eagerly
+            // materialize un-browsed folders — those stay lazy and populate on first browse.
             var pullOperations = operations
                 .Where(o => o.Kind is SyncOperationKind.DownloadFile or SyncOperationKind.CreateLocalFolder or SyncOperationKind.DeleteLocal)
+                .Where(o => populated.Contains(ParentFolderOf(o.RelativePath)))
                 .ToList();
 
             // Deletions: remote-deleted items, plus changed files (delete the stale placeholder so the
@@ -239,16 +340,29 @@ public sealed class CloudSyncService(
                 DeleteLocalPlaceholder(pair.LocalPath, op.RelativePath, op.IsFolder);
             }
 
-            // Creations + recreations: CreatePlaceholders adds every entry now missing on disk (it skips
-            // ones that already exist), which covers both brand-new remote items and the just-deleted
-            // changed files.
-            placeholderEngine.CreatePlaceholders(pair.LocalPath, remote);
+            // Creations + recreations: create placeholders for ONLY the pulled entries (new remote items in
+            // populated folders + the just-deleted changed files) — NOT the whole remote tree, which would
+            // defeat lazy population. A newly-created sub-folder is itself just a placeholder; its children
+            // populate when it's browsed.
+            var toCreate = pullOperations
+                .Where(o => o.Kind is SyncOperationKind.DownloadFile or SyncOperationKind.CreateLocalFolder && o.Remote is not null)
+                .Select(o => o.Remote!)
+                .ToList();
+            if (toCreate.Count > 0)
+            {
+                placeholderEngine.CreatePlaceholders(pair.LocalPath, new RemoteSnapshot
+                {
+                    RootPath = pair.RemotePath,
+                    CapturedUtc = DateTimeOffset.UtcNow,
+                    Entries = toCreate,
+                });
+            }
 
             // Re-capture the local tree so the new state records each pulled placeholder's ACTUAL on-disk
             // size/mtime. Using the remote entry's values would mismatch when the remote modified-time is
             // unknown (the placeholder then gets "now"), making the next reconcile see a phantom local edit
             // and treat a later remote delete as a conflict instead of applying it.
-            var localAfter = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken);
+            var localAfter = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
 
             // Merge the pulled paths into last-known state surgically — paths we didn't touch (e.g. files
             // with unpushed local edits) keep their old baseline, so the next push still detects them.
@@ -266,15 +380,13 @@ public sealed class CloudSyncService(
             _clientUseGate.Release();
         }
 
-        // (Re)connect the provider with the refreshed tree so Explorer shows the new contents and
-        // sub-folder enumeration uses up-to-date data. We must connect if not yet connected (first-time
-        // pull → make the folder browsable); if already connected, only reconnect when something actually
-        // changed, so an idle periodic poll doesn't needlessly churn the connection. Done OUTSIDE the
-        // client gate so a hydration mid-flight on the old connection can drain before it's disconnected
-        // (avoids a callback deadlock).
-        if (!IsEnabled(pair.Id) || result.Total > 0)
+        // Ensure a provider is connected so the folder is browsable / hydratable. No snapshot to refresh —
+        // the connection lists folders live on browse — so a reconnect is only needed when not yet
+        // connected (first-time pull). Done OUTSIDE the client gate so a hydration mid-flight on the old
+        // connection can drain before any disconnect (avoids a callback deadlock).
+        if (!IsEnabled(pair.Id))
         {
-            await ReconnectAsync(accountId, pair, remote, cancellationToken).ConfigureAwait(false);
+            await ReconnectAsync(accountId, pair, cancellationToken).ConfigureAwait(false);
         }
 
         return result;
@@ -452,7 +564,7 @@ public sealed class CloudSyncService(
     // Disconnects any existing provider for the pair and connects a fresh one over the given snapshot.
     // Registration is idempotent. Holds only _enableGate (NOT _clientUseGate) so disposing the old
     // connection can wait for an in-flight hydration callback to finish acquiring/releasing _clientUseGate.
-    private async Task ReconnectAsync(string accountId, SyncPair pair, RemoteSnapshot snapshot, CancellationToken cancellationToken)
+    private async Task ReconnectAsync(string accountId, SyncPair pair, CancellationToken cancellationToken)
     {
         await _enableGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -464,7 +576,7 @@ public sealed class CloudSyncService(
 
             DisposeConnection(pair.Id);
             placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
-            var connection = placeholderEngine.Connect(pair.LocalPath, snapshot, CreateFetchCallback(accountId));
+            var connection = placeholderEngine.Connect(pair.LocalPath, CreateFetchChildren(accountId, pair), CreateFetchCallback(accountId));
 
             lock (_connections)
             {

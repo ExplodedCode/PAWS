@@ -10,8 +10,13 @@ public sealed class LocalSnapshotBuilder
     /// <summary>
     /// Captures the subtree rooted at <paramref name="localRoot"/>. Returns null if the directory does
     /// not exist. Skips reparse points (symlinks/junctions) to avoid cycles and surprises.
+    /// <para>When <paramref name="populatedFolders"/> is non-null (on-demand, lazy population), descent is
+    /// limited to folders in that set (relative, '/'-separated, "" = root): a sub-folder placeholder is
+    /// still recorded, but its children are NOT enumerated unless it's populated. This keeps the walk from
+    /// (a) triggering on-demand population of un-browsed folders and (b) reporting their un-materialized
+    /// contents as local deletions. Null = walk everything (full-sync mirror).</para>
     /// </summary>
-    public LocalSnapshot? Capture(string localRoot, CancellationToken cancellationToken = default)
+    public LocalSnapshot? Capture(string localRoot, IReadOnlySet<string>? populatedFolders = null, CancellationToken cancellationToken = default)
     {
         if (!Directory.Exists(localRoot))
         {
@@ -50,7 +55,9 @@ public sealed class LocalSnapshotBuilder
                     ModifiedUtc = isFolder ? null : new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero),
                 });
 
-                if (info is DirectoryInfo subFolder)
+                // Descend only into populated folders (when scoping is on) — see the summary. An
+                // un-populated sub-folder is recorded above but not walked.
+                if (info is DirectoryInfo subFolder && (populatedFolders is null || populatedFolders.Contains(relativePath)))
                 {
                     folders.Enqueue(subFolder);
                 }

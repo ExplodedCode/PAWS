@@ -38,6 +38,8 @@ return mode switch
     "--watchtest" or "watchtest" => await WatchTestAsync(localArg, remoteArg),
     "--pulltest" or "pulltest" => await PullTestAsync(localArg, remoteArg),
     "--fullautotest" or "fullautotest" => await FullAutoTestAsync(localArg, remoteArg),
+    "--lazytest" or "lazytest" => await LazyTestAsync(localArg, remoteArg),
+    "--dirtest" or "dirtest" => DirTest(localArg, remoteArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -85,7 +87,7 @@ static async Task<int> HydrateAsync(string? localOverride, string? remoteOverrid
     var created = engine.CreatePlaceholders(localOverride, snapshot);
     Console.WriteLine($"Placeholders: created {created.Created}, errors {created.Errors.Count}");
 
-    using var connection = engine.Connect(localOverride, snapshot, async (identity, output, ct) =>
+    using var connection = engine.Connect(localOverride, MakeTestFetchChildren(drive, remoteOverride), async (identity, output, ct) =>
     {
         await drive.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
     });
@@ -173,7 +175,7 @@ static async Task<int> StreamTestAsync(string? localOverride, string? remoteOver
 
     engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
     engine.CreatePlaceholders(localOverride, snapshot);
-    using var connection = engine.Connect(localOverride, snapshot, async (identity, output, ct) =>
+    using var connection = engine.Connect(localOverride, MakeTestFetchChildren(drive, remoteOverride), async (identity, output, ct) =>
     {
         await drive.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
     });
@@ -375,6 +377,262 @@ static async Task<int> UploadTestAsync(string? remoteOverride, string? sizeArg)
     return ok ? 0 : 1;
 }
 
+// Phase: scalable (lazy) population + the critical push-safety invariant. Builds a remote test tree
+// (root.txt + sub/{a.txt,b.txt}), enables on-demand (shallow), and verifies: (1) only the root is
+// materialized (sub/ is a placeholder, its files are NOT); (2) a PUSH does NOT trash the un-browsed
+// sub/ files (the data-loss guard); (3) browsing sub/ populates it. `--lazytest <local> <remote>`.
+static async Task<int> LazyTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --lazytest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    Console.WriteLine($"PAWS - lazy population + push-safety test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
+
+    var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+    var testRoot = $"{remoteOverride.TrimEnd('/')}/_lazytest_{stamp}";
+
+    // --- Build the remote test tree: _lazytest_x/{root.txt, sub/{a.txt, b.txt}} ---
+    await using (var setup = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (setup is null)
+        {
+            return 1;
+        }
+
+        var parent = await setup.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+        if (parent is null)
+        {
+            Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+            return 1;
+        }
+
+        var testFolder = await setup.CreateFolderAsync(parent, $"_lazytest_{stamp}").ConfigureAwait(false);
+        using (var c = new MemoryStream(Encoding.UTF8.GetBytes("root")))
+        {
+            await setup.UploadAsync(testFolder, "root.txt", c).ConfigureAwait(false);
+        }
+
+        var sub = await setup.CreateFolderAsync(testFolder, "sub").ConfigureAwait(false);
+        using (var c = new MemoryStream(Encoding.UTF8.GetBytes("aaa")))
+        {
+            await setup.UploadAsync(sub, "a.txt", c).ConfigureAwait(false);
+        }
+
+        using (var c = new MemoryStream(Encoding.UTF8.GetBytes("bbb")))
+        {
+            await setup.UploadAsync(sub, "b.txt", c).ConfigureAwait(false);
+        }
+    }
+
+    Console.WriteLine($"  built remote tree {testRoot}/  (root.txt, sub/a.txt, sub/b.txt)\n");
+
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
+    var pair = new SyncPair { Id = $"lazytest{stamp}", LocalPath = localOverride, RemotePath = testRoot, Mode = SyncMode.OnDemand };
+
+    var ok = true;
+    try
+    {
+        // 1. Shallow enable — only the root should materialize.
+        var count = await cloud.EnableAsync(account.Id, pair);
+        var rootTxt = File.Exists(Path.Combine(localOverride, "root.txt"));
+        var subDir = Directory.Exists(Path.Combine(localOverride, "sub"));
+        var subFileMaterialized = File.Exists(Path.Combine(localOverride, "sub", "a.txt"));
+        Console.WriteLine($"  after shallow enable ({count} root item(s)): root.txt={rootTxt}, sub/ dir={subDir}, sub/a.txt materialized={subFileMaterialized}");
+        ok = ok && rootTxt && subDir && !subFileMaterialized; // sub/ present but NOT populated
+
+        // 2. CRITICAL: push must NOT trash the un-browsed sub/ files.
+        Console.WriteLine("\n  pushing (sub/ is un-browsed — its remote files must survive)…");
+        var push = await cloud.SyncChangesAsync(account.Id, pair);
+        Console.WriteLine($"    push: {push.Completed} applied, {push.Failures.Count} failed");
+
+        await using (var verify = await ConnectFromStoredAsync().ConfigureAwait(false))
+        {
+            var snap = verify is null ? null : await new RemoteSnapshotBuilder(verify).CaptureAsync(testRoot).ConfigureAwait(false);
+            var names = snap?.Entries.Select(e => e.RelativePath).ToHashSet(StringComparer.Ordinal) ?? [];
+            var survived = names.Contains("sub/a.txt") && names.Contains("sub/b.txt");
+            Console.WriteLine($"    remote after push contains sub/a.txt & sub/b.txt: {(survived ? "YES (safe)" : "NO — DATA LOSS!")}");
+            ok = ok && survived;
+        }
+
+        // 3. Browse sub/ from a SEPARATE process — this fires FETCH_PLACEHOLDERS and populates it lazily
+        // (an in-process enumeration by the provider itself never triggers the callback).
+        Console.WriteLine("\n  browsing sub/ from a separate process (should populate lazily)…");
+        var (subOk, subEntries) = EnumerateInSeparateProcess(Path.Combine(localOverride, "sub"));
+        Console.WriteLine($"    sub/ now contains: {(subOk ? string.Join(", ", subEntries) : subEntries[0])}");
+        ok = ok && subOk && subEntries.Contains("a.txt") && subEntries.Contains("b.txt");
+
+        // 4. CRITICAL: push AGAIN now that sub/ is populated. Its placeholder children are NOT in the saved
+        // state (state was baselined at enable, root-only), and the delete-guard no longer shields sub/
+        // (it's populated) — so the reconciler must ADOPT the just-browsed placeholders as no-ops, never
+        // upload them again or trash their remote originals.
+        Console.WriteLine("\n  pushing again (sub/ now populated — placeholders must adopt, not re-sync/trash)…");
+        var push2 = await cloud.SyncChangesAsync(account.Id, pair);
+        Console.WriteLine($"    push2: {push2.Completed} applied, {push2.Failures.Count} failed (expect 0 applied)");
+        ok = ok && push2.Completed == 0 && push2.Failures.Count == 0;
+
+        await using (var verify2 = await ConnectFromStoredAsync().ConfigureAwait(false))
+        {
+            var snap = verify2 is null ? null : await new RemoteSnapshotBuilder(verify2).CaptureAsync(testRoot).ConfigureAwait(false);
+            var names = snap?.Entries.Select(e => e.RelativePath).ToHashSet(StringComparer.Ordinal) ?? [];
+            var survived = names.Contains("sub/a.txt") && names.Contains("sub/b.txt");
+            Console.WriteLine($"    remote after push2 still has sub/a.txt & sub/b.txt: {(survived ? "YES (safe)" : "NO — DATA LOSS!")}");
+            ok = ok && survived;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Test error: {ex.GetType().Name}: {ex.Message}");
+        ok = false;
+    }
+    finally
+    {
+        cloud.Disable(pair.Id);
+        try { engine.UnregisterSyncRoot(localOverride); } catch { /* ignore */ }
+        new JsonSyncStateStore(paths).Clear(pair.Id);
+        new JsonPopulatedFolderStore(paths).Clear(pair.Id);
+
+        await using var cleanup = await ConnectFromStoredAsync().ConfigureAwait(false);
+        if (cleanup is not null)
+        {
+            var node = await cleanup.ResolvePathAsync(testRoot).ConfigureAwait(false);
+            if (node is not null)
+            {
+                await cleanup.TrashAsync(node).ConfigureAwait(false);
+                Console.WriteLine("\n  cleaned up the remote test tree.");
+            }
+        }
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE cfapi-only regression (no Proton) for the lazy-population + metadata-corruption fix. Uses
+// realistic long Proton-style composite identities (the ones that used to corrupt) and verifies, from a
+// SEPARATE process (a real browse, since same-process enumeration never fires FETCH_PLACEHOLDERS):
+//   1. the eagerly-created childless sub/ placeholder enumerates without STATUS_CLOUD_FILE_METADATA_CORRUPT
+//      (guards the batched-CfCreatePlaceholders identity-overrun bug — must be single-element);
+//   2. browsing sub/ populates it lazily via FETCH_PLACEHOLDERS (long-identity file + nested folder);
+//   3. browsing the transfer-created nested folder recurses and populates too.
+// `--dirtest <localFolder>`.
+static int DirTest(string? localOverride, string? _)
+{
+    if (localOverride is null)
+    {
+        Console.WriteLine("  x Usage: --dirtest <localFolder>");
+        return 1;
+    }
+
+    var engine = new CloudFilterPlaceholderEngine();
+    Directory.CreateDirectory(localOverride);
+    engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+
+    var now = DateTimeOffset.UtcNow;
+    string LongId(string tag) => "iAxR7cgYefZJzyNS1S1MbQ~pjMdBpjbtK7iGaTg-UgH-g~XsODA2mF5rj49K_" + tag; // ~64 chars
+    RemoteEntry MkFile(string path, string tag) => new() { RelativePath = path, Name = path.Split('/')[^1], IsFolder = false, Size = 3, ModifiedUtc = now, Uid = LongId(tag), RevisionUid = LongId(tag + "r") };
+    RemoteEntry MkDir(string path, string tag) => new() { RelativePath = path, Name = path.Split('/')[^1], IsFolder = true, Size = null, ModifiedUtc = now, Uid = "iAxR7cgYefZJzyNS1S1MbQ~zgzJvzyxOEdz_" + tag };
+
+    // Shallow eager root: a long-identity FILE next to a childless FOLDER (the exact shape that corrupted).
+    engine.CreatePlaceholders(localOverride, new RemoteSnapshot
+    {
+        RootPath = "/",
+        CapturedUtc = now,
+        Entries = new List<RemoteEntry> { MkFile("root.txt", "root"), MkDir("sub", "sub") },
+    });
+
+    using var conn = engine.Connect(localOverride,
+        (rel, ct) => Task.FromResult<IReadOnlyList<RemoteEntry>>(rel switch
+        {
+            "sub" => new List<RemoteEntry> { MkFile("sub/bigfile.txt", "bf"), MkDir("sub/deep", "deep") },
+            "sub/deep" => new List<RemoteEntry> { MkFile("sub/deep/leaf.txt", "lf") },
+            _ => new List<RemoteEntry>(),
+        }),
+        (id, output, ct) => Task.CompletedTask);
+
+    var ok = true;
+    var (subOk, sub) = EnumerateInSeparateProcess(Path.Combine(localOverride, "sub"));
+    Console.WriteLine($"  browse sub/       -> {(subOk ? $"[{string.Join(",", sub)}]" : sub[0])}");
+    ok = ok && subOk && sub.Contains("bigfile.txt") && sub.Contains("deep");
+
+    var (deepOk, deep) = EnumerateInSeparateProcess(Path.Combine(localOverride, "sub", "deep"));
+    Console.WriteLine($"  browse sub/deep/  -> {(deepOk ? $"[{string.Join(",", deep)}]" : deep[0])}");
+    ok = ok && deepOk && deep.Contains("leaf.txt");
+
+    conn.Dispose();
+    try { engine.UnregisterSyncRoot(localOverride); } catch { }
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Enumerates a folder from a SEPARATE process (a fresh cmd.exe) — a real browse that triggers Cloud
+// Filter's FETCH_PLACEHOLDERS, unlike an in-process enumeration by the provider itself. Returns the child
+// names, or (false, [errorText]) if the enumeration failed (e.g. the metadata-corrupt IOException).
+static (bool ok, List<string> names) EnumerateInSeparateProcess(string folder)
+{
+    var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c dir /b \"{folder}\"")
+    {
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+    };
+    using var proc = System.Diagnostics.Process.Start(psi)!;
+    var stdout = proc.StandardOutput.ReadToEnd();
+    var stderr = proc.StandardError.ReadToEnd();
+    proc.WaitForExit();
+
+    if (proc.ExitCode != 0)
+    {
+        return (false, new List<string> { $"dir failed: {stderr.Trim()}" });
+    }
+
+    var names = stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+    return (true, names);
+}
+
+// Lazy per-folder children listing for the harness (mirrors CloudSyncService.CreateFetchChildren): lists
+// one remote folder's children and maps them to sync-root-relative RemoteEntry.
+static FetchFolderChildren MakeTestFetchChildren(IProtonDriveClient drive, string remoteRoot) => async (relativeFolder, ct) =>
+{
+    var remotePath = string.IsNullOrEmpty(relativeFolder) ? remoteRoot : $"{remoteRoot.TrimEnd('/')}/{relativeFolder}";
+    var entries = new List<RemoteEntry>();
+    var folder = await drive.ResolvePathAsync(remotePath, ct).ConfigureAwait(false);
+    if (folder is null)
+    {
+        return entries;
+    }
+
+    await foreach (var child in drive.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+    {
+        var rel = string.IsNullOrEmpty(relativeFolder) ? child.Name : $"{relativeFolder}/{child.Name}";
+        entries.Add(new RemoteEntry
+        {
+            RelativePath = rel,
+            Name = child.Name,
+            IsFolder = child.IsFolder,
+            Size = child.Size,
+            ModifiedUtc = child.ModifiedUtc,
+            Uid = child.Uid,
+            ParentUid = child.ParentUid,
+            RevisionUid = child.RevisionUid,
+        });
+    }
+
+    return entries;
+};
+
 // Rebuilds a minimal RemoteNode from a placeholder's stored identity (a revision uid "vol~link~rev").
 static RemoteNode NodeFromIdentity(string identity)
 {
@@ -404,7 +662,7 @@ static async Task<int> PushTestAsync(string? localOverride, string? remoteOverri
     Console.WriteLine($"PAWS - on-demand push test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "pushtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     Console.WriteLine("Enabling on-demand…");
@@ -468,7 +726,7 @@ static async Task<int> WatchTestAsync(string? localOverride, string? remoteOverr
     Console.WriteLine($"PAWS - auto-sync watch test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "watchtest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     // Fires when an auto-sync run actually pushed something up.
@@ -556,7 +814,7 @@ static async Task<int> PullTestAsync(string? localOverride, string? remoteOverri
     Console.WriteLine($"PAWS - on-demand pull test\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "pulltest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     Console.WriteLine("Enabling on-demand (sets the baseline)…");
@@ -750,7 +1008,7 @@ static async Task<int> DeleteConsistencyTestAsync(string? localOverride, string?
     Console.WriteLine($"PAWS - delete-consistency diagnostic\n  local  : {localOverride}\n  remote : {remoteOverride}\n");
 
     var engine = new CloudFilterPlaceholderEngine();
-    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new SemaphoreSlim(1, 1));
+    await using var cloud = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
     var pair = new SyncPair { Id = "deltest", LocalPath = localOverride, RemotePath = remoteOverride, Mode = SyncMode.OnDemand };
 
     await cloud.EnableAsync(account.Id, pair);

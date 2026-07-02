@@ -29,7 +29,8 @@ public sealed class SyncEngine(IProtonDriveClientFactory clientFactory, ISyncSta
             var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
 
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, cancellationToken)
+            // Full-sync mirrors the whole tree (no lazy population), so walk everything (null scope).
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, null, cancellationToken)
                 ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
 
             var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
@@ -67,7 +68,7 @@ public sealed class SyncEngine(IProtonDriveClientFactory clientFactory, ISyncSta
             try
             {
                 var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(plan.Pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
-                var local = new LocalSnapshotBuilder().Capture(plan.Pair.LocalPath, cancellationToken);
+                var local = new LocalSnapshotBuilder().Capture(plan.Pair.LocalPath, null, cancellationToken);
                 if (remote is not null && local is not null)
                 {
                     stateStore.Save(SyncStateBuilder.Build(plan.Pair.Id, remote, local));

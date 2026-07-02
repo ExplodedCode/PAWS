@@ -38,6 +38,18 @@ public sealed class PawsPaths
         return Path.Combine(StateDirectory, safe + ".json");
     }
 
+    /// <summary>Per-pair set of populated (materialized) on-demand folders, e.g. <c>state\{pairId}.populated.json</c>.</summary>
+    public string PopulatedFoldersFileFor(string pairId)
+    {
+        var safe = new string(pairId.Where(char.IsLetterOrDigit).ToArray());
+        if (string.IsNullOrEmpty(safe))
+        {
+            throw new ArgumentException("Pair id must contain alphanumeric characters.", nameof(pairId));
+        }
+
+        return Path.Combine(StateDirectory, safe + ".populated.json");
+    }
+
     /// <summary>Per-account encrypted secret blob, e.g. <c>secrets\{accountId}.bin</c>.</summary>
     public string SecretsFileFor(string accountId)
     {

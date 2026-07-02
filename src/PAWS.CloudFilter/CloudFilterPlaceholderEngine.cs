@@ -61,8 +61,8 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         var created = 0;
         var skipped = 0;
 
-        // Group entries by their parent folder's relative path (root = ""), so we can create each
-        // folder's children in one CfCreatePlaceholders call. Parent-first (the snapshot is sorted).
+        // Group entries by their parent folder's relative path (root = "") so parents are created before
+        // their children (the snapshot is sorted; we also process parents in ordinal order).
         var byParent = remoteSnapshot.Entries
             .GroupBy(e => ParentPath(e.RelativePath))
             .ToDictionary(g => g.Key, g => g.ToList());
@@ -70,7 +70,6 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         foreach (var parentPath in byParent.Keys.OrderBy(p => p, StringComparer.Ordinal))
         {
             var parentFullPath = Path.Combine(localRoot, parentPath.Replace('/', Path.DirectorySeparatorChar));
-            var infos = new List<CF_PLACEHOLDER_CREATE_INFO>();
 
             foreach (var child in byParent[parentPath])
             {
@@ -81,36 +80,39 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                     continue;
                 }
 
-                infos.Add(BuildPlaceholderInfo(child));
-            }
-
-            try
-            {
-                if (infos.Count > 0)
+                // Create ONE placeholder per CfCreatePlaceholders call. Passing a multi-element array
+                // corrupts adjacent entries' on-disk cloud metadata whenever an element carries a long
+                // FileIdentity (our identities are ~45–68-char composite uids): the batched entry's identity
+                // bleeds into the next entry, so browsing it fails with STATUS_CLOUD_FILE_METADATA_CORRUPT
+                // ("The cloud file metadata is corrupt and unreadable"). Reproduced down to a 66-char
+                // identity flipping the following folder to corrupt; single-element calls are unaffected and
+                // match the reference providers (CloudMirror, Proton's windows-drive both pass count=1).
+                var info = BuildPlaceholderInfo(child);
+                try
                 {
-                    var array = infos.ToArray();
-                    var hr = CfCreatePlaceholders(parentFullPath, array, (uint)array.Length, CF_CREATE_FLAGS.CF_CREATE_FLAG_NONE, out var processed);
+                    var single = new[] { info };
+                    var hr = CfCreatePlaceholders(parentFullPath, single, 1, CF_CREATE_FLAGS.CF_CREATE_FLAG_NONE, out var processed);
                     if (hr.Succeeded)
                     {
                         created += (int)processed;
                     }
                     else
                     {
-                        errors.Add($"{parentPath}: 0x{hr.Code:X8}");
+                        errors.Add($"{child.RelativePath}: 0x{hr.Code:X8}");
                     }
                 }
-            }
-            finally
-            {
-                FreeIdentities(infos);
+                finally
+                {
+                    FreeIdentity(info);
+                }
             }
         }
 
         return new PlaceholderResult(created, skipped, errors);
     }
 
-    public IDisposable Connect(string localRoot, RemoteSnapshot snapshot, FetchPlaceholderData fetchData)
-        => new HydrationConnection(localRoot, snapshot, fetchData);
+    public IDisposable Connect(string localRoot, FetchFolderChildren fetchChildren, FetchPlaceholderData fetchData)
+        => new HydrationConnection(localRoot, fetchChildren, fetchData);
 
     // Builds a placeholder for one remote entry. Caller must free the returned info's FileIdentity.
     private static CF_PLACEHOLDER_CREATE_INFO BuildPlaceholderInfo(RemoteEntry child)
@@ -139,14 +141,19 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         };
     }
 
+    private static void FreeIdentity(CF_PLACEHOLDER_CREATE_INFO info)
+    {
+        if (info.FileIdentity != IntPtr.Zero)
+        {
+            Marshal.FreeCoTaskMem(info.FileIdentity);
+        }
+    }
+
     private static void FreeIdentities(IEnumerable<CF_PLACEHOLDER_CREATE_INFO> infos)
     {
         foreach (var info in infos)
         {
-            if (info.FileIdentity != IntPtr.Zero)
-            {
-                Marshal.FreeCoTaskMem(info.FileIdentity);
-            }
+            FreeIdentity(info);
         }
     }
 
@@ -157,9 +164,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
     }
 
     /// <summary>
-    /// A live provider connection. Serves FETCH_PLACEHOLDERS (directory enumeration → the folder's
-    /// children from the snapshot) and FETCH_DATA (file open → download via the caller's callback).
-    /// The native callbacks run on Cloud Filter threads; the (network) download is offloaded to a worker.
+    /// A live provider connection. Serves FETCH_PLACEHOLDERS (directory enumeration → that folder's
+    /// children, listed lazily on first browse via the caller's callback) and FETCH_DATA (file open →
+    /// download via the caller's callback). The native callbacks run on Cloud Filter threads; the (network)
+    /// listing and download are offloaded to workers.
     /// </summary>
     private sealed class HydrationConnection : IDisposable
     {
@@ -169,7 +177,7 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         private readonly CF_CALLBACK _fetchPlaceholdersCallback;  // must outlive the connection
         private readonly CF_CALLBACK_REGISTRATION[] _callbacks;   // must outlive the connection
         private readonly FetchPlaceholderData _fetchData;
-        private readonly Dictionary<string, List<RemoteEntry>> _childrenByParent;
+        private readonly FetchFolderChildren _fetchChildren;
         private readonly string _localRootNormalized;
         private readonly CF_CONNECTION_KEY _connectionKey;
 
@@ -181,12 +189,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         private byte[]? _cachedData;
         private bool _disposed;
 
-        public HydrationConnection(string localRoot, RemoteSnapshot snapshot, FetchPlaceholderData fetchData)
+        public HydrationConnection(string localRoot, FetchFolderChildren fetchChildren, FetchPlaceholderData fetchData)
         {
             _fetchData = fetchData;
-            _childrenByParent = snapshot.Entries
-                .GroupBy(e => ParentPath(e.RelativePath))
-                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+            _fetchChildren = fetchChildren;
 
             // Cloud Filter callback paths are volume-relative (no drive letter), e.g. "\Folder\Sub".
             _localRootNormalized = localRoot.Length >= 2 ? localRoot[2..] : localRoot;
@@ -208,13 +214,68 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 out _connectionKey).ThrowIfFailed();
         }
 
-        // Directory enumeration: populate the folder's placeholders from the snapshot (in-memory, fast).
+        // Directory enumeration (first browse of a folder): list that folder's children LIVE and populate
+        // its placeholders. Offloaded to a worker because the listing is a network call — this is what
+        // makes population lazy/scalable (only browsed folders are materialized).
         private void OnFetchPlaceholders(in CF_CALLBACK_INFO callbackInfo, in CF_CALLBACK_PARAMETERS callbackParameters)
         {
-            var operation = CreateOperationInfo(callbackInfo, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
+            if (_disposed)
+            {
+                return;
+            }
 
+            var operation = CreateOperationInfo(callbackInfo, CF_OPERATION_TYPE.CF_OPERATION_TYPE_TRANSFER_PLACEHOLDERS);
             var relativeFolder = ToRelativeFolder(callbackInfo.NormalizedPath);
-            var children = _childrenByParent.TryGetValue(relativeFolder, out var list) ? list : [];
+            _ = Task.Run(() => PopulateAsync(operation, relativeFolder));
+        }
+
+        private async Task PopulateAsync(CF_OPERATION_INFO operation, string relativeFolder)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            // The network listing runs outside the gate so it doesn't block hydration; a listing failure
+            // reports the enumeration as failed (and leaves on-demand population ON) so a re-browse retries
+            // rather than caching an empty folder.
+            IReadOnlyList<RemoteEntry> children;
+            var populated = true;
+            try
+            {
+                children = await _fetchChildren(relativeFolder, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                children = [];
+                populated = false;
+            }
+
+            if (_disposed)
+            {
+                return;
+            }
+
+            // Serialize the CfExecute on the same gate Dispose drains, so we never transfer against a
+            // disconnected connection key (see Dispose + TransferAsync).
+            await _downloadGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                SendPlaceholders(operation, children, populated);
+            }
+            finally
+            {
+                _downloadGate.Release();
+            }
+        }
+
+        private void SendPlaceholders(CF_OPERATION_INFO operation, IReadOnlyList<RemoteEntry> children, bool populated)
+        {
             var infos = children.Select(BuildPlaceholderInfo).ToArray();
 
             using var array = new SafeNativeArray<CF_PLACEHOLDER_CREATE_INFO>(infos);
@@ -225,9 +286,12 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                     PlaceholderArray = array,
                     PlaceholderCount = (uint)infos.Length,
                     PlaceholderTotalCount = (uint)infos.Length,
-                    // Tell the platform this folder is fully provided — don't ask again.
-                    Flags = CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
-                    // CompletionStatus left default (STATUS_SUCCESS).
+                    // On success, tell the platform this folder is fully provided — don't ask again. On a
+                    // listing failure, leave population enabled so a re-browse retries, and fail the op.
+                    Flags = populated
+                        ? CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
+                        : CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS.CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+                    CompletionStatus = populated ? new NTStatus(0) : new NTStatus(0xC0000001u), // STATUS_SUCCESS / STATUS_UNSUCCESSFUL
                 };
                 var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
                 CfExecute(operation, ref parameters);

@@ -55,8 +55,11 @@ namespace PAWS
             SyncStateStore = new JsonSyncStateStore(Paths);
             SyncEngine = new SyncEngine(DriveClientFactory, SyncStateStore, _driveGate);
 
-            // Files-on-demand: registers sync roots + serves hydration for On-demand pairs.
-            CloudSync = new CloudSyncService(new CloudFilterPlaceholderEngine(), DriveClientFactory, SyncStateStore, _driveGate);
+            // Files-on-demand: registers sync roots + serves hydration for On-demand pairs. Population is
+            // lazy/scalable (only browsed folders materialize); the populated-folder store records which
+            // folders are materialized so push/pull never mistake un-browsed content for a deletion.
+            CloudSync = new CloudSyncService(
+                new CloudFilterPlaceholderEngine(), DriveClientFactory, SyncStateStore, new JsonPopulatedFolderStore(Paths), _driveGate);
 
             // Automatic two-way sync for Full-sync pairs (over the shared SyncEngine).
             FullSync = new FullSyncService(SyncEngine);
