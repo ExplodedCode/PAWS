@@ -224,15 +224,39 @@ namespace PAWS.Views
                 actions.Children.Add(BuildPlayPauseButton(account, pair));
             }
 
-            var open = new Button { Content = "Open" };
-            ToolTipService.SetToolTip(open, "Open this folder in File Explorer.");
-            open.Click += (_, _) =>
+            // Open is a split button: the click opens the local folder (the everyday case); the arrow
+            // offers that plus viewing this folder on the Proton Drive website — a deep link into the
+            // pair's remote folder, falling back to the Drive home page if the link can't be built.
+            var openLocal = new MenuFlyoutItem { Text = "Open local folder", Icon = new FontIcon { Glyph = "" } }; // folder open
+            openLocal.Click += (_, _) => OpenLocalFolder(pair);
+
+            var openWeb = new MenuFlyoutItem { Text = "View on drive.proton.me", Icon = new FontIcon { Glyph = "" } }; // globe
+            openWeb.Click += async (_, _) =>
             {
-                if (Directory.Exists(pair.LocalPath))
+                var uri = new Uri("https://drive.proton.me/");
+                try
                 {
-                    Process.Start(new ProcessStartInfo { FileName = pair.LocalPath, UseShellExecute = true });
+                    var url = await App.Instance.CloudSync.GetWebUrlAsync(account.Id, pair.RemotePath);
+                    if (url is not null)
+                    {
+                        uri = new Uri(url);
+                    }
                 }
+                catch
+                {
+                    // Best-effort deep link — fall back to the Drive home page.
+                }
+
+                await Windows.System.Launcher.LaunchUriAsync(uri);
             };
+
+            var openFlyout = new MenuFlyout();
+            openFlyout.Items.Add(openLocal);
+            openFlyout.Items.Add(openWeb);
+
+            var open = new SplitButton { Content = "Open", Flyout = openFlyout };
+            ToolTipService.SetToolTip(open, "Open this folder in File Explorer — or use the arrow to view your files on the Proton Drive website.");
+            open.Click += (_, _) => OpenLocalFolder(pair);
             actions.Children.Add(open);
 
             actions.Children.Add(BuildManualMenu(account, pair));
@@ -363,6 +387,14 @@ namespace PAWS.Views
             App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
             App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
             Refresh();
+        }
+
+        private static void OpenLocalFolder(SyncPair pair)
+        {
+            if (Directory.Exists(pair.LocalPath))
+            {
+                Process.Start(new ProcessStartInfo { FileName = pair.LocalPath, UseShellExecute = true });
+            }
         }
 
         private static string FolderDisplayName(string localPath)

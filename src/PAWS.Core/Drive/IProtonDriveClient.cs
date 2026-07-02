@@ -76,4 +76,10 @@ public interface IProtonDriveClient : IAsyncDisposable
 
     /// <summary>Moves a node to the trash (recoverable). Use for the local-delete → remote propagation.</summary>
     Task TrashAsync(RemoteNode node, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The drive.proton.me web-app URL that shows <paramref name="node"/> (deep link into the folder or
+    /// file), or null if it cannot be determined — callers should fall back to the site root.
+    /// </summary>
+    Task<string?> GetWebUrlAsync(RemoteNode node, CancellationToken cancellationToken = default);
 }

@@ -429,6 +429,31 @@ public sealed class CloudSyncService(
             },
             cancellationToken);
 
+    /// <summary>
+    /// Resolves the drive.proton.me web URL for a remote path (the UI's "view online" action), or null if
+    /// it can't be determined. Uses the cached client, serialized on the shared drive gate like every
+    /// other Drive read.
+    /// </summary>
+    public async Task<string?> GetWebUrlAsync(string accountId, string remotePath, CancellationToken cancellationToken = default)
+    {
+        var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var node = await client.ResolvePathAsync(remotePath, cancellationToken).ConfigureAwait(false);
+            if (node is null)
+            {
+                return null;
+            }
+
+            return await client.GetWebUrlAsync(node, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+    }
+
     // Runs a read against a FRESH Drive session, holding the shared drive gate for the whole thing so it
     // can't overlap any other Drive operation. Fresh session = current Drive truth (the SDK's per-session
     // cache would otherwise hide remote deletions/revisions); it becomes the new cached client.

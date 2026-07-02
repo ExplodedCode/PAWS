@@ -18,7 +18,7 @@ namespace PAWS.Proton;
 public static class ProtonSessionConnector
 {
     // Third-party Drive clients use the "external-drive-<name>@x.y.z-stable" app-version convention.
-    private const string DefaultAppVersion = "external-drive-paws@1.0.0-stable";
+    internal const string DefaultAppVersion = "external-drive-paws@1.0.0-stable";
 
     /// <summary>
     /// Resumes the SDK session from a stored <see cref="ProtonSession"/> (tokens + key password), with

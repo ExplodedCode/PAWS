@@ -16,9 +16,14 @@ namespace PAWS.Proton.Drive;
 /// </summary>
 public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProtonDriveClient
 {
+    // Plain client for the one raw web-URL API call (see GetWebUrlAsync) — auth is per-request headers.
+    private static readonly HttpClient WebUrlHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
+
     private readonly ProtonDriveClient _client = new(session);
 
     private RemoteNode? _root;
+    private string? _webShareIdVolume; // volume the cached share id belongs to
+    private string? _webShareId;
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
@@ -235,6 +240,75 @@ public sealed class ProtonDriveClientAdapter(ProtonApiSession session) : IProton
         if (results.TryGetValue(uid, out var result) && result.TryGetError(out var error))
         {
             throw new InvalidOperationException($"Failed to trash '{node.Name}': {error.Message}", error);
+        }
+    }
+
+    /// <summary>
+    /// Builds the drive.proton.me web-app URL for a node: <c>/u/0/{shareId}/folder/{linkId}</c>. The web
+    /// app routes by the volume's root SHARE id, which the SDK doesn't expose publicly, so this makes one
+    /// raw API call (GET drive/volumes/{volumeId}, authenticated with the session's current tokens) and
+    /// caches the share id for the adapter's lifetime. Returns null on any failure — the caller falls
+    /// back to the site root. (The <c>u/0</c> segment is the browser's first signed-in Proton account.)
+    /// </summary>
+    public async Task<string?> GetWebUrlAsync(RemoteNode node, CancellationToken cancellationToken = default)
+    {
+        // Uid is our composite "volumeId~linkId" (NodeUid.ToString()).
+        var parts = node.Uid.Split('~');
+        if (parts.Length < 2 || string.IsNullOrEmpty(parts[0]) || string.IsNullOrEmpty(parts[1]))
+        {
+            return null;
+        }
+
+        var volumeId = parts[0];
+        var linkId = parts[1];
+
+        var shareId = string.Equals(_webShareIdVolume, volumeId, StringComparison.Ordinal) ? _webShareId : null;
+        shareId ??= await FetchRootShareIdAsync(volumeId, cancellationToken).ConfigureAwait(false);
+        if (shareId is null)
+        {
+            return null;
+        }
+
+        _webShareIdVolume = volumeId;
+        _webShareId = shareId;
+
+        return $"https://drive.proton.me/u/0/{shareId}/{(node.IsFolder ? "folder" : "file")}/{linkId}";
+    }
+
+    // One raw REST call: the volume details include its root share's id. Uses the session's live access
+    // token (TokenCredential refreshes it transparently), so no manual token management is needed.
+    private async Task<string?> FetchRootShareIdAsync(string volumeId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var (accessToken, _) = await session.TokenCredential.GetTokensAsync(cancellationToken).ConfigureAwait(false);
+
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                $"https://drive-api.proton.me/drive/volumes/{Uri.EscapeDataString(volumeId)}");
+            request.Headers.TryAddWithoutValidation("x-pm-uid", session.SessionId.ToString());
+            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + accessToken);
+            request.Headers.TryAddWithoutValidation("x-pm-appversion", ProtonSessionConnector.DefaultAppVersion);
+
+            using var response = await WebUrlHttpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            using var json = System.Text.Json.JsonDocument.Parse(
+                await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+
+            return json.RootElement.TryGetProperty("Volume", out var volume)
+                && volume.TryGetProperty("Share", out var share)
+                && share.TryGetProperty("ShareID", out var id)
+                ? id.GetString()
+                : null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Best-effort convenience link — never let it break the caller.
+            return null;
         }
     }
 

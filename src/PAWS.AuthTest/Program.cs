@@ -40,6 +40,7 @@ return mode switch
     "--fullautotest" or "fullautotest" => await FullAutoTestAsync(localArg, remoteArg),
     "--lazytest" or "lazytest" => await LazyTestAsync(localArg, remoteArg),
     "--dirtest" or "dirtest" => DirTest(localArg, remoteArg),
+    "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -517,6 +518,29 @@ static async Task<int> LazyTestAsync(string? localOverride, string? remoteOverri
 
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
+}
+
+// Prints the drive.proton.me web URL for a remote path (verifies the volumes API call + URL format).
+// `--weburl <remotePath>`.
+static async Task<int> WebUrlAsync(string? path)
+{
+    await using var drive = await ConnectFromStoredAsync().ConfigureAwait(false);
+    if (drive is null)
+    {
+        return 1;
+    }
+
+    var remote = string.IsNullOrWhiteSpace(path) ? "/" : path;
+    var node = await drive.ResolvePathAsync(remote).ConfigureAwait(false);
+    if (node is null)
+    {
+        Console.WriteLine($"  x Not found on Drive: {remote}");
+        return 1;
+    }
+
+    var url = await drive.GetWebUrlAsync(node).ConfigureAwait(false);
+    Console.WriteLine(url is null ? "  x Could not determine the web URL." : $"  {remote}  ->  {url}");
+    return url is null ? 1 : 0;
 }
 
 // OFFLINE cfapi-only regression (no Proton) for the lazy-population + metadata-corruption fix. Uses
