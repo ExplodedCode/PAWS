@@ -38,32 +38,25 @@
             <!-- Step 2: folder to sync (enabled after sign-in) -->
             <ContentControl x:Name="FolderSection" IsEnabled="False" Opacity="0.5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                 <StackPanel Spacing="14">
-                <TextBlock Text="2 · Folder to sync" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
-                <TextBox x:Name="LabelBox" Header="Label for this account (optional)" PlaceholderText="e.g. Work or Personal" />
-                <Grid ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBox x:Name="LocalFolderBox" Header="Local folder" PlaceholderText="C:\Users\you\ProtonSync" IsReadOnly="True" />
-                    <Button Grid.Column="1" Content="Browse…" VerticalAlignment="Bottom" Click="OnBrowseClicked" />
-                </Grid>
-                <TextBox x:Name="RemotePathBox" Header="Proton Drive folder" Text="/" PlaceholderText="/Backup/Desktop" />
-                <ComboBox x:Name="ModeBox" Header="Sync mode" HorizontalAlignment="Stretch" SelectedIndex="0">
-                    <ComboBoxItem Content="On-demand — placeholders, download when opened" />
-                    <ComboBoxItem Content="Full sync — keep every file local" />
-                    <ComboBoxItem Content="Cloud-only — download only when pinned" />
-                </ComboBox>
-                <Button x:Name="FinishButton" Content="Add account" Style="{StaticResource AccentButtonStyle}" Click="OnFinishClicked" HorizontalAlignment="Right" Margin="0,12,0,0" />
+                    <TextBlock Text="2 · Folder to sync" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,8,0,0" />
+                    <TextBox x:Name="LabelBox" Header="Label for this account (optional)" PlaceholderText="e.g. Work or Personal" />
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="LocalFolderBox" Header="Local folder" PlaceholderText="C:\Users\you\ProtonSync" IsReadOnly="True" />
+                        <Button Grid.Column="1" Content="Browse…" VerticalAlignment="Bottom" Click="OnBrowseClicked" />
+                    </Grid>
+                    <TextBox x:Name="RemotePathBox" Header="Proton Drive folder" Text="/" PlaceholderText="/Backup/Desktop" />
+                    <ComboBox x:Name="ModeBox" Header="Sync mode" HorizontalAlignment="Stretch" SelectedIndex="0">
+                        <ComboBoxItem Content="On-demand — placeholders, download when opened" />
+                        <ComboBoxItem Content="Full sync — keep every file local" />
+                        <ComboBoxItem Content="Cloud-only — download only when pinned" />
+                    </ComboBox>
+                    <Button x:Name="FinishButton" Content="Add account" Style="{StaticResource AccentButtonStyle}" Click="OnFinishClicked" HorizontalAlignment="Right" Margin="0,12,0,0" />
                 </StackPanel>
             </ContentControl>
-
-            <InfoBar
-                IsOpen="True"
-                IsClosable="False"
-                Severity="Informational"
-                Title="Preview build"
-                Message="Sign-in is live against Proton. Syncing is not active yet — this stores the account and a folder mapping." />
         </StackPanel>
     </ScrollViewer>
 </Page>

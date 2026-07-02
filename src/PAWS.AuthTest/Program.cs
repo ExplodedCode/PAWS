@@ -40,6 +40,7 @@ return mode switch
     "--fullautotest" or "fullautotest" => await FullAutoTestAsync(localArg, remoteArg),
     "--lazytest" or "lazytest" => await LazyTestAsync(localArg, remoteArg),
     "--dirtest" or "dirtest" => DirTest(localArg, remoteArg),
+    "--removetest" or "removetest" => RemoveTest(localArg),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
@@ -1017,6 +1018,150 @@ static int DirTest(string? localOverride, string? _)
 
     conn.Dispose();
     try { engine.UnregisterSyncRoot(localOverride); } catch { }
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE cfapi-only regression (no Proton) for stopping sync / removing an account / resetting the app:
+// DecommissionTree must return the folder to a NORMAL folder BEFORE the sync root is unregistered.
+// Keep-files mode: a hydrated placeholder reverts to a plain file (content kept), a cloud-only
+// placeholder is deleted (its content lives on the remote), a plain local file is untouched, and a
+// placeholder folder with nothing local left inside is removed. Remove-files mode: everything under the
+// root is deleted. `--removetest <localFolder>`.
+static int RemoveTest(string? localOverride)
+{
+    if (localOverride is null)
+    {
+        Console.WriteLine("  x Usage: --removetest <localFolder>");
+        return 1;
+    }
+
+    var engine = new CloudFilterPlaceholderEngine();
+    Directory.CreateDirectory(localOverride);
+    var rootInfo = new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0");
+    engine.RegisterSyncRoot(rootInfo);
+
+    var now = DateTimeOffset.UtcNow;
+    var content = Encoding.UTF8.GetBytes("hello from the cloud! this file was hydrated on demand.");
+    RemoteEntry MkFile(string path, string id, long size) => new()
+    {
+        RelativePath = path, Name = path.Split('/')[^1], IsFolder = false, Size = size, ModifiedUtc = now,
+        Uid = "vol~" + id, RevisionUid = "vol~" + id + "~r1",
+    };
+
+    engine.CreatePlaceholders(localOverride, new RemoteSnapshot
+    {
+        RootPath = "/",
+        CapturedUtc = now,
+        Entries = new List<RemoteEntry>
+        {
+            MkFile("hydrated.txt", "hyd", content.Length),
+            MkFile("cloudonly.txt", "cld", 5),
+            new() { RelativePath = "sub", Name = "sub", IsFolder = true, ModifiedUtc = now, Uid = "vol~sub" },
+            MkFile("sub/inner.txt", "inn", 5),
+            new() { RelativePath = "sub2", Name = "sub2", IsFolder = true, ModifiedUtc = now, Uid = "vol~sub2" },
+        },
+    });
+
+    // Local-file creation and hydration both need the provider connected (an unpopulated on-demand
+    // directory refuses new files until the provider answers for it) — matching the real app, where the
+    // provider runs for the folder's whole lifetime. Disconnect before decommissioning, like the service.
+    using (engine.Connect(
+        localOverride,
+        (rel, _) => Task.FromResult<IReadOnlyList<RemoteEntry>>(rel switch
+        {
+            "sub2" => new List<RemoteEntry> { MkFile("sub2/keep2.txt", "kp2", content.Length) },
+            _ => new List<RemoteEntry>(),
+        }),
+        async (_, output, ct) => await output.WriteAsync(content, ct)))
+    {
+        File.WriteAllText(Path.Combine(localOverride, "local.txt"), "born local, never a placeholder");
+        var bytes = File.ReadAllBytes(Path.Combine(localOverride, "hydrated.txt"));
+        Console.WriteLine($"  hydrate hydrated.txt -> {bytes.Length} B (content match: {bytes.AsSpan().SequenceEqual(content)})");
+
+        // Browse sub2 from a SEPARATE process so it gets POPULATED (the real Explorer flow), then
+        // hydrate its file — a populated folder with local content must survive as a plain folder.
+        var (browseOk, names) = EnumerateInSeparateProcess(Path.Combine(localOverride, "sub2"));
+        var bytes2 = File.ReadAllBytes(Path.Combine(localOverride, "sub2", "keep2.txt"));
+        Console.WriteLine($"  browse+hydrate sub2/keep2.txt -> browse={browseOk} [{string.Join(",", names)}], {bytes2.Length} B (match: {bytes2.AsSpan().SequenceEqual(content)})");
+    }
+
+    // Diagnostic: what does each entry look like right before decommission? (Attributes vs the
+    // authoritative Cloud Filter placeholder state — under shell registration these can disagree.)
+    foreach (var entry in Directory.EnumerateFileSystemEntries(localOverride, "*", SearchOption.AllDirectories))
+    {
+        var attributes = File.GetAttributes(entry);
+        var handle = Vanara.PInvoke.Kernel32.FindFirstFile(entry, out var findData);
+        var state = handle.IsInvalid
+            ? Vanara.PInvoke.CldApi.CF_PLACEHOLDER_STATE.CF_PLACEHOLDER_STATE_INVALID
+            : Vanara.PInvoke.CldApi.CfGetPlaceholderStateFromFindData(findData);
+        handle.Dispose();
+        Console.WriteLine($"    {Path.GetRelativePath(localOverride, entry),-16} attrs=0x{(int)attributes:X8} state={state}");
+    }
+
+    var keep = engine.DecommissionTree(localOverride, keepLocalFiles: true);
+    Console.WriteLine($"  decommission(keep files) -> reverted={keep.Reverted} deleted={keep.Deleted} kept={keep.Kept} errors={keep.Errors.Count}");
+    foreach (var error in keep.Errors)
+    {
+        Console.WriteLine($"    ! {error}");
+    }
+
+    try
+    {
+        engine.UnregisterSyncRoot(localOverride);
+        Console.WriteLine("  unregister sync root -> OK");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  unregister sync root -> FAILED: {ex.Message}");
+    }
+
+    var ok = true;
+    bool Report(string what, bool pass)
+    {
+        Console.WriteLine($"  {(pass ? "OK " : "x  ")} {what}");
+        return pass;
+    }
+
+    bool IsPlainFile(string name)
+    {
+        var path = Path.Combine(localOverride, name);
+        return File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0;
+    }
+
+    ok &= Report("hydrated.txt is now a plain file with its content",
+        IsPlainFile("hydrated.txt") && File.ReadAllBytes(Path.Combine(localOverride, "hydrated.txt")).AsSpan().SequenceEqual(content));
+    ok &= Report("local.txt untouched", IsPlainFile("local.txt"));
+    ok &= Report("cloudonly.txt removed (content lives on the remote)", !File.Exists(Path.Combine(localOverride, "cloudonly.txt")));
+    ok &= Report("sub/ removed (nothing local was inside it)", !Directory.Exists(Path.Combine(localOverride, "sub")));
+    ok &= Report("sub2/ kept as a plain folder (had local content)", Directory.Exists(Path.Combine(localOverride, "sub2")));
+    ok &= Report("sub2/keep2.txt is a plain file with its content",
+        IsPlainFile(Path.Combine("sub2", "keep2.txt"))
+        && File.ReadAllBytes(Path.Combine(localOverride, "sub2", "keep2.txt")).AsSpan().SequenceEqual(content));
+
+    // Round 2: remove-files mode — the folder is emptied (still never touching the remote). The plain
+    // file goes in before re-registering (no provider is connected to answer population requests).
+    File.WriteAllText(Path.Combine(localOverride, "another-local.txt"), "x");
+    engine.RegisterSyncRoot(rootInfo);
+    engine.CreatePlaceholders(localOverride, new RemoteSnapshot
+    {
+        RootPath = "/",
+        CapturedUtc = now,
+        Entries = new List<RemoteEntry> { MkFile("cloudonly2.txt", "cl2", 5) },
+    });
+
+    var wipe = engine.DecommissionTree(localOverride, keepLocalFiles: false);
+    Console.WriteLine($"  decommission(remove files) -> deleted={wipe.Deleted} errors={wipe.Errors.Count}");
+    try
+    {
+        engine.UnregisterSyncRoot(localOverride);
+    }
+    catch
+    {
+    }
+
+    ok &= Report("remove-files leaves the folder empty", !Directory.EnumerateFileSystemEntries(localOverride).Any());
+
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
 }

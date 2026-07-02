@@ -18,6 +18,14 @@ public sealed record PlaceholderResult(int Created, int Skipped, IReadOnlyList<s
 public sealed record DehydrateResult(int Dehydrated, int Skipped, IReadOnlyList<string> Errors);
 
 /// <summary>
+/// Outcome of decommissioning an on-demand folder: <see cref="Reverted"/> placeholders were turned back
+/// into ordinary files/folders (their content was on disk), <see cref="Deleted"/> items were removed
+/// locally (cloud-only placeholders whose content lives on the remote — or, when the caller chose not to
+/// keep files, everything). <see cref="Kept"/> counts plain local items that were never placeholders.
+/// </summary>
+public sealed record DecommissionResult(int Reverted, int Deleted, int Kept, IReadOnlyList<string> Errors);
+
+/// <summary>
 /// Supplies a placeholder's content on demand. Given the file-identity blob stored on the placeholder
 /// (the remote revision uid), write the full file content to <paramref name="output"/>. The engine then
 /// serves whatever byte range Windows requested from it.
@@ -73,6 +81,19 @@ public interface IPlaceholderEngine
     /// (the platform refuses those, so no unpushed edit can be lost). Local-only; safe while syncing.
     /// </summary>
     DehydrateResult DehydrateTree(string path, TimeSpan? notUsedFor = null);
+
+    /// <summary>
+    /// Takes a folder OUT of files-on-demand, returning it to an ordinary local folder. Must run while
+    /// the sync root is still registered (afterwards the caller unregisters it) — reverting or deleting
+    /// placeholders needs the Cloud Filter driver's cooperation, and unregistering first would strand
+    /// dehydrated placeholders as unopenable husks.
+    /// <para>With <paramref name="keepLocalFiles"/>: files whose content is on disk (hydrated
+    /// placeholders) are reverted in place to plain files; cloud-only placeholders are deleted locally
+    /// (their content still lives on the remote); plain local files are untouched. Folder placeholders
+    /// are reverted, or deleted when nothing local remains inside them. Without it, everything under
+    /// <paramref name="localRoot"/> is deleted. The root folder itself always remains.</para>
+    /// </summary>
+    DecommissionResult DecommissionTree(string localRoot, bool keepLocalFiles);
 
     /// <summary>
     /// Marks a just-uploaded local file as a synced placeholder so it can be dehydrated later: a plain

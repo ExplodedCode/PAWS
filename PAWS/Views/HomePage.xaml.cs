@@ -417,28 +417,152 @@ namespace PAWS.Views
             await dialog.ShowAsync();
         }
 
-        private async Task RemoveFolderAsync(ProtonAccount account, SyncPair pair)
+        private enum StopSyncChoice
         {
+            Cancel,
+            KeepFiles,
+            RemoveFiles,
+        }
+
+        /// <summary>
+        /// Asks what should happen to the local files when syncing stops. Either way the local folder is
+        /// returned to an ordinary folder: online-only placeholders are removed (their content lives on
+        /// Proton Drive), and nothing on Proton Drive is touched.
+        /// </summary>
+        private async Task<StopSyncChoice> AskKeepOrRemoveFilesAsync(string title, string intro)
+        {
+            var content = new StackPanel { Spacing = 10, MaxWidth = 460 };
+            content.Children.Add(new TextBlock { Text = intro, TextWrapping = TextWrapping.Wrap });
+            content.Children.Add(new TextBlock
+            {
+                Text = "What should happen to the files in the local folder? Everything stays on Proton Drive either way.",
+                TextWrapping = TextWrapping.Wrap,
+            });
+            content.Children.Add(new TextBlock
+            {
+                Text = "• Keep files — files already on this PC stay as normal files. Online-only files "
+                       + "(the ones that download when opened) are removed from the folder, since their "
+                       + "content only lives on Proton Drive.\n"
+                       + "• Remove files — everything inside the local folder is deleted from this PC.",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.8,
+            });
+
             var dialog = new ContentDialog
             {
-                Title = "Stop syncing this folder?",
-                Content = $"PAWS will stop syncing \"{FolderDisplayName(pair.LocalPath)}\".\n\n"
-                          + "Nothing is deleted — the files stay on your PC and on Proton Drive; they just won't sync anymore.",
-                PrimaryButtonText = "Stop syncing",
+                Title = title,
+                Content = content,
+                PrimaryButtonText = "Keep files",
+                SecondaryButtonText = "Remove files",
                 CloseButtonText = "Cancel",
-                DefaultButton = ContentDialogButton.Close,
+                DefaultButton = ContentDialogButton.Primary,
                 XamlRoot = XamlRoot,
             };
 
-            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            return await dialog.ShowAsync() switch
+            {
+                ContentDialogResult.Primary => StopSyncChoice.KeepFiles,
+                ContentDialogResult.Secondary => StopSyncChoice.RemoveFiles,
+                _ => StopSyncChoice.Cancel,
+            };
+        }
+
+        /// <summary>
+        /// Runs the actual teardown for one or more pairs with a progress dialog: stops their watchers,
+        /// decommissions each local folder back to an ordinary folder (keeping or removing files as
+        /// chosen), then applies <paramref name="onCleanupDone"/> (the settings change — remove the pair
+        /// or the whole account) and reports what happened.
+        /// </summary>
+        private async Task RunStopSyncCleanupAsync(
+            string title, IReadOnlyList<SyncPair> pairs, bool keepFiles, Action onCleanupDone)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Cleaning up…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var details = new StackPanel { Spacing = 2 };
+            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
+            panel.Children.Add(header);
+            panel.Children.Add(details);
+
+            var dialog = new ContentDialog
+            {
+                Title = title,
+                Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                var reverted = 0;
+                var deleted = 0;
+                var kept = 0;
+                var errors = new List<string>();
+
+                foreach (var pair in pairs)
+                {
+                    status.Text = $"Cleaning up \"{FolderDisplayName(pair.LocalPath)}\"…";
+                    try
+                    {
+                        App.Instance.FullSync.StopAutoSync(pair.Id); // full-sync watcher/poll, if any
+                        var result = await App.Instance.CloudSync.DecommissionAsync(pair, keepFiles);
+                        reverted += result.Reverted;
+                        deleted += result.Deleted;
+                        kept += result.Kept;
+                        errors.AddRange(result.Errors);
+                    }
+                    catch (Exception ex)
+                    {
+                        errors.Add($"{FolderDisplayName(pair.LocalPath)}: {ex.Message}");
+                    }
+                }
+
+                // The cleanup is done (best-effort) — apply the settings change regardless, so a stray
+                // locked file can't leave the account/folder half-removed in the app.
+                try
+                {
+                    onCleanupDone();
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"Updating settings failed: {ex.Message}");
+                }
+
+                ring.IsActive = false;
+                status.Text = keepFiles
+                    ? $"Done. {reverted + kept} file(s)/folder(s) kept on this PC as normal files; "
+                      + $"{deleted} online-only item(s) removed locally (still on Proton Drive)."
+                    : $"Done. {deleted} item(s) removed from this PC. Everything is still on Proton Drive.";
+
+                foreach (var error in errors)
+                {
+                    details.Children.Add(new TextBlock { Text = $"⚠ {error}", TextWrapping = TextWrapping.Wrap });
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        private async Task RemoveFolderAsync(ProtonAccount account, SyncPair pair)
+        {
+            var choice = await AskKeepOrRemoveFilesAsync(
+                "Stop syncing this folder?",
+                $"PAWS will stop syncing \"{FolderDisplayName(pair.LocalPath)}\" and turn it back into a regular folder.");
+
+            if (choice == StopSyncChoice.Cancel)
             {
                 return;
             }
 
-            App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the on-demand watcher/poll, if any
-            App.Instance.FullSync.StopAutoSync(pair.Id); // stop the full-sync watcher/poll, if any
-            App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
-            App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
+            await RunStopSyncCleanupAsync(
+                $"Stop syncing — {FolderDisplayName(pair.LocalPath)}",
+                [pair],
+                keepFiles: choice == StopSyncChoice.KeepFiles,
+                onCleanupDone: () => App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id));
+
             Refresh();
         }
 
@@ -1084,22 +1208,21 @@ namespace PAWS.Views
 
         private async Task RemoveAccountAsync(ProtonAccount account)
         {
-            var dialog = new ContentDialog
-            {
-                Title = "Remove account",
-                Content = $"Remove {account.Label} and its stored credentials from this PC?",
-                PrimaryButtonText = "Remove",
-                CloseButtonText = "Cancel",
-                DefaultButton = ContentDialogButton.Close,
-                XamlRoot = XamlRoot,
-            };
+            var choice = await AskKeepOrRemoveFilesAsync(
+                "Remove account?",
+                $"PAWS will remove {account.Label} and its stored credentials from this PC, and stop syncing "
+                + $"its {account.SyncPairs.Count} folder(s) — each goes back to being a regular folder.");
 
-            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            if (choice == StopSyncChoice.Cancel)
             {
                 return;
             }
 
-            App.Instance.CreateSetupWorkflow().RemoveAccount(account.Id);
+            await RunStopSyncCleanupAsync(
+                $"Remove account — {account.Label}",
+                [.. account.SyncPairs],
+                keepFiles: choice == StopSyncChoice.KeepFiles,
+                onCleanupDone: () => App.Instance.CreateSetupWorkflow().RemoveAccount(account.Id));
 
             if (!App.Instance.IsConfigured)
             {

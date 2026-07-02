@@ -3,7 +3,6 @@ using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using PAWS.Infrastructure.Startup;
-using PAWS.Infrastructure.Storage;
 
 namespace PAWS.Views
 {
@@ -134,16 +133,20 @@ namespace PAWS.Views
 
         /// <summary>
         /// Signs out every account and removes all folder configurations: stops every watcher/poll,
-        /// disconnects the on-demand providers, clears per-pair sync state, and deletes each account's
-        /// stored credentials and settings. Local files and Proton Drive content are left untouched.
+        /// decommissions each synced folder back to an ordinary folder (files already on this PC are kept
+        /// as normal files; online-only placeholders are removed locally — their content stays on Proton
+        /// Drive), unregisters the sync roots, clears per-pair sync state, and deletes each account's
+        /// stored credentials and settings. Nothing on Proton Drive is touched.
         /// </summary>
         private async Task ResetAppAsync()
         {
             var confirm = new ContentDialog
             {
                 Title = "Reset PAWS?",
-                Content = "This signs out every account and removes all folder sync configurations from this PC.\n\n"
-                          + "No files are deleted — everything on your PC and on Proton Drive stays where it is.",
+                Content = "This signs out every account and removes all folder sync configurations from this PC. "
+                          + "Each synced folder goes back to being a regular folder.\n\n"
+                          + "Files already on this PC are kept as normal files. Online-only files (the ones that "
+                          + "download when opened) are removed from your folders — they stay on Proton Drive.",
                 PrimaryButtonText = "Reset",
                 CloseButtonText = "Cancel",
                 DefaultButton = ContentDialogButton.Close,
@@ -159,20 +162,18 @@ namespace PAWS.Views
 
             var settings = App.Instance.SettingsStore.Load();
             var workflow = App.Instance.CreateSetupWorkflow();
-            var populatedStore = new JsonPopulatedFolderStore(App.Instance.Paths);
 
             foreach (var account in settings.Accounts)
             {
                 foreach (var pair in account.SyncPairs)
                 {
                     // Best-effort teardown per pair — a failure on one must not block the reset.
+                    // Decommission stops auto-sync, cleans the placeholder tree (keeping local files),
+                    // unregisters the sync root, and clears the pair's persisted state.
                     try
                     {
-                        App.Instance.CloudSync.StopAutoSync(pair.Id);
                         App.Instance.FullSync.StopAutoSync(pair.Id);
-                        App.Instance.CloudSync.Disable(pair.Id);
-                        App.Instance.SyncStateStore.Clear(pair.Id);
-                        populatedStore.Clear(pair.Id);
+                        await App.Instance.CloudSync.DecommissionAsync(pair, keepLocalFiles: true);
                     }
                     catch
                     {

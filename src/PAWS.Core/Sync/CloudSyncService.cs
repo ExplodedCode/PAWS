@@ -619,6 +619,49 @@ public sealed class CloudSyncService(
     public void Disable(string pairId) => DisposeConnection(pairId);
 
     /// <summary>
+    /// Fully removes a pair's sync machinery from this PC, returning the local folder to an ordinary
+    /// folder: stops auto-sync, disconnects the provider, cleans the placeholder tree (see
+    /// <see cref="IPlaceholderEngine.DecommissionTree"/> — with <paramref name="keepLocalFiles"/>,
+    /// on-disk content is kept as plain files and cloud-only placeholders are removed; without it, the
+    /// folder's contents are deleted), unregisters the sync root, and clears the pair's persisted
+    /// sync/populated state. Nothing on the remote is touched either way. The tree MUST be cleaned before
+    /// the sync root is unregistered, or dehydrated placeholders would be stranded unopenable.
+    /// Purely local (no Drive/crypto), so it needs no drive gate. Safe for non-on-demand pairs too — with
+    /// no placeholders present the cleanup keeps everything and the unregister is a no-op.
+    /// </summary>
+    public async Task<DecommissionResult> DecommissionAsync(SyncPair pair, bool keepLocalFiles, CancellationToken cancellationToken = default)
+    {
+        StopAutoSync(pair.Id);
+        Disable(pair.Id); // waits (bounded) for an in-flight hydration to drain before disconnecting
+
+        var result = await Task.Run(
+            () => placeholderEngine.DecommissionTree(pair.LocalPath, keepLocalFiles), cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            placeholderEngine.UnregisterSyncRoot(pair.LocalPath);
+        }
+        catch (Exception ex)
+        {
+            // Never registered (full-sync pair) or already gone — fine. A real failure on an on-demand
+            // root only leaves a stale Explorer entry behind; report it rather than failing the removal.
+            if (pair.Mode == SyncMode.OnDemand)
+            {
+                result = result with { Errors = [.. result.Errors, $"unregister sync root: {ex.Message}"] };
+            }
+        }
+
+        stateStore.Clear(pair.Id);
+        populatedStore.Clear(pair.Id);
+        lock (_populated)
+        {
+            _populated.Remove(pair.Id);
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// "Free up space": dehydrates the pair's local files back to cloud-only placeholders — all of them,
     /// or only those unused for <paramref name="notUsedFor"/> when given. Pinned files ("Always keep on
     /// this device"), files with unpushed local edits, and files already cloud-only are skipped. Purely

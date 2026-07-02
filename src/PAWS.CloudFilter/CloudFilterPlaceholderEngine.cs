@@ -305,6 +305,197 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         }
     }
 
+    public DecommissionResult DecommissionTree(string localRoot, bool keepLocalFiles)
+    {
+        var reverted = 0;
+        var deleted = 0;
+        var kept = 0;
+        var errors = new List<string>();
+
+        if (!Directory.Exists(localRoot))
+        {
+            return new DecommissionResult(0, 0, 0, []);
+        }
+
+        if (keepLocalFiles)
+        {
+            CleanDirectoryKeepingLocal(localRoot, ref reverted, ref deleted, ref kept, errors);
+        }
+        else
+        {
+            // Delete everything under the root (the root itself is the user's chosen folder — keep it).
+            // Placeholders are ordinary filesystem objects to delete; no revert needed first.
+            foreach (var entry in Directory.EnumerateFileSystemEntries(localRoot))
+            {
+                try
+                {
+                    if (Directory.Exists(entry))
+                    {
+                        Directory.Delete(entry, recursive: true);
+                    }
+                    else
+                    {
+                        File.Delete(entry);
+                    }
+
+                    deleted++;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{entry}: {ex.Message}");
+                }
+            }
+        }
+
+        return new DecommissionResult(reverted, deleted, kept, errors);
+    }
+
+    // Depth-first pass over one directory for the keep-local-files decommission. Files: hydrated
+    // placeholders are reverted to plain files, cloud-only placeholders (content not on disk) are
+    // deleted, plain files are kept. Sub-folders are processed first, then each placeholder folder is
+    // deleted if nothing local remained inside it, or reverted to a plain folder otherwise.
+    //
+    // NOTE placeholder detection: under SHELL sync-root registration the Cloud Filter driver MASKS the
+    // reparse-point attribute (a fully-hydrated placeholder is indistinguishable from a plain file by
+    // attributes, and even CfGetPlaceholderStateFromFindData reports NO_STATES) — so never test
+    // FileAttributes.ReparsePoint here. RECALL_ON_DATA_ACCESS is still surfaced and marks content that
+    // is not fully local; for the rest, CfRevertPlaceholder itself is the authority — it succeeds on a
+    // placeholder and returns ERROR_NOT_A_CLOUD_FILE on a plain file.
+    private static void CleanDirectoryKeepingLocal(
+        string directory, ref int reverted, ref int deleted, ref int kept, List<string> errors)
+    {
+        foreach (var subDirectory in Directory.EnumerateDirectories(directory))
+        {
+            try
+            {
+                // A symlink/junction points elsewhere — never treat its target as ours to clean.
+                if (new DirectoryInfo(subDirectory).LinkTarget is not null)
+                {
+                    kept++;
+                    continue;
+                }
+
+                CleanDirectoryKeepingLocal(subDirectory, ref reverted, ref deleted, ref kept, errors);
+
+                var isEmpty = !Directory.EnumerateFileSystemEntries(subDirectory).Any();
+
+                // RECALL_ON_DATA_ACCESS on a directory = a placeholder whose children were never fully
+                // populated — cloud-backed by definition (a plain local folder never carries it), and
+                // CfRevertPlaceholder refuses it as "partial". Empty after the pass above means nothing
+                // local lives in it: remove it (its contents still live on the remote).
+                if ((File.GetAttributes(subDirectory) & (FileAttributes)RecallOnDataAccessAttribute) != 0 && isEmpty)
+                {
+                    Directory.Delete(subDirectory);
+                    deleted++;
+                    continue;
+                }
+
+                switch (TryRevert(subDirectory, isDirectory: true))
+                {
+                    case RevertOutcome.NotPlaceholder:
+                        kept++;
+                        break;
+                    case RevertOutcome.Reverted when isEmpty:
+                        // The folder existed only to mirror the remote and nothing local remained in
+                        // it — remove it (its contents still live on the remote).
+                        Directory.Delete(subDirectory);
+                        deleted++;
+                        break;
+                    case RevertOutcome.Reverted:
+                        reverted++;
+                        break;
+                    default:
+                        errors.Add($"{subDirectory}: could not revert the folder placeholder");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{subDirectory}: {ex.Message}");
+            }
+        }
+
+        foreach (var file in Directory.EnumerateFiles(directory))
+        {
+            try
+            {
+                if ((File.GetAttributes(file) & (FileAttributes)RecallOnDataAccessAttribute) != 0)
+                {
+                    // Cloud-only (or partially hydrated): the content is not on disk, so "keep files"
+                    // has nothing to keep — remove the local stub; the file stays on the remote.
+                    File.Delete(file);
+                    deleted++;
+                    continue;
+                }
+
+                switch (TryRevert(file, isDirectory: false))
+                {
+                    case RevertOutcome.Reverted:
+                        reverted++;
+                        break;
+                    case RevertOutcome.NotPlaceholder:
+                        kept++; // plain local file — not ours to touch
+                        break;
+                    default:
+                        // In use or refused — the data IS on disk, so leaving it is safe (a fully-
+                        // hydrated placeholder keeps opening even after the sync root goes away).
+                        errors.Add($"{file}: could not revert the placeholder (file in use?)");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{file}: {ex.Message}");
+            }
+        }
+    }
+
+    private enum RevertOutcome
+    {
+        Reverted,
+        NotPlaceholder,
+        Failed,
+    }
+
+    // ERROR_NOT_A_CLOUD_FILE as an HRESULT — CfRevertPlaceholder/CfUpdatePlaceholder return it when the
+    // target is a plain file, which is our only reliable placeholder test (see CleanDirectoryKeepingLocal).
+    private static readonly HRESULT NotACloudFile = ((Win32Error)Win32Error.ERROR_NOT_A_CLOUD_FILE).ToHRESULT();
+
+    // Strips a placeholder back to an ordinary file/folder (removes the cloud reparse point + metadata).
+    // Directories can't take an exclusive oplock, so they open with plain write access instead
+    // (CfRevertPlaceholder needs a writable handle).
+    private static RevertOutcome TryRevert(string path, bool isDirectory)
+    {
+        var openFlags = isDirectory ? CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_WRITE_ACCESS : CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE;
+        if (CfOpenFileWithOplock(path, openFlags, out var handle).Failed)
+        {
+            return RevertOutcome.Failed;
+        }
+
+        using (handle)
+        {
+            var hr = CfRevertPlaceholder(handle, CF_REVERT_FLAGS.CF_REVERT_FLAG_NONE);
+
+            // A never-populated directory placeholder is "partial" and refuses to revert; marking it
+            // populated (nothing more will be enumerated into it — we're decommissioning) unblocks it.
+            if (hr.Failed && hr != NotACloudFile && isDirectory)
+            {
+                long usn = 0;
+                if (CfUpdatePlaceholder(
+                    handle, default, IntPtr.Zero, 0, null, 0,
+                    CF_UPDATE_FLAGS.CF_UPDATE_FLAG_DISABLE_ON_DEMAND_POPULATION | CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC,
+                    ref usn).Succeeded)
+                {
+                    hr = CfRevertPlaceholder(handle, CF_REVERT_FLAGS.CF_REVERT_FLAG_NONE);
+                }
+            }
+
+            return hr.Succeeded ? RevertOutcome.Reverted
+                : hr == NotACloudFile ? RevertOutcome.NotPlaceholder
+                : RevertOutcome.Failed;
+        }
+    }
+
     public void FinalizeUploadedFile(string fullPath, string fileIdentity)
     {
         try
@@ -313,9 +504,6 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             {
                 return;
             }
-
-            // A cloud placeholder is a reparse point; a brand-new local file that was just pushed is not.
-            var isPlaceholder = (File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0;
 
             if (CfOpenFileWithOplock(fullPath, CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE, out var handle).Failed)
             {
@@ -328,20 +516,19 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 try
                 {
                     var identityLength = (uint)((fileIdentity.Length + 1) * sizeof(char));
-                    if (isPlaceholder)
+
+                    // Whether the pushed file is a placeholder (edited, needs its identity refreshed to
+                    // the NEW revision — else a later dehydrate + open would download the old content) or
+                    // a plain local file (brand new, needs converting) can NOT be told from attributes:
+                    // shell-registered roots mask the reparse-point attribute. So try the update path and
+                    // let the API say "not a cloud file", then convert. Zeroed CF_FS_METADATA fields mean
+                    // "no metadata change"; both paths mark the file in-sync so it can dehydrate.
+                    long usn = 0;
+                    var hr = CfUpdatePlaceholder(
+                        handle, default, identity, identityLength, null, 0,
+                        CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, ref usn);
+                    if (hr == NotACloudFile)
                     {
-                        // Edited placeholder that was pushed: point it at the NEW revision (else a later
-                        // dehydrate + open would download the old content) and mark it in-sync so it can
-                        // dehydrate. Zeroed CF_FS_METADATA fields mean "no metadata change".
-                        long usn = 0;
-                        CfUpdatePlaceholder(
-                            handle, default, identity, identityLength, null, 0,
-                            CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, ref usn);
-                    }
-                    else
-                    {
-                        // New local file that was pushed: convert it in place to a hydrated, in-sync
-                        // placeholder carrying the uploaded revision's identity.
                         CfConvertToPlaceholder(
                             handle, identity, identityLength, CF_CONVERT_FLAGS.CF_CONVERT_FLAG_MARK_IN_SYNC, out _);
                     }
