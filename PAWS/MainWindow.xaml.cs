@@ -36,6 +36,18 @@ namespace PAWS
             AppWindow.Closing += OnClosing;
             TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
 
+            // Set the tray image from a real .ico via the Icon property — H.NotifyIcon's XAML IconSource
+            // (ms-appx URI) conversion path throws COMException 0x800C000E on every launch. Best-effort:
+            // without an image the tray item still works (tooltip + menu).
+            try
+            {
+                TrayIcon.Icon = new System.Drawing.Icon(
+                    System.IO.Path.Combine(System.AppContext.BaseDirectory, "Assets", "PAWS.ico"));
+            }
+            catch
+            {
+            }
+
             if (App.Instance.IsConfigured)
             {
                 RootFrame.Navigate(typeof(HomePage));

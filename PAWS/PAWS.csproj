@@ -12,9 +12,15 @@
     <WinUISDKReferences>false</WinUISDKReferences>
     <EnableMsixTooling>true</EnableMsixTooling>
     <Nullable>enable</Nullable>
+    <!-- Don't Debugger.Break() in the XAML-generated UnhandledException hook: App wires its own handler
+         that logs the full exception (PawsLog) and marks it handled, so the break is redundant noise. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_BREAK_ON_UNHANDLED_EXCEPTION</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- CopyToOutputDirectory: the tray icon is loaded from AppContext.BaseDirectory at runtime
+         (MSIX packaging includes Content automatically, but plain builds only copy on request). -->
+    <Content Include="Assets\PAWS.ico" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Assets\SplashScreen.scale-200.png" />
     <Content Include="Assets\LockScreenLogo.scale-200.png" />
     <Content Include="Assets\Square150x150Logo.scale-200.png" />

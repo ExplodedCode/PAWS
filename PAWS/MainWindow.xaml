@@ -34,11 +34,12 @@
 
         <Frame x:Name="RootFrame" Grid.Row="1" />
 
-        <!-- Notification-area (tray) icon. Keeps PAWS reachable while it runs in the background. -->
+        <!-- Notification-area (tray) icon. Keeps PAWS reachable while it runs in the background.
+             The image is set in code (TrayIcon.Icon, from Assets\PAWS.ico): H.NotifyIcon's IconSource
+             ms-appx conversion throws COMException 0x800C000E at every startup. -->
         <tb:TaskbarIcon
             x:Name="TrayIcon"
-            ToolTipText="PAWS — Proton Drive sync"
-            IconSource="ms-appx:///Assets/Square44x44Logo.scale-200.png">
+            ToolTipText="PAWS — Proton Drive sync">
             <tb:TaskbarIcon.ContextFlyout>
                 <MenuFlyout>
                     <MenuFlyoutItem Text="Open PAWS" Click="OnTrayOpen" />
