@@ -43,6 +43,10 @@ return mode switch
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
+    "--dehydratetest" or "dehydratetest" => await DehydrateTestAsync(localArg, remoteArg),
+    "--shellreg" or "shellreg" => await ShellRegCheckAsync(localArg),
+    "--shellquery" or "shellquery" => await ShellQueryAsync(localArg),
+    "--shellfix" or "shellfix" => await ShellFixAsync(localArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -515,6 +519,228 @@ static async Task<int> LazyTestAsync(string? localOverride, string? remoteOverri
                 await cleanup.TrashAsync(node).ConfigureAwait(false);
                 Console.WriteLine("\n  cleaned up the remote test tree.");
             }
+        }
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Re-registers an existing sync root in place with current capabilities (verified AllowPinning) and
+// LEAVES it registered — repairs a stale registration without needing the app. Only run while the PAWS
+// app is NOT running (a live provider connection must not have the root yanked out from under it).
+// `--shellfix <folder>`.
+static async Task<int> ShellFixAsync(string? localOverride)
+{
+    if (localOverride is null || !Directory.Exists(localOverride))
+    {
+        Console.WriteLine("  x Usage: --shellfix <existingFolder>");
+        return 1;
+    }
+
+    var engine = new CloudFilterPlaceholderEngine();
+    engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+    return await ShellQueryAsync(localOverride);
+}
+
+// READ-ONLY: prints what the shell has recorded for an existing sync root (no changes made).
+// `--shellquery <folder>`.
+static async Task<int> ShellQueryAsync(string? localOverride)
+{
+    if (localOverride is null)
+    {
+        Console.WriteLine("  x Usage: --shellquery <folder>");
+        return 1;
+    }
+
+    try
+    {
+        var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(localOverride);
+        var info = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+        Console.WriteLine($"  Id             : {info.Id}");
+        Console.WriteLine($"  DisplayName    : {info.DisplayNameResource}");
+        Console.WriteLine($"  AllowPinning   : {info.AllowPinning}");
+        Console.WriteLine($"  Population     : {info.PopulationPolicy}");
+        Console.WriteLine($"  Hydration      : {info.HydrationPolicy} / {info.HydrationPolicyModifier}");
+        return info.AllowPinning ? 0 : 1;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Not a shell-registered sync root: {ex.Message}");
+        return 1;
+    }
+}
+
+// OFFLINE shell-registration check: registers a sync root, reads back what the shell recorded (Id +
+// AllowPinning — the flag gating Explorer's "Always keep on this device"/"Free up space" menu), proves
+// re-register updates in place, then unregisters. `--shellreg <folder>`.
+static async Task<int> ShellRegCheckAsync(string? localOverride)
+{
+    if (localOverride is null)
+    {
+        Console.WriteLine("  x Usage: --shellreg <folder>");
+        return 1;
+    }
+
+    var engine = new CloudFilterPlaceholderEngine();
+    Directory.CreateDirectory(localOverride);
+    var info = new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0");
+
+    engine.RegisterSyncRoot(info);
+    var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(localOverride);
+    var registered = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+    Console.WriteLine($"  Id           : {registered.Id}");
+    Console.WriteLine($"  AllowPinning : {registered.AllowPinning}");
+
+    engine.RegisterSyncRoot(info); // must update in place (the path existing roots take on app relaunch)
+    Console.WriteLine("  re-register  : OK");
+
+    engine.UnregisterSyncRoot(localOverride);
+    Console.WriteLine("  unregistered : OK");
+    return registered.AllowPinning ? 0 : 1;
+}
+
+// End-to-end dehydration ("free up space") test: enable an on-demand pair, hydrate a file by reading it,
+// then verify (1) FreeUpSpace dehydrates it back to cloud-only and it re-hydrates on read; (2) pinned
+// files ("Always keep on this device") are skipped; (3) the age filter skips recently-used files;
+// (4) a NEW local file, after a push, is finalized into an in-sync placeholder that can dehydrate AND
+// re-hydrate with the correct (new-revision) content. Also reports whether the sync root got SHELL
+// registration (= Explorer context menu available). `--dehydratetest <localFolder> <remotePath>`.
+static async Task<int> DehydrateTestAsync(string? localOverride, string? remoteOverride)
+{
+    const int RecallOnDataAccess = 0x400000; // dehydrated (cloud-only) placeholder attribute
+    const int Pinned = 0x80000;
+
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --dehydratetest <localFolder> <remotePath>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    var stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
+    var testRoot = $"{remoteOverride.TrimEnd('/')}/_dehydtest_{stamp}";
+    var helloContent = $"dehydrate me {stamp}";
+
+    await using (var setup = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (setup is null)
+        {
+            return 1;
+        }
+
+        var parent = await setup.ResolvePathAsync(remoteOverride).ConfigureAwait(false);
+        if (parent is null)
+        {
+            Console.WriteLine($"  x Remote folder not found: {remoteOverride}");
+            return 1;
+        }
+
+        var folder = await setup.CreateFolderAsync(parent, $"_dehydtest_{stamp}").ConfigureAwait(false);
+        using var c = new MemoryStream(Encoding.UTF8.GetBytes(helloContent));
+        await setup.UploadAsync(folder, "hello.txt", c).ConfigureAwait(false);
+    }
+
+    Console.WriteLine($"PAWS - dehydration test\n  local  : {localOverride}\n  remote : {testRoot}\n");
+
+    Directory.CreateDirectory(localOverride);
+    var engine = new CloudFilterPlaceholderEngine();
+    await using var cloud = new CloudSyncService(
+        engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths),
+        new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1));
+    var pair = new SyncPair { Id = $"dehydtest{stamp}", LocalPath = localOverride, RemotePath = testRoot, Mode = SyncMode.OnDemand };
+
+    var ok = true;
+    try
+    {
+        await cloud.EnableAsync(account.Id, pair);
+
+        // Shell registration check (this is what puts "Free up space" in Explorer's context menu).
+        try
+        {
+            var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(localOverride);
+            var reg = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            Console.WriteLine($"  shell registration: YES — {reg.Id}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  shell registration: NO ({ex.Message.Trim()}) — Explorer menu unavailable, Win32 fallback in use");
+        }
+
+        int Attrs(string p) => (int)File.GetAttributes(p);
+        var hello = Path.Combine(localOverride, "hello.txt");
+
+        // 1. Hydrate by reading, then FreeUpSpace should dehydrate it back to cloud-only.
+        var read1 = Encoding.UTF8.GetString(await File.ReadAllBytesAsync(hello));
+        var hydrated = (Attrs(hello) & RecallOnDataAccess) == 0;
+        Console.WriteLine($"  hydrate on read: content match={read1 == helloContent}, hydrated={hydrated}");
+        ok = ok && read1 == helloContent && hydrated;
+
+        var r1 = cloud.FreeUpSpace(pair);
+        var offloaded = (Attrs(hello) & RecallOnDataAccess) != 0;
+        Console.WriteLine($"  free up space: dehydrated={r1.Dehydrated}, now cloud-only={offloaded}  -> {(r1.Dehydrated >= 1 && offloaded ? "PASS" : "FAIL")}");
+        ok = ok && r1.Dehydrated >= 1 && offloaded;
+
+        // 2. Re-read still works (re-hydrates through the provider).
+        var read2 = Encoding.UTF8.GetString(await File.ReadAllBytesAsync(hello));
+        Console.WriteLine($"  re-hydrate on read: content match={read2 == helloContent}  -> {(read2 == helloContent ? "PASS" : "FAIL")}");
+        ok = ok && read2 == helloContent;
+
+        // 3. Pinned files are skipped ("Always keep on this device").
+        File.SetAttributes(hello, (FileAttributes)(Attrs(hello) | Pinned));
+        var r2 = cloud.FreeUpSpace(pair);
+        var stillHydrated = (Attrs(hello) & RecallOnDataAccess) == 0;
+        Console.WriteLine($"  pinned skip: dehydrated={r2.Dehydrated}, still hydrated={stillHydrated}  -> {(r2.Dehydrated == 0 && stillHydrated ? "PASS" : "FAIL")}");
+        ok = ok && r2.Dehydrated == 0 && stillHydrated;
+        File.SetAttributes(hello, (FileAttributes)(Attrs(hello) & ~Pinned));
+
+        // 4. Age filter: a freshly-used file is left alone.
+        var r3 = cloud.FreeUpSpace(pair, TimeSpan.FromDays(1));
+        Console.WriteLine($"  age filter (1 day): dehydrated={r3.Dehydrated}  -> {(r3.Dehydrated == 0 ? "PASS" : "FAIL")}");
+        ok = ok && r3.Dehydrated == 0;
+
+        // 5. New local file → push → finalize should make it a dehydratable in-sync placeholder whose
+        // identity points at the uploaded revision (so it re-hydrates with the right content).
+        var newContent = $"born local {stamp}";
+        var localNew = Path.Combine(localOverride, "local-new.txt");
+        await File.WriteAllTextAsync(localNew, newContent);
+        var push = await cloud.SyncChangesAsync(account.Id, pair);
+        Console.WriteLine($"  pushed new local file: {push.Completed} op(s), {push.Failures.Count} failed");
+
+        var r4 = cloud.FreeUpSpace(pair);
+        var newOffloaded = (Attrs(localNew) & RecallOnDataAccess) != 0;
+        Console.WriteLine($"  finalize + free up: dehydrated={r4.Dehydrated} (expect 2: hello + local-new), local-new cloud-only={newOffloaded}  -> {(newOffloaded ? "PASS" : "FAIL")}");
+        ok = ok && newOffloaded;
+
+        var read3 = await File.ReadAllTextAsync(localNew);
+        Console.WriteLine($"  re-hydrate converted file: content match={read3 == newContent}  -> {(read3 == newContent ? "PASS" : "FAIL")}");
+        ok = ok && read3 == newContent;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Test error: {ex.GetType().Name}: {ex.Message}");
+        ok = false;
+    }
+    finally
+    {
+        cloud.Disable(pair.Id);
+        try { engine.UnregisterSyncRoot(localOverride); } catch { }
+        new JsonSyncStateStore(paths).Clear(pair.Id);
+        new JsonPopulatedFolderStore(paths).Clear(pair.Id);
+
+        await using var cleanup = await ConnectFromStoredAsync().ConfigureAwait(false);
+        var node = cleanup is null ? null : await cleanup.ResolvePathAsync(testRoot).ConfigureAwait(false);
+        if (node is not null)
+        {
+            await cleanup!.TrashAsync(node).ConfigureAwait(false);
+            Console.WriteLine("\n  cleaned up the remote test folder.");
         }
     }
 

@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -165,6 +166,42 @@ namespace PAWS
             if (settings.AutoSyncOnLaunch)
             {
                 StartFullSyncPairs();
+            }
+
+            // Startup storage sweep: dehydrate on-demand files not used recently (pinned files are never
+            // touched). Purely local, so it can run alongside the provider/auto-sync startup above.
+            if (settings.AutoDehydrateDays is > 0 and var days)
+            {
+                _ = Task.Run(() => AutoDehydrate(TimeSpan.FromDays(days)));
+            }
+        }
+
+        /// <summary>
+        /// Frees up space in every enabled on-demand folder: files whose last write AND last read are
+        /// older than <paramref name="notUsedFor"/> go back to cloud-only placeholders. Skips pinned
+        /// ("Always keep on this device") files, unpushed local edits, and already-dehydrated files.
+        /// </summary>
+        private void AutoDehydrate(TimeSpan notUsedFor)
+        {
+            foreach (var account in SettingsStore.Load().Accounts)
+            {
+                foreach (var pair in account.SyncPairs.Where(p => p.Enabled && p.Mode == SyncMode.OnDemand))
+                {
+                    try
+                    {
+                        var result = CloudSync.FreeUpSpace(pair, notUsedFor);
+                        if (result.Dehydrated > 0 || result.Errors.Count > 0)
+                        {
+                            PawsLog.Write(
+                                $"Auto free-up ({pair.LocalPath}): {result.Dehydrated} dehydrated, {result.Skipped} skipped"
+                                + (result.Errors.Count > 0 ? $", {result.Errors.Count} error(s): {result.Errors[0]}" : string.Empty));
+                        }
+                    }
+                    catch (System.Exception ex)
+                    {
+                        PawsLog.Write($"Auto free-up failed for {pair.LocalPath}: {ex.Message}");
+                    }
+                }
             }
         }
 

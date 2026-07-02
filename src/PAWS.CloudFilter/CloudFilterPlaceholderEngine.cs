@@ -23,6 +23,98 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
     {
         Directory.CreateDirectory(info.LocalPath);
 
+        // Prefer SHELL registration (StorageProviderSyncRootManager): it performs the same Cloud Filter
+        // registration AND integrates with Explorer — sync status icons plus the built-in "Always keep on
+        // this device" / "Free up space" context menu (Explorer pins/dehydrates directly; hydration flows
+        // through our connected provider). Works unpackaged (no MSIX identity required — cfapiSync ships
+        // this exact pattern as a plain desktop app). A path previously registered by the old Win32-only
+        // call makes Register throw, so unregister and retry once to migrate existing pairs; if the shell
+        // path still fails, fall back to the Win32 registration — everything works except the Explorer
+        // menu/icons.
+        if (TryRegisterWithShell(info))
+        {
+            return;
+        }
+
+        CfUnregisterSyncRoot(info.LocalPath); // best-effort migration off a previous Win32-only registration
+        if (TryRegisterWithShell(info))
+        {
+            return;
+        }
+
+        RegisterSyncRootWin32(info);
+    }
+
+    private static bool TryRegisterWithShell(SyncRootInfo info)
+    {
+        try
+        {
+            var folder = Windows.Storage.StorageFolder.GetFolderFromPathAsync(info.LocalPath).AsTask().GetAwaiter().GetResult();
+
+            var registration = new Windows.Storage.Provider.StorageProviderSyncRootInfo
+            {
+                Id = ShellSyncRootId(info),
+                Path = folder,
+                DisplayNameResource = $"{info.ProviderName} - {FolderLeaf(info.LocalPath)}",
+                IconResource = @"%SystemRoot%\system32\imageres.dll,-1043",
+                Version = info.Version,
+                ProviderId = Guid.Parse(info.ProviderId),
+                HydrationPolicy = Windows.Storage.Provider.StorageProviderHydrationPolicy.Progressive,
+                HydrationPolicyModifier = Windows.Storage.Provider.StorageProviderHydrationPolicyModifier.AutoDehydrationAllowed,
+                // "Full" is the shell's name for on-demand population (folders fill via FETCH_PLACEHOLDERS).
+                PopulationPolicy = Windows.Storage.Provider.StorageProviderPopulationPolicy.Full,
+                InSyncPolicy = Windows.Storage.Provider.StorageProviderInSyncPolicy.FileLastWriteTime,
+                HardlinkPolicy = Windows.Storage.Provider.StorageProviderHardlinkPolicy.None,
+                ShowSiblingsAsGroup = false,
+                // THE switch for Explorer's "Always keep on this device" / "Free up space" context menu —
+                // it defaults to false, and without it the shell offers no pin UX at all.
+                AllowPinning = true,
+                ProtectionMode = Windows.Storage.Provider.StorageProviderProtectionMode.Unknown,
+            };
+            registration.Context = Windows.Security.Cryptography.CryptographicBuffer.ConvertStringToBinary(
+                registration.Id, Windows.Security.Cryptography.BinaryStringEncoding.Utf8);
+
+            Windows.Storage.Provider.StorageProviderSyncRootManager.Register(registration);
+
+            // Register over an EXISTING id succeeds but keeps the old capabilities (observed live: a root
+            // registered before AllowPinning was set stayed Flags-stale after re-register, so Explorer
+            // never showed the pin menu). Verify what the shell actually recorded and, if the pin
+            // capability is missing, unregister and register fresh.
+            var recorded = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            if (!recorded.AllowPinning)
+            {
+                Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(recorded.Id);
+                Windows.Storage.Provider.StorageProviderSyncRootManager.Register(registration);
+                recorded = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            }
+
+            return recorded.AllowPinning;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // The shell requires the id format "{providerId}!{userSid}!{accountSegment}"; the last segment is a
+    // stable per-folder tag so each pair registers as its own root.
+    private static string ShellSyncRootId(SyncRootInfo info)
+    {
+        var sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "S-1-0-0";
+        var pathHash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.Unicode.GetBytes(info.LocalPath.TrimEnd('\\', '/').ToUpperInvariant()));
+        return $"{info.ProviderId}!{sid}!{Convert.ToHexString(pathHash.AsSpan(0, 8))}";
+    }
+
+    private static string FolderLeaf(string localPath)
+    {
+        var name = Path.GetFileName(localPath.TrimEnd('\\', '/'));
+        return string.IsNullOrEmpty(name) ? localPath : name;
+    }
+
+    // The original Win32-only registration (no Explorer shell integration) — kept as the fallback.
+    private static void RegisterSyncRootWin32(SyncRootInfo info)
+    {
         var registration = new CF_SYNC_REGISTRATION
         {
             ProviderId = Guid.Parse(info.ProviderId),
@@ -53,7 +145,32 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
     }
 
     public void UnregisterSyncRoot(string localPath)
-        => CfUnregisterSyncRoot(localPath).ThrowIfFailed();
+    {
+        // Shell-registered roots must be removed through the shell (clears the Explorer integration);
+        // Win32-registered roots need CfUnregisterSyncRoot. Try shell first, then the Win32 call — if the
+        // shell already unregistered it, the Win32 failure is expected and ignored.
+        var shellUnregistered = TryUnregisterShell(localPath);
+        var hr = CfUnregisterSyncRoot(localPath);
+        if (!shellUnregistered)
+        {
+            hr.ThrowIfFailed();
+        }
+    }
+
+    private static bool TryUnregisterShell(string localPath)
+    {
+        try
+        {
+            var folder = Windows.Storage.StorageFolder.GetFolderFromPathAsync(localPath).AsTask().GetAwaiter().GetResult();
+            var current = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(current.Id);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     public PlaceholderResult CreatePlaceholders(string localRoot, RemoteSnapshot remoteSnapshot)
     {
@@ -113,6 +230,133 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
     public IDisposable Connect(string localRoot, FetchFolderChildren fetchChildren, FetchPlaceholderData fetchData)
         => new HydrationConnection(localRoot, fetchChildren, fetchData);
+
+    private const int PinnedAttribute = 0x80000;           // FILE_ATTRIBUTE_PINNED — "Always keep on this device"
+    private const int RecallOnDataAccessAttribute = 0x400000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS — already cloud-only
+
+    public DehydrateResult DehydrateTree(string path, TimeSpan? notUsedFor = null)
+    {
+        var dehydrated = 0;
+        var skipped = 0;
+        var errors = new List<string>();
+        var cutoffUtc = notUsedFor is { } age ? DateTime.UtcNow - age : (DateTime?)null;
+
+        IEnumerable<string> files;
+        if (File.Exists(path))
+        {
+            files = [path];
+        }
+        else if (Directory.Exists(path))
+        {
+            files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
+        }
+        else
+        {
+            return new DehydrateResult(0, 0, [$"{path}: not found"]);
+        }
+
+        foreach (var file in files)
+        {
+            try
+            {
+                var info = new FileInfo(file);
+                var attributes = (int)info.Attributes;
+
+                // Leave alone: pinned files, files already cloud-only, and (when an age is given) files
+                // used recently — "used" meaning either written or read.
+                if ((attributes & PinnedAttribute) != 0
+                    || (attributes & RecallOnDataAccessAttribute) != 0
+                    || (cutoffUtc is { } cutoff && (info.LastWriteTimeUtc > cutoff || info.LastAccessTimeUtc > cutoff)))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (TryDehydrate(file))
+                {
+                    dehydrated++;
+                }
+                else
+                {
+                    // In use, not a placeholder (a local file that hasn't synced), or not in sync
+                    // (unpushed edits — the platform refuses, which is exactly the safety we want).
+                    skipped++;
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{file}: {ex.Message}");
+            }
+        }
+
+        return new DehydrateResult(dehydrated, skipped, errors);
+    }
+
+    private static bool TryDehydrate(string file)
+    {
+        if (CfOpenFileWithOplock(file, CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE, out var handle).Failed)
+        {
+            return false;
+        }
+
+        using (handle)
+        {
+            return CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAGS.CF_DEHYDRATE_FLAG_NONE).Succeeded;
+        }
+    }
+
+    public void FinalizeUploadedFile(string fullPath, string fileIdentity)
+    {
+        try
+        {
+            if (!File.Exists(fullPath))
+            {
+                return;
+            }
+
+            // A cloud placeholder is a reparse point; a brand-new local file that was just pushed is not.
+            var isPlaceholder = (File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0;
+
+            if (CfOpenFileWithOplock(fullPath, CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_EXCLUSIVE, out var handle).Failed)
+            {
+                return;
+            }
+
+            using (handle)
+            {
+                var identity = Marshal.StringToCoTaskMemUni(fileIdentity);
+                try
+                {
+                    var identityLength = (uint)((fileIdentity.Length + 1) * sizeof(char));
+                    if (isPlaceholder)
+                    {
+                        // Edited placeholder that was pushed: point it at the NEW revision (else a later
+                        // dehydrate + open would download the old content) and mark it in-sync so it can
+                        // dehydrate. Zeroed CF_FS_METADATA fields mean "no metadata change".
+                        long usn = 0;
+                        CfUpdatePlaceholder(
+                            handle, default, identity, identityLength, null, 0,
+                            CF_UPDATE_FLAGS.CF_UPDATE_FLAG_MARK_IN_SYNC, ref usn);
+                    }
+                    else
+                    {
+                        // New local file that was pushed: convert it in place to a hydrated, in-sync
+                        // placeholder carrying the uploaded revision's identity.
+                        CfConvertToPlaceholder(
+                            handle, identity, identityLength, CF_CONVERT_FLAGS.CF_CONVERT_FLAG_MARK_IN_SYNC, out _);
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeCoTaskMem(identity);
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort — the file just stays non-dehydratable until the next enable rebuilds it.
+        }
+    }
 
     // Builds a placeholder for one remote entry. Caller must free the returned info's FileIdentity.
     private static CF_PLACEHOLDER_CREATE_INFO BuildPlaceholderInfo(RemoteEntry child)

@@ -38,6 +38,13 @@ public sealed class PawsSettings
     public bool AutoSyncOnLaunch { get; set; } = true;
 
     /// <summary>
+    /// Automatically dehydrate ("free up space" on) on-demand files not used for this many days, checked
+    /// at app startup. Null = off. Files marked "Always keep on this device" (pinned) and files with
+    /// unpushed local changes are never dehydrated.
+    /// </summary>
+    public int? AutoDehydrateDays { get; set; } = 14;
+
+    /// <summary>
     /// Upload speed cap in KB/s; null = unlimited. Enforced by <c>TransferThrottle</c> in every upload
     /// path; changes apply immediately, including to in-flight transfers.
     /// </summary>

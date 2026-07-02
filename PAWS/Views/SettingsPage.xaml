@@ -40,6 +40,30 @@
                         Header="Start syncing all accounts when PAWS starts"
                         ToolTipService.ToolTip="Background sync resumes for every folder at launch — including folders you paused. Turn this off to keep pause states across restarts."
                         Toggled="OnBehaviorToggled" />
+
+                    <Grid ColumnSpacing="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ToggleSwitch
+                            x:Name="AutoDehydrateToggle"
+                            Header="Automatically free up space"
+                            ToolTipService.ToolTip="At startup, on-demand files you haven't used for this many days become online-only again (their content is freed from disk; opening them downloads it back). Files marked 'Always keep on this device' and files with unsynced changes are never touched."
+                            Toggled="OnAutoDehydrateToggled" />
+                        <NumberBox
+                            x:Name="AutoDehydrateDaysBox"
+                            Grid.Column="1"
+                            Header="days unused"
+                            Minimum="1"
+                            Maximum="3650"
+                            SmallChange="1"
+                            SpinButtonPlacementMode="Compact"
+                            MinWidth="140"
+                            VerticalAlignment="Bottom"
+                            IsEnabled="False"
+                            ValueChanged="OnAutoDehydrateValueChanged" />
+                    </Grid>
                 </StackPanel>
             </Border>
 

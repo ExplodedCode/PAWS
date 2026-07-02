@@ -353,6 +353,11 @@ namespace PAWS.Views
                 var pull = new MenuFlyoutItem { Text = "Pull remote changes from Drive", Icon = new FontIcon { Glyph = "" } };
                 pull.Click += async (_, _) => await SyncDownAsync(account, pair);
                 flyout.Items.Add(pull);
+
+                var freeUp = new MenuFlyoutItem { Text = "Free up space now", Icon = new FontIcon { Glyph = "" } }; // cloud
+                ToolTipService.SetToolTip(freeUp, "Make every synced file in this folder online-only again. Pinned files and unsynced changes are left alone.");
+                freeUp.Click += async (_, _) => await FreeUpSpaceAsync(pair);
+                flyout.Items.Add(freeUp);
             }
             else
             {
@@ -370,6 +375,46 @@ namespace PAWS.Views
             var manual = new DropDownButton { Content = "Manual", Flyout = flyout };
             ToolTipService.SetToolTip(manual, "Run a sync yourself, or stop syncing this folder.");
             return manual;
+        }
+
+        /// <summary>
+        /// Dehydrates all synced files in an on-demand folder back to cloud-only placeholders. Pinned
+        /// files, unpushed local edits, and already-online-only files are skipped — nothing is lost.
+        /// </summary>
+        private async Task FreeUpSpaceAsync(SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Freeing up space…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Free up space — {FolderDisplayName(pair.LocalPath)}",
+                Content = new StackPanel { Spacing = 10, MinWidth = 420, Children = { header } },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    var result = await Task.Run(() => App.Instance.CloudSync.FreeUpSpace(pair));
+                    ring.IsActive = false;
+                    status.Text = result.Dehydrated == 0
+                        ? $"Nothing to free — {result.Skipped} file(s) are already online-only, pinned, recently changed, or not yet synced."
+                        : $"Freed {result.Dehydrated} file(s) back to online-only. {result.Skipped} left as-is (pinned, unsynced, or already online-only).";
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Free up space failed: {ex.Message}";
+                }
+            };
+
+            await dialog.ShowAsync();
         }
 
         private async Task RemoveFolderAsync(ProtonAccount account, SyncPair pair)

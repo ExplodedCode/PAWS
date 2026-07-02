@@ -31,6 +31,10 @@ namespace PAWS.Views
             BackgroundToggle.IsOn = settings.RunInBackground;
             AutoSyncStartToggle.IsOn = settings.AutoSyncOnLaunch;
 
+            AutoDehydrateToggle.IsOn = settings.AutoDehydrateDays is not null;
+            AutoDehydrateDaysBox.IsEnabled = AutoDehydrateToggle.IsOn;
+            AutoDehydrateDaysBox.Value = settings.AutoDehydrateDays ?? 14;
+
             UploadLimitToggle.IsOn = settings.UploadLimitKBps is not null;
             UploadLimitBox.IsEnabled = UploadLimitToggle.IsOn;
             UploadLimitBox.Value = settings.UploadLimitKBps ?? 1024;
@@ -62,6 +66,31 @@ namespace PAWS.Views
 
             StartupRegistration.Apply(settings.RunOnStartup);
         }
+
+        private void OnAutoDehydrateToggled(object sender, RoutedEventArgs e)
+        {
+            AutoDehydrateDaysBox.IsEnabled = AutoDehydrateToggle.IsOn;
+            SaveAutoDehydrate();
+        }
+
+        private void OnAutoDehydrateValueChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+            => SaveAutoDehydrate();
+
+        private void SaveAutoDehydrate()
+        {
+            if (_loading)
+            {
+                return;
+            }
+
+            var settings = App.Instance.SettingsStore.Load();
+            settings.AutoDehydrateDays = AutoDehydrateToggle.IsOn ? ToDays(AutoDehydrateDaysBox.Value) : null;
+            App.Instance.SettingsStore.Save(settings);
+        }
+
+        // NumberBox reports NaN while empty; fall back to the default sweep age.
+        private static int ToDays(double value)
+            => double.IsNaN(value) || value < 1 ? 14 : (int)value;
 
         private void OnUploadLimitToggled(object sender, RoutedEventArgs e)
         {

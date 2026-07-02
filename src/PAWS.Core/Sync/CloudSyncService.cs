@@ -280,6 +280,33 @@ public sealed class CloudSyncService(
                 stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
             }
 
+            // Turn each successfully-uploaded file into a dehydratable, in-sync placeholder carrying its
+            // NEW revision id: brand-new local files convert in place; edited placeholders get their
+            // identity refreshed (else a later dehydrate + open would download the old revision).
+            if (newRemote is not null)
+            {
+                var failedPaths = result.Failures
+                    .Select(f => f.Operation.RelativePath)
+                    .ToHashSet(StringComparer.Ordinal);
+                var remoteFiles = newRemote.Entries
+                    .Where(e => !e.IsFolder)
+                    .ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
+
+                foreach (var op in pushOperations)
+                {
+                    if (op.Kind != SyncOperationKind.UploadFile || failedPaths.Contains(op.RelativePath))
+                    {
+                        continue;
+                    }
+
+                    if (remoteFiles.TryGetValue(op.RelativePath, out var entry) && (entry.RevisionUid ?? entry.Uid) is { } identity)
+                    {
+                        var localFile = Path.Combine(pair.LocalPath, op.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+                        placeholderEngine.FinalizeUploadedFile(localFile, identity);
+                    }
+                }
+            }
+
             return result;
         }
         finally
@@ -590,6 +617,15 @@ public sealed class CloudSyncService(
 
     /// <summary>Disconnects the provider for a pair (placeholders and registration are left in place).</summary>
     public void Disable(string pairId) => DisposeConnection(pairId);
+
+    /// <summary>
+    /// "Free up space": dehydrates the pair's local files back to cloud-only placeholders — all of them,
+    /// or only those unused for <paramref name="notUsedFor"/> when given. Pinned files ("Always keep on
+    /// this device"), files with unpushed local edits, and files already cloud-only are skipped. Purely
+    /// local (no Drive/crypto involved), so it needs no gate and is safe alongside syncing.
+    /// </summary>
+    public DehydrateResult FreeUpSpace(SyncPair pair, TimeSpan? notUsedFor = null)
+        => placeholderEngine.DehydrateTree(pair.LocalPath, notUsedFor);
 
     // Disconnects any existing provider for the pair and connects a fresh one over the given snapshot.
     // Registration is idempotent. Holds only _enableGate (NOT _clientUseGate) so disposing the old
