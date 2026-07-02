@@ -962,12 +962,18 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
         private static CF_OPERATION_INFO CreateOperationInfo(in CF_CALLBACK_INFO callbackInfo, CF_OPERATION_TYPE type)
         {
+            // ConnectionKey/TransferKey/RequestKey are VALUES and safe to carry to a worker thread.
+            // CorrelationVector is a POINTER into platform memory that is only valid DURING the callback
+            // (same lifetime rule as FileIdentity) — our CfExecute runs later, on a worker, after a
+            // network call, so passing it along dereferences freed memory inside CfExecute = a native
+            // access violation (seen in the wild: startup crash in SendPlaceholders after a force-close,
+            // where the slow session resume widened the callback→CfExecute gap). It's optional telemetry;
+            // leave it null.
             var operation = new CF_OPERATION_INFO
             {
                 Type = type,
                 ConnectionKey = callbackInfo.ConnectionKey,
                 TransferKey = callbackInfo.TransferKey,
-                CorrelationVector = callbackInfo.CorrelationVector,
                 RequestKey = callbackInfo.RequestKey,
             };
             operation.StructSize = (uint)Marshal.SizeOf(operation);

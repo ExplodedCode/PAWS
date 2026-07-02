@@ -47,12 +47,14 @@ public sealed class SyncEngine(
 
     /// <summary>
     /// Applies a previously-computed plan and persists the resulting state. Re-captures both trees
-    /// afterwards so the saved state reflects what is actually on disk/Drive now.
+    /// afterwards so the saved state reflects what is actually on disk/Drive now. Conflicted paths are
+    /// skipped unless <paramref name="conflictResolutions"/> carries the user's decision for them.
     /// </summary>
     public async Task<SyncResult> ApplyAsync(
         string accountId,
         SyncPlan plan,
         IProgress<SyncProgress>? progress = null,
+        IReadOnlyDictionary<string, ConflictResolution>? conflictResolutions = null,
         CancellationToken cancellationToken = default)
     {
         await driveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -62,7 +64,7 @@ public sealed class SyncEngine(
 
             var executor = new SyncExecutor(client, throttle);
             var result = await executor.ExecuteAsync(
-                plan.Pair.LocalPath, plan.RemoteRoot, plan.RemoteSnapshot, plan.Operations, progress, cancellationToken).ConfigureAwait(false);
+                plan.Pair.LocalPath, plan.RemoteRoot, plan.RemoteSnapshot, plan.Operations, progress, conflictResolutions, cancellationToken).ConfigureAwait(false);
 
             // Persist new last-known state from the now-current trees (best effort — don't fail the sync if
             // the re-capture hiccups; the next run will simply recompute).

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI;
@@ -354,6 +355,11 @@ namespace PAWS.Views
                 pull.Click += async (_, _) => await SyncDownAsync(account, pair);
                 flyout.Items.Add(pull);
 
+                var resolve = new MenuFlyoutItem { Text = "Resolve conflicts…", Icon = new FontIcon { Glyph = "" } }; // warning
+                ToolTipService.SetToolTip(resolve, "Review files that changed both here and on Proton Drive, and choose which version to keep.");
+                resolve.Click += async (_, _) => await ResolveConflictsDialogAsync(account, pair);
+                flyout.Items.Add(resolve);
+
                 var freeUp = new MenuFlyoutItem { Text = "Free up space now", Icon = new FontIcon { Glyph = "" } }; // cloud
                 ToolTipService.SetToolTip(freeUp, "Make every synced file in this folder online-only again. Pinned files and unsynced changes are left alone.");
                 freeUp.Click += async (_, _) => await FreeUpSpaceAsync(pair);
@@ -411,6 +417,209 @@ namespace PAWS.Views
                 {
                     ring.IsActive = false;
                     status.Text = $"Free up space failed: {ex.Message}";
+                }
+            };
+
+            await dialog.ShowAsync();
+        }
+
+        // ---- Conflict resolution ----------------------------------------------------------------------
+
+        /// <summary>
+        /// One row of the conflict UI: the path, why it conflicts, and a ComboBox with the applicable
+        /// choices ("Decide later" keeps it skipped). The chosen resolution is registered in
+        /// <paramref name="selections"/>; a file-vs-folder mismatch gets a disabled box (no automatic
+        /// resolution — the user must rename one side).
+        /// </summary>
+        private static FrameworkElement BuildConflictRow(SyncOperation conflict, Dictionary<string, ComboBox> selections)
+        {
+            var panel = new StackPanel { Spacing = 2, Margin = new Thickness(0, 4, 0, 4) };
+
+            var title = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            title.Children.Add(new FontIcon { Glyph = "", FontSize = 13, VerticalAlignment = VerticalAlignment.Center }); // warning
+            title.Children.Add(new TextBlock
+            {
+                Text = conflict.RelativePath,
+                FontWeight = FontWeights.SemiBold,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            panel.Children.Add(title);
+
+            if (conflict.Reason is { } reason)
+            {
+                panel.Children.Add(new TextBlock { Text = reason, FontSize = 12, Opacity = 0.7, TextWrapping = TextWrapping.Wrap });
+            }
+
+            var combo = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0, 4, 0, 0) };
+            combo.Items.Add(new ComboBoxItem { Content = "Decide later", Tag = null });
+
+            var mismatch = conflict is { Remote: not null, Local: not null }
+                && conflict.Remote.IsFolder != conflict.Local.IsFolder;
+            if (mismatch)
+            {
+                combo.IsEnabled = false;
+                panel.Children.Add(new TextBlock
+                {
+                    Text = "A file on one side and a folder on the other can't be merged automatically — rename one of them, then sync again.",
+                    FontSize = 12,
+                    Opacity = 0.7,
+                    TextWrapping = TextWrapping.Wrap,
+                });
+            }
+            else
+            {
+                combo.Items.Add(new ComboBoxItem
+                {
+                    Content = conflict.Local is null ? "Keep it deleted (remove from Proton Drive too)" : "Keep this PC's version",
+                    Tag = ConflictResolution.KeepLocal,
+                });
+                combo.Items.Add(new ComboBoxItem
+                {
+                    Content = conflict.Remote is null ? "Accept the deletion (remove from this PC)" : "Keep Proton Drive's version",
+                    Tag = ConflictResolution.KeepRemote,
+                });
+                if (conflict is { Remote: not null, Local: not null })
+                {
+                    combo.Items.Add(new ComboBoxItem { Content = "Keep both (rename this PC's copy)", Tag = ConflictResolution.KeepBoth });
+                }
+            }
+
+            combo.SelectedIndex = 0;
+            selections[conflict.RelativePath] = combo;
+            panel.Children.Add(combo);
+            return panel;
+        }
+
+        /// <summary>The non-"decide later" choices the user made across the built conflict rows.</summary>
+        private static Dictionary<string, ConflictResolution> CollectResolutions(Dictionary<string, ComboBox> selections)
+        {
+            var resolutions = new Dictionary<string, ConflictResolution>(StringComparer.Ordinal);
+            foreach (var (path, combo) in selections)
+            {
+                if ((combo.SelectedItem as ComboBoxItem)?.Tag is ConflictResolution resolution)
+                {
+                    resolutions[path] = resolution;
+                }
+            }
+
+            return resolutions;
+        }
+
+        /// <summary>
+        /// Lists an on-demand folder's conflicts (files changed both here and on Drive, or a deletion
+        /// racing an edit) and applies the user's per-file decisions. "Keep Drive's version" restores an
+        /// on-demand placeholder (no download); "keep both" renames the local copy so nothing is lost.
+        /// </summary>
+        private async Task ResolveConflictsDialogAsync(ProtonAccount account, SyncPair pair)
+        {
+            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
+            var status = new TextBlock { Text = "Checking for conflicts…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
+            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
+            header.Children.Add(ring);
+            header.Children.Add(status);
+
+            var rows = new StackPanel { Spacing = 6 };
+            var panel = new StackPanel { Spacing = 10, MinWidth = 460 };
+            panel.Children.Add(header);
+            panel.Children.Add(rows);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Resolve conflicts — {FolderDisplayName(pair.LocalPath)}",
+                Content = new ScrollViewer { Content = panel, MaxHeight = 480 },
+                CloseButtonText = "Close",
+                XamlRoot = XamlRoot,
+            };
+
+            var selections = new Dictionary<string, ComboBox>(StringComparer.Ordinal);
+
+            dialog.Opened += async (_, _) =>
+            {
+                try
+                {
+                    // First use this session: the sync root + provider must be up before we can touch
+                    // placeholders (and before resolution can recreate them).
+                    if (!App.Instance.CloudSync.IsEnabled(pair.Id))
+                    {
+                        status.Text = "Setting up files-on-demand…";
+                        await App.Instance.CloudSync.EnableAsync(account.Id, pair);
+                        status.Text = "Checking for conflicts…";
+                    }
+
+                    var conflicts = await App.Instance.CloudSync.GetConflictsAsync(account.Id, pair);
+                    ring.IsActive = false;
+
+                    if (conflicts.Count == 0)
+                    {
+                        status.Text = "No conflicts — everything can sync cleanly.";
+                        return;
+                    }
+
+                    status.Text = $"{conflicts.Count} file(s) changed both here and on Proton Drive. Choose what to keep for each, then Apply.";
+                    foreach (var conflict in conflicts)
+                    {
+                        rows.Children.Add(BuildConflictRow(conflict, selections));
+                    }
+
+                    dialog.PrimaryButtonText = "Apply";
+                    dialog.DefaultButton = ContentDialogButton.Primary;
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Could not check for conflicts: {ex.Message}\n\nIf this mentions a session or token, use Options ▸ Sign in again on the account, then retry.";
+                }
+            };
+
+            dialog.PrimaryButtonClick += async (_, e) =>
+            {
+                var resolutions = CollectResolutions(selections);
+                if (resolutions.Count == 0)
+                {
+                    return; // nothing chosen — just close
+                }
+
+                var deferral = e.GetDeferral();
+                e.Cancel = true;
+                dialog.IsPrimaryButtonEnabled = false;
+                ring.IsActive = true;
+                status.Text = $"Applying {resolutions.Count} decision(s)…";
+                SetPairStatus(pair.Id, PairState.Syncing, "Resolving conflicts…");
+
+                try
+                {
+                    var result = await App.Instance.CloudSync.ResolveConflictsAsync(account.Id, pair, resolutions);
+                    ring.IsActive = false;
+                    rows.Children.Clear();
+
+                    status.Text = result.Errors.Count == 0
+                        ? $"Resolved {result.Resolved} conflict(s)."
+                        : $"Resolved {result.Resolved} conflict(s); {result.Errors.Count} could not be applied.";
+                    foreach (var error in result.Errors)
+                    {
+                        rows.Children.Add(new TextBlock { Text = $"⚠ {error}", TextWrapping = TextWrapping.Wrap });
+                    }
+
+                    var when = DateTime.Now.ToString("t");
+                    SetPairStatus(pair.Id,
+                        result.Errors.Count > 0 ? PairState.Attention : PairState.UpToDate,
+                        result.Errors.Count > 0
+                            ? $"{result.Resolved} conflict(s) resolved, {result.Errors.Count} failed · {when}"
+                            : $"{result.Resolved} conflict(s) resolved · {when}");
+
+                    dialog.PrimaryButtonText = string.Empty; // done — only Close remains
+                }
+                catch (Exception ex)
+                {
+                    ring.IsActive = false;
+                    status.Text = $"Applying failed: {ex.Message}";
+                    SetPairStatus(pair.Id, PairState.Attention, $"Conflict resolution failed: {ex.Message}");
+                    dialog.IsPrimaryButtonEnabled = true;
+                }
+                finally
+                {
+                    deferral.Complete();
                 }
             };
 
@@ -752,9 +961,16 @@ namespace PAWS.Views
                     return;
                 }
 
+                if (result.Skipped > 0)
+                {
+                    SetPairStatus(e.PairId, PairState.Attention,
+                        $"{(result.Completed > 0 ? $"Synced {result.Completed} change(s); " : string.Empty)}{result.Skipped} conflict(s) need a decision — Manual ▸ Sync now · {when}");
+                    return;
+                }
+
                 SetPairStatus(e.PairId, PairState.UpToDate, result.Total == 0
                     ? $"Up to date · {when}"
-                    : $"Synced {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s) skipped" : string.Empty)} · {when}");
+                    : $"Synced {result.Completed} change(s) · {when}");
             });
         }
 
@@ -777,6 +993,14 @@ namespace PAWS.Views
                 {
                     // Show the actual reason (first failure); full detail + stack is in the log file.
                     SetPairStatus(e.PairId, PairState.Attention, $"{result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
+                    return;
+                }
+
+                if (result.Skipped > 0)
+                {
+                    // Conflicts ride along in the push plan (never auto-resolved) — needs the user.
+                    SetPairStatus(e.PairId, PairState.Attention,
+                        $"{(result.Completed > 0 ? $"Pushed {result.Completed} change(s); " : string.Empty)}{result.Skipped} conflict(s) need a decision — Manual ▸ Resolve conflicts · {when}");
                     return;
                 }
 
@@ -955,7 +1179,8 @@ namespace PAWS.Views
                     var when = DateTime.Now.ToString("t");
                     status.Text = result.Total == 0
                         ? "No local changes to push — already up to date."
-                        : $"Pushed {result.Completed} change(s) up.{(result.Failures.Count > 0 ? $" {result.Failures.Count} failed." : string.Empty)}";
+                        : $"Pushed {result.Completed} change(s) up.{(result.Failures.Count > 0 ? $" {result.Failures.Count} failed." : string.Empty)}"
+                          + (result.Skipped > 0 ? $" {result.Skipped} conflict(s) skipped — use Manual ▸ Resolve conflicts to settle them." : string.Empty);
 
                     foreach (var failure in result.Failures)
                     {
@@ -963,10 +1188,12 @@ namespace PAWS.Views
                     }
 
                     SetPairStatus(pair.Id,
-                        result.Failures.Count > 0 ? PairState.Attention : PairState.UpToDate,
+                        result.Failures.Count > 0 || result.Skipped > 0 ? PairState.Attention : PairState.UpToDate,
                         result.Failures.Count > 0
                             ? $"{result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}"
-                            : result.Total == 0 ? $"Up to date · {when}" : $"Pushed {result.Completed} change(s) · {when}");
+                            : result.Skipped > 0
+                                ? $"{result.Skipped} conflict(s) need a decision — Manual ▸ Resolve conflicts · {when}"
+                                : result.Total == 0 ? $"Up to date · {when}" : $"Pushed {result.Completed} change(s) · {when}");
                 }
                 catch (Exception ex)
                 {
@@ -1008,6 +1235,7 @@ namespace PAWS.Views
 
             SyncPlan? plan = null;
             var applied = false;
+            var conflictSelections = new Dictionary<string, ComboBox>(StringComparer.Ordinal);
 
             dialog.Opened += async (_, _) =>
             {
@@ -1024,10 +1252,19 @@ namespace PAWS.Views
                         return;
                     }
 
-                    status.Text = $"{plan.Operations.Count} planned operation(s). Review, then Sync — or Close to cancel.";
+                    var conflictCount = plan.Operations.Count(o => o.Kind == SyncOperationKind.Conflict);
+                    status.Text = $"{plan.Operations.Count} planned operation(s)."
+                        + (conflictCount > 0 ? $" {conflictCount} conflict(s) — pick what to keep for each (\"decide later\" leaves both sides alone)." : string.Empty)
+                        + " Review, then Sync — or Close to cancel.";
                     SetPairStatus(pair.Id, PairState.Auto, $"{plan.Operations.Count} change(s) waiting for confirmation…");
                     foreach (var op in plan.Operations)
                     {
+                        if (op.Kind == SyncOperationKind.Conflict)
+                        {
+                            results.Children.Add(BuildConflictRow(op, conflictSelections));
+                            continue;
+                        }
+
                         results.Children.Add(new TextBlock
                         {
                             Text = $"{OperationGlyph(op.Kind)}  {op.RelativePath}{(op.IsFolder ? "/" : string.Empty)}   — {op.Reason}",
@@ -1053,6 +1290,9 @@ namespace PAWS.Views
                     return;
                 }
 
+                // Collect the conflict decisions before the rows (and their ComboBoxes) are cleared.
+                var resolutions = CollectResolutions(conflictSelections);
+
                 // Keep the dialog open to show progress and the result.
                 var deferral = e.GetDeferral();
                 e.Cancel = true;
@@ -1068,7 +1308,7 @@ namespace PAWS.Views
                     var progress = new Progress<SyncProgress>(p =>
                         status.Text = $"Applying… [{p.Completed + 1}/{p.Total}] {OperationGlyph(p.Current.Kind)} {p.Current.RelativePath}");
 
-                    var result = await App.Instance.SyncEngine.ApplyAsync(account.Id, plan, progress);
+                    var result = await App.Instance.SyncEngine.ApplyAsync(account.Id, plan, progress, resolutions);
                     applied = true;
 
                     ring.IsActive = false;

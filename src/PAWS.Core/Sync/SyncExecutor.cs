@@ -7,7 +7,8 @@ namespace PAWS.Core.Sync;
 /// Applies a reconciled list of <see cref="SyncOperation"/>s against the local filesystem and Proton
 /// Drive (via <see cref="IProtonDriveClient"/>). Operations are assumed already ordered by the
 /// reconciler (creates/transfers parent-first, deletes child-first). Each operation is independent:
-/// a failure is recorded and the run continues. Conflicts are skipped (never auto-resolved).
+/// a failure is recorded and the run continues. Conflicts are skipped unless the caller supplies a
+/// <see cref="ConflictResolution"/> for their path — never auto-resolved.
 ///
 /// Safety: downloads are written to a temp file and atomically moved into place, so a failed download
 /// never leaves a half-written file. First sync (empty state) yields no deletes.
@@ -20,6 +21,7 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
         RemoteSnapshot remoteSnapshot,
         IReadOnlyList<SyncOperation> operations,
         IProgress<SyncProgress>? progress = null,
+        IReadOnlyDictionary<string, ConflictResolution>? conflictResolutions = null,
         CancellationToken cancellationToken = default)
     {
         // Relative folder path -> remote node: existing folders from the snapshot, plus ones we create
@@ -45,7 +47,39 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
 
             if (op.Kind == SyncOperationKind.Conflict)
             {
-                skipped++;
+                ConflictPlan? plan = null;
+                if (conflictResolutions is not null
+                    && conflictResolutions.TryGetValue(op.RelativePath, out var resolution))
+                {
+                    plan = PlanResolution(op, resolution);
+                }
+
+                if (plan is null)
+                {
+                    skipped++; // no decision (or unresolvable file/folder mismatch) — leave both sides alone
+                    continue;
+                }
+
+                try
+                {
+                    if (plan.RenameLocalToConflictCopy)
+                    {
+                        RenameToConflictCopy(localRoot, op.RelativePath);
+                    }
+
+                    foreach (var step in plan.Operations)
+                    {
+                        await ApplyAsync(step, localRoot, remoteFolders, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    completed++;
+                }
+                catch (Exception ex)
+                {
+                    PawsLog.Write($"Conflict resolution FAILED: \"{op.RelativePath}\"{Environment.NewLine}{ex}");
+                    failures.Add(new SyncFailure(op, Describe(ex)));
+                }
+
                 continue;
             }
 
@@ -63,6 +97,76 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
         }
 
         return new SyncResult { Completed = completed, Skipped = skipped, Failures = failures };
+    }
+
+    /// <summary>
+    /// Translates a user's <see cref="ConflictResolution"/> for one conflicted path into the concrete
+    /// steps that carry it out — pure planning, no I/O. Returns null when the conflict can't be
+    /// auto-resolved (a file on one side vs a folder on the other: rename one side manually).
+    /// <para>The deletion-flavored conflicts map naturally: "deleted locally but remote changed" +
+    /// KeepLocal keeps it deleted (trashes remote); "deleted remotely but local changed" + KeepRemote
+    /// accepts the deletion (removes local). KeepBoth renames the local file to a conflict-copy sibling
+    /// (picked up as a new file by the next sync) and gives the original name to the remote version.</para>
+    /// </summary>
+    public static ConflictPlan? PlanResolution(SyncOperation conflict, ConflictResolution resolution)
+    {
+        if (conflict.Kind != SyncOperationKind.Conflict)
+        {
+            return null;
+        }
+
+        // A file/folder type mismatch has no safe automatic resolution.
+        if (conflict is { Remote: not null, Local: not null } && conflict.Remote.IsFolder != conflict.Local.IsFolder)
+        {
+            return null;
+        }
+
+        return resolution switch
+        {
+            ConflictResolution.KeepLocal when conflict.Local is null =>
+                new ConflictPlan(false, [conflict with { Kind = SyncOperationKind.DeleteRemote, Reason = "conflict resolved: keep deleted" }]),
+            ConflictResolution.KeepLocal =>
+                new ConflictPlan(false, [conflict with { Kind = SyncOperationKind.UploadFile, Reason = "conflict resolved: keep this PC's version" }]),
+
+            ConflictResolution.KeepRemote when conflict.Remote is null =>
+                new ConflictPlan(false, [conflict with { Kind = SyncOperationKind.DeleteLocal, Reason = "conflict resolved: accept remote deletion" }]),
+            ConflictResolution.KeepRemote =>
+                new ConflictPlan(false, [conflict with { Kind = SyncOperationKind.DownloadFile, Reason = "conflict resolved: keep Drive's version" }]),
+
+            // Keep both: the local copy moves aside (uploads as its own file next sync); the remote
+            // version — when there is one — comes down under the original name.
+            ConflictResolution.KeepBoth when conflict.Remote is null =>
+                new ConflictPlan(conflict.Local is not null, []),
+            ConflictResolution.KeepBoth =>
+                new ConflictPlan(
+                    conflict.Local is not null,
+                    [conflict with { Kind = SyncOperationKind.DownloadFile, Local = null, Reason = "conflict resolved: keep both" }]),
+
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Moves the local file at <paramref name="relativePath"/> aside to "name (conflict copy
+    /// yyyy-MM-dd HH-mm).ext" (uniquified if needed) and returns the new full path. The copy is a brand
+    /// new local file, so the next sync uploads it as its own document.
+    /// </summary>
+    public static string RenameToConflictCopy(string localRoot, string relativePath)
+    {
+        var source = LocalPath(localRoot, relativePath);
+        var directory = Path.GetDirectoryName(source)!;
+        var name = Path.GetFileNameWithoutExtension(source);
+        var extension = Path.GetExtension(source);
+        var stamp = DateTime.Now.ToString("yyyy-MM-dd HH-mm");
+
+        var target = Path.Combine(directory, $"{name} (conflict copy {stamp}){extension}");
+        for (var i = 2; File.Exists(target); i++)
+        {
+            target = Path.Combine(directory, $"{name} (conflict copy {stamp}) ({i}){extension}");
+        }
+
+        File.Move(source, target);
+        return target;
     }
 
     // A concise one-line description that follows the InnerException chain — the top-level message alone

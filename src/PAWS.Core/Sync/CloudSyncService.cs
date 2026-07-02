@@ -258,9 +258,11 @@ public sealed class CloudSyncService(
             var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
             var operations = new Reconciler().Reconcile(remote, local, lastKnown);
 
-            // On-demand pushes local->remote only; new/updated remote content stays as on-demand placeholders.
+            // On-demand pushes local->remote only; new/updated remote content stays as on-demand
+            // placeholders. Conflicts ride along so the executor counts them as skipped — the UI can
+            // then tell the user there is something to resolve (Manual ▸ Resolve conflicts).
             var pushOperations = operations
-                .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote)
+                .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote or SyncOperationKind.Conflict)
                 // Hard safety guard: only trash on Drive when the item's parent folder is actually
                 // populated (fully materialized) locally, so lazy population can never be read as a delete.
                 .Where(o => o.Kind != SyncOperationKind.DeleteRemote || populated.Contains(ParentFolderOf(o.RelativePath)))
@@ -669,6 +671,198 @@ public sealed class CloudSyncService(
     /// </summary>
     public DehydrateResult FreeUpSpace(SyncPair pair, TimeSpan? notUsedFor = null)
         => placeholderEngine.DehydrateTree(pair.LocalPath, notUsedFor);
+
+    /// <summary>
+    /// Lists the paths currently in conflict for an on-demand pair (changed on both sides, or a
+    /// deletion racing an edit) — a fresh reconcile against current Drive truth, scoped to populated
+    /// folders. Nothing is changed; feed the user's decisions to <see cref="ResolveConflictsAsync"/>.
+    /// </summary>
+    public Task<IReadOnlyList<SyncOperation>> GetConflictsAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
+        => WithFreshClientAsync<IReadOnlyList<SyncOperation>>(
+            accountId,
+            async (client, ct) =>
+            {
+                var populated = GetPopulated(pair.Id);
+
+                var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+                var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, ct)
+                    ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+                var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+
+                return new Reconciler().Reconcile(remote, local, lastKnown)
+                    .Where(o => o.Kind == SyncOperationKind.Conflict)
+                    .Where(o => populated.Contains(ParentFolderOf(o.RelativePath)))
+                    .ToList();
+            },
+            cancellationToken);
+
+    /// <summary>
+    /// Applies the user's per-path conflict decisions on an on-demand pair. "Keep this PC's version"
+    /// uploads the local file (or keeps a local deletion by trashing the remote copy); "keep Drive's
+    /// version" replaces the local file with a fresh placeholder at Drive's revision — <b>no content is
+    /// downloaded</b>, it stays on-demand; "keep both" renames the local file to a conflict-copy sibling
+    /// (uploaded as its own file on the next push) and gives the original name to Drive's version.
+    /// Re-reconciles first, so a path that is no longer conflicted is simply left alone. State is merged
+    /// surgically — untouched paths keep their baseline, so unrelated pending edits stay detected.
+    /// </summary>
+    public async Task<ConflictResolveResult> ResolveConflictsAsync(
+        string accountId,
+        SyncPair pair,
+        IReadOnlyDictionary<string, ConflictResolution> resolutions,
+        CancellationToken cancellationToken = default)
+    {
+        var errors = new List<string>();
+        var resolved = 0;
+
+        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Fresh session for current Drive truth (per-session cache would hide remote-side changes).
+            await EvictClientAsync(accountId).ConfigureAwait(false);
+            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+
+            var populated = GetPopulated(pair.Id);
+
+            var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
+            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
+                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+
+            var conflicts = new Reconciler().Reconcile(remote, local, lastKnown)
+                .Where(o => o.Kind == SyncOperationKind.Conflict && resolutions.ContainsKey(o.RelativePath))
+                .Where(o => populated.Contains(ParentFolderOf(o.RelativePath)))
+                .ToList();
+
+            // Split each decision into its steps. Local steps run right here (deletes, placeholder
+            // recreations); remote-affecting steps (uploads, trash) batch through the executor below.
+            var executorOps = new List<SyncOperation>();
+            var placeholderEntries = new List<RemoteEntry>();
+            var stateOps = new List<SyncOperation>(); // consumed by MergePulledState afterwards
+
+            foreach (var conflict in conflicts)
+            {
+                var plan = SyncExecutor.PlanResolution(conflict, resolutions[conflict.RelativePath]);
+                if (plan is null)
+                {
+                    errors.Add($"{conflict.RelativePath}: can't resolve a file-vs-folder mismatch automatically — rename one side manually");
+                    continue;
+                }
+
+                try
+                {
+                    if (plan.RenameLocalToConflictCopy)
+                    {
+                        SyncExecutor.RenameToConflictCopy(pair.LocalPath, conflict.RelativePath);
+                        if (plan.Operations.Count == 0)
+                        {
+                            // Keep-both with no remote side: the rename is the whole resolution; the
+                            // original path is now gone locally, so drop its state entry.
+                            stateOps.Add(conflict with { Kind = SyncOperationKind.DeleteLocal });
+                        }
+                    }
+
+                    foreach (var step in plan.Operations)
+                    {
+                        switch (step.Kind)
+                        {
+                            case SyncOperationKind.UploadFile:
+                            case SyncOperationKind.DeleteRemote:
+                                executorOps.Add(step);
+                                break;
+
+                            case SyncOperationKind.DownloadFile:
+                                // On-demand: Drive's version comes back as a fresh placeholder at the
+                                // new revision (content downloads when opened), not a file transfer.
+                                DeleteLocalPlaceholder(pair.LocalPath, step.RelativePath, isFolder: false);
+                                placeholderEntries.Add(step.Remote!);
+                                stateOps.Add(step);
+                                break;
+
+                            case SyncOperationKind.DeleteLocal:
+                                DeleteLocalPlaceholder(pair.LocalPath, step.RelativePath, step.IsFolder);
+                                stateOps.Add(step);
+                                break;
+                        }
+                    }
+
+                    resolved++;
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"{conflict.RelativePath}: {ex.Message}");
+                }
+            }
+
+            var failedPaths = new HashSet<string>(StringComparer.Ordinal);
+            if (executorOps.Count > 0)
+            {
+                var result = await new SyncExecutor(client, throttle)
+                    .ExecuteAsync(pair.LocalPath, root, remote, executorOps, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+
+                foreach (var failure in result.Failures)
+                {
+                    errors.Add($"{failure.Operation.RelativePath}: {failure.Error}");
+                    failedPaths.Add(failure.Operation.RelativePath);
+                    resolved--;
+                }
+            }
+
+            if (placeholderEntries.Count > 0)
+            {
+                placeholderEngine.CreatePlaceholders(pair.LocalPath, new RemoteSnapshot
+                {
+                    RootPath = pair.RemotePath,
+                    CapturedUtc = DateTimeOffset.UtcNow,
+                    Entries = placeholderEntries,
+                });
+            }
+
+            // Re-capture remote so uploads get their NEW revision recorded (and their placeholders
+            // finalized as dehydratable, identity-refreshed — same as a normal push).
+            var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (newRemote is not null)
+            {
+                var remoteFiles = newRemote.Entries
+                    .Where(e => !e.IsFolder)
+                    .ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
+
+                foreach (var op in executorOps)
+                {
+                    if (failedPaths.Contains(op.RelativePath) || !remoteFiles.TryGetValue(op.RelativePath, out var entry))
+                    {
+                        // Trashed (keep-deleted) paths land here too: drop them from state.
+                        if (op.Kind == SyncOperationKind.DeleteRemote && !failedPaths.Contains(op.RelativePath))
+                        {
+                            stateOps.Add(op with { Kind = SyncOperationKind.DeleteLocal });
+                        }
+
+                        continue;
+                    }
+
+                    if (op.Kind == SyncOperationKind.UploadFile && (entry.RevisionUid ?? entry.Uid) is { } identity)
+                    {
+                        var localFile = Path.Combine(pair.LocalPath, op.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+                        placeholderEngine.FinalizeUploadedFile(localFile, identity);
+                        stateOps.Add(op with { Remote = entry }); // record the fresh revision as the baseline
+                    }
+                }
+            }
+
+            var localAfter = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
+            stateStore.Save(MergePulledState(lastKnown, pair.Id, stateOps, localAfter));
+        }
+        finally
+        {
+            _clientUseGate.Release();
+        }
+
+        return new ConflictResolveResult(resolved, errors);
+    }
 
     // Disconnects any existing provider for the pair and connects a fresh one over the given snapshot.
     // Registration is idempotent. Holds only _enableGate (NOT _clientUseGate) so disposing the old

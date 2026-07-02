@@ -41,6 +41,8 @@ return mode switch
     "--lazytest" or "lazytest" => await LazyTestAsync(localArg, remoteArg),
     "--dirtest" or "dirtest" => DirTest(localArg, remoteArg),
     "--removetest" or "removetest" => RemoveTest(localArg),
+    "--popfailtest" or "popfailtest" => PopFailTest(localArg),
+    "--conflicttest" or "conflicttest" => ConflictPlanSelfTest(),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
@@ -1019,6 +1021,154 @@ static int DirTest(string? localOverride, string? _)
     conn.Dispose();
     try { engine.UnregisterSyncRoot(localOverride); } catch { }
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE pure self-test (no Proton, no cfapi) for conflict-resolution planning: every conflict shape
+// the reconciler can emit × every ConflictResolution must map to exactly the right concrete steps —
+// including the deletion-flavored conflicts and the unresolvable file-vs-folder mismatch — plus the
+// conflict-copy rename (name shape + uniquification). `--conflicttest`.
+static int ConflictPlanSelfTest()
+{
+    var ok = true;
+    void Case(string name, bool pass)
+    {
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}");
+        ok &= pass;
+    }
+
+    var remoteFile = new RemoteEntry { RelativePath = "doc.txt", Name = "doc.txt", IsFolder = false, Size = 10, Uid = "vol~u", RevisionUid = "vol~u~r1" };
+    var localFile = new LocalEntry { RelativePath = "doc.txt", Name = "doc.txt", IsFolder = false, Size = 12, ModifiedUtc = DateTimeOffset.UtcNow };
+    var remoteFolder = new RemoteEntry { RelativePath = "doc.txt", Name = "doc.txt", IsFolder = true, Uid = "vol~d" };
+
+    SyncOperation Conflict(RemoteEntry? r, LocalEntry? l) => new()
+    {
+        Kind = SyncOperationKind.Conflict, RelativePath = "doc.txt", IsFolder = false, Remote = r, Local = l,
+    };
+
+    var bothChanged = Conflict(remoteFile, localFile);          // changed on both sides / no-history different size
+    var deletedLocally = Conflict(remoteFile, null);            // deleted locally, remote changed
+    var deletedRemotely = Conflict(null, localFile);            // deleted remotely, local changed
+    var typeMismatch = Conflict(remoteFolder, localFile);       // file vs folder
+
+    ConflictPlan? P(SyncOperation c, ConflictResolution r) => SyncExecutor.PlanResolution(c, r);
+    bool Steps(ConflictPlan? p, bool rename, params SyncOperationKind[] kinds)
+        => p is not null && p.RenameLocalToConflictCopy == rename
+           && p.Operations.Select(o => o.Kind).SequenceEqual(kinds);
+
+    Case("both-changed + KeepLocal  -> upload", Steps(P(bothChanged, ConflictResolution.KeepLocal), false, SyncOperationKind.UploadFile));
+    Case("both-changed + KeepRemote -> download", Steps(P(bothChanged, ConflictResolution.KeepRemote), false, SyncOperationKind.DownloadFile));
+    Case("both-changed + KeepBoth   -> rename + download", Steps(P(bothChanged, ConflictResolution.KeepBoth), true, SyncOperationKind.DownloadFile));
+    Case("both-changed + KeepBoth   downloads fresh (no stale Local)", P(bothChanged, ConflictResolution.KeepBoth)!.Operations[0].Local is null);
+
+    Case("deleted-locally + KeepLocal  -> trash remote", Steps(P(deletedLocally, ConflictResolution.KeepLocal), false, SyncOperationKind.DeleteRemote));
+    Case("deleted-locally + KeepRemote -> download", Steps(P(deletedLocally, ConflictResolution.KeepRemote), false, SyncOperationKind.DownloadFile));
+    Case("deleted-locally + KeepBoth   -> download only (nothing local to rename)", Steps(P(deletedLocally, ConflictResolution.KeepBoth), false, SyncOperationKind.DownloadFile));
+
+    Case("deleted-remotely + KeepLocal  -> upload", Steps(P(deletedRemotely, ConflictResolution.KeepLocal), false, SyncOperationKind.UploadFile));
+    Case("deleted-remotely + KeepRemote -> delete local", Steps(P(deletedRemotely, ConflictResolution.KeepRemote), false, SyncOperationKind.DeleteLocal));
+    Case("deleted-remotely + KeepBoth   -> rename only", Steps(P(deletedRemotely, ConflictResolution.KeepBoth), true));
+
+    Case("type mismatch is unresolvable (all three)",
+        P(typeMismatch, ConflictResolution.KeepLocal) is null
+        && P(typeMismatch, ConflictResolution.KeepRemote) is null
+        && P(typeMismatch, ConflictResolution.KeepBoth) is null);
+    Case("non-conflict op is not planned",
+        SyncExecutor.PlanResolution(bothChanged with { Kind = SyncOperationKind.UploadFile }, ConflictResolution.KeepLocal) is null);
+
+    // Conflict-copy rename: name shape + uniquification when resolved twice in the same minute.
+    var root = Path.Combine(Path.GetTempPath(), "paws-conflicttest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        File.WriteAllText(Path.Combine(root, "a.txt"), "one");
+        var first = SyncExecutor.RenameToConflictCopy(root, "a.txt");
+        File.WriteAllText(Path.Combine(root, "a.txt"), "two");
+        var second = SyncExecutor.RenameToConflictCopy(root, "a.txt");
+
+        Case("rename moves the file aside", !File.Exists(Path.Combine(root, "a.txt")) && File.Exists(first));
+        Case("copy is named \"a (conflict copy …).txt\"",
+            Path.GetFileName(first).StartsWith("a (conflict copy ", StringComparison.Ordinal) && first.EndsWith(".txt", StringComparison.Ordinal));
+        Case("second copy is uniquified, both kept",
+            File.Exists(first) && File.Exists(second) && !string.Equals(first, second, StringComparison.OrdinalIgnoreCase)
+            && File.ReadAllText(first) == "one" && File.ReadAllText(second) == "two");
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE cfapi-only repro/regression (no Proton) for the TRANSFER_PLACEHOLDERS edge paths that a normal
+// browse never hits: (1) enumerating an EMPTY remote folder (zero placeholders, success status) and
+// (2) a folder whose live listing THROWS (e.g. Drive session resume fails after a force-close
+// mid-upload) — the provider then reports the enumeration failed with an empty placeholder array.
+// A crash here reproduces the startup access violation at SendPlaceholders/CfExecute.
+// `--popfailtest <localFolder>`.
+static int PopFailTest(string? localOverride)
+{
+    if (localOverride is null)
+    {
+        Console.WriteLine("  x Usage: --popfailtest <localFolder>");
+        return 1;
+    }
+
+    var engine = new CloudFilterPlaceholderEngine();
+    Directory.CreateDirectory(localOverride);
+    engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
+
+    var now = DateTimeOffset.UtcNow;
+    engine.CreatePlaceholders(localOverride, new RemoteSnapshot
+    {
+        RootPath = "/",
+        CapturedUtc = now,
+        Entries = new List<RemoteEntry>
+        {
+            new() { RelativePath = "emptydir", Name = "emptydir", IsFolder = true, ModifiedUtc = now, Uid = "vol~empty" },
+            new() { RelativePath = "faildir", Name = "faildir", IsFolder = true, ModifiedUtc = now, Uid = "vol~fail" },
+        },
+    });
+
+    using var conn = engine.Connect(
+        localOverride,
+        (rel, _) => rel switch
+        {
+            "emptydir" => Task.FromResult<IReadOnlyList<RemoteEntry>>(new List<RemoteEntry>()),
+            "faildir" => Task.FromException<IReadOnlyList<RemoteEntry>>(new InvalidOperationException("simulated listing failure")),
+            _ => Task.FromResult<IReadOnlyList<RemoteEntry>>(new List<RemoteEntry>()),
+        },
+        (_, _, _) => Task.CompletedTask);
+
+    var ok = true;
+
+    Console.WriteLine("  browsing emptydir (zero children, success)...");
+    var (emptyOk, emptyNames) = EnumerateInSeparateProcess(Path.Combine(localOverride, "emptydir"));
+    Console.WriteLine($"    -> ok={emptyOk} [{string.Join(",", emptyNames)}]");
+    ok &= emptyOk && emptyNames.Count == 0;
+
+    Console.WriteLine("  browsing faildir (listing throws -> enumeration reported failed)...");
+    var (failOk, failNames) = EnumerateInSeparateProcess(Path.Combine(localOverride, "faildir"));
+    Console.WriteLine($"    -> ok={failOk} [{string.Join(",", failNames)}] (a FAILED dir here is acceptable; a process crash is the bug)");
+
+    // Browse faildir again — population must still be enabled (the failure path must not have latched
+    // DISABLE_ON_DEMAND_POPULATION), and the provider must still be alive to answer.
+    Console.WriteLine("  browsing faildir again (retry must still reach the provider)...");
+    var (retryOk, retryNames) = EnumerateInSeparateProcess(Path.Combine(localOverride, "faildir"));
+    Console.WriteLine($"    -> ok={retryOk} [{string.Join(",", retryNames)}]");
+
+    conn.Dispose();
+    try
+    {
+        engine.UnregisterSyncRoot(localOverride);
+    }
+    catch
+    {
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")} (and we did not crash)");
     return ok ? 0 : 1;
 }
 
