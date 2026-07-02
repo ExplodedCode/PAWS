@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Windows.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -22,6 +23,16 @@ namespace PAWS
             ExtendsContentIntoTitleBar = true;
             SetTitleBar(AppTitleBar);
 
+            // Cap the window width: the content column maxes out at ~920 DIPs, so anything wider is just
+            // empty space on both sides. Presenter sizes are physical pixels — scale by the monitor DPI.
+            if (AppWindow.Presenter is OverlappedPresenter presenter)
+            {
+                var scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+                presenter.PreferredMaximumWidth = (int)(1000 * scale);
+                presenter.PreferredMinimumWidth = (int)(640 * scale);
+                presenter.PreferredMinimumHeight = (int)(420 * scale);
+            }
+
             AppWindow.Closing += OnClosing;
             TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
 
@@ -38,6 +49,8 @@ namespace PAWS
         public void NavigateToHome() => RootFrame.Navigate(typeof(HomePage));
 
         public void NavigateToSetup() => RootFrame.Navigate(typeof(SetupPage));
+
+        public void NavigateToSettings() => RootFrame.Navigate(typeof(SettingsPage));
 
         public void ShowFromTray()
         {
@@ -65,6 +78,9 @@ namespace PAWS
             e.Cancel = true;
             sender.Hide();
         }
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr hwnd);
     }
 
     /// <summary>Minimal ICommand used for the tray icon's left-click action.</summary>

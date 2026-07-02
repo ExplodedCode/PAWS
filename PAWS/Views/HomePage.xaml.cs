@@ -97,6 +97,9 @@ namespace PAWS.Views
         private void OnAddAccountClicked(object sender, RoutedEventArgs e)
             => App.Instance.Window?.NavigateToSetup();
 
+        private void OnSettingsClicked(object sender, RoutedEventArgs e)
+            => App.Instance.Window?.NavigateToSettings();
+
         private Expander BuildAccountCard(ProtonAccount account)
         {
             var title = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };

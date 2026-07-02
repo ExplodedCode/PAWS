@@ -9,13 +9,17 @@
 
     <ScrollViewer>
         <StackPanel Padding="40,32,40,24" Spacing="16" MaxWidth="840" HorizontalAlignment="Center">
-            <Grid>
+            <Grid ColumnSpacing="8">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock Text="Folders" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
                 <Button Grid.Column="1" Content="Add account" Click="OnAddAccountClicked" Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />
+                <Button Grid.Column="2" Click="OnSettingsClicked" VerticalAlignment="Center" ToolTipService.ToolTip="Settings">
+                    <FontIcon Glyph="&#xE713;" FontSize="14" />
+                </Button>
             </Grid>
 
             <StackPanel x:Name="AccountsPanel" Spacing="12" />
