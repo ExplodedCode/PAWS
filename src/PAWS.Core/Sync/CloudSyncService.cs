@@ -245,80 +245,104 @@ public sealed class CloudSyncService(
     public async Task<SyncResult> SyncChangesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
         var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+        var populated = GetPopulated(pair.Id);
 
-        // Hold the client gate for the entire operation: capture, upload, and re-capture all use the
-        // shared client's native crypto (not concurrency-safe), and this serializes a push against
-        // hydration, against other pairs on the same account, and against overlapping auto-sync runs.
+        // Local reads are plain filesystem — no SDK/crypto involved, so they never need the gate.
+        // Scope the walk to populated folders: un-browsed folders aren't materialized, so walking them
+        // would (a) trigger on-demand population and (b) make the reconciler see their remote contents
+        // as "deleted locally". Their contents are therefore never in this snapshot.
+        var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
+            ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+
+        RemoteNode root = null!;
+        RemoteSnapshot remote = null!;
+        await GateAsync(async ct =>
+        {
+            root = await client.ResolvePathAsync(pair.RemotePath, ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
+            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
+        }, cancellationToken).ConfigureAwait(false);
+
+        var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+        var operations = new Reconciler().Reconcile(remote, local, lastKnown);
+
+        // On-demand pushes local->remote only; new/updated remote content stays as on-demand
+        // placeholders. Conflicts ride along so the executor counts them as skipped — the UI can
+        // then tell the user there is something to resolve (Manual ▸ Resolve conflicts).
+        var pushOperations = operations
+            .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote or SyncOperationKind.Conflict)
+            // Hard safety guard: only trash on Drive when the item's parent folder is actually
+            // populated (fully materialized) locally, so lazy population can never be read as a delete.
+            .Where(o => o.Kind != SyncOperationKind.DeleteRemote || populated.Contains(ParentFolderOf(o.RelativePath)))
+            .ToList();
+
+        // Gated PER OPERATION (see SyncExecutor's remarks on `gate`) rather than one lock held for the
+        // whole batch: a large/slow push (many files, or one big one under a low speed limit) must not
+        // starve pending Explorer-triggered hydration/browse callbacks for its entire duration — that is
+        // what previously froze Explorer and produced "the cloud operation was not completed before the
+        // time-out period expired". Releasing the lock between files lets those requests through.
+        var result = await new SyncExecutor(client, throttle)
+            .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, gate: GateAsync, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+
+        // Re-capture and persist state so the next run starts from a clean baseline. Local is again
+        // scoped to populated folders, which keeps the saved state "materialized-only" — the property
+        // that makes un-browsed remote content read as new (ignored by push), never as a deletion.
+        RemoteSnapshot? newRemote = null;
+        await GateAsync(async ct =>
+        {
+            newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
+
+        var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
+        if (newRemote is not null && newLocal is not null)
+        {
+            stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
+        }
+
+        // Turn each successfully-uploaded file into a dehydratable, in-sync placeholder carrying its NEW
+        // revision id: brand-new local files convert in place; edited placeholders get their identity
+        // refreshed (else a later dehydrate + open would download the old revision). Pure cfapi/local
+        // filesystem work — no SDK call, so it never needs the gate.
+        if (newRemote is not null)
+        {
+            var failedPaths = result.Failures
+                .Select(f => f.Operation.RelativePath)
+                .ToHashSet(StringComparer.Ordinal);
+            var remoteFiles = newRemote.Entries
+                .Where(e => !e.IsFolder)
+                .ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
+
+            foreach (var op in pushOperations)
+            {
+                if (op.Kind != SyncOperationKind.UploadFile || failedPaths.Contains(op.RelativePath))
+                {
+                    continue;
+                }
+
+                if (remoteFiles.TryGetValue(op.RelativePath, out var entry) && (entry.RevisionUid ?? entry.Uid) is { } identity)
+                {
+                    var localFile = Path.Combine(pair.LocalPath, op.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+                    placeholderEngine.FinalizeUploadedFile(localFile, identity);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Acquires the shared crypto/SDK gate for exactly the duration of one inner action — used both
+    // directly (for a single capture/resolve) and as the `gate` handed to SyncExecutor (for each
+    // individual upload/download/create/trash) — rather than one lock held across an entire multi-step
+    // push/pull/resolve. See SyncExecutor's remarks for why: a continuously-held lock lets a large batch
+    // starve Explorer's own cloud-file callbacks (60s fixed timeout each) for its whole duration.
+    private async Task GateAsync(Func<CancellationToken, Task> action, CancellationToken cancellationToken)
+    {
         await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var populated = GetPopulated(pair.Id);
-
-            var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
-            // Scope the local walk to populated folders: un-browsed folders aren't materialized, so walking
-            // them would (a) trigger on-demand population and (b) make the reconciler see their remote
-            // contents as "deleted locally". Their contents are therefore never in this snapshot.
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
-                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
-
-            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
-            var operations = new Reconciler().Reconcile(remote, local, lastKnown);
-
-            // On-demand pushes local->remote only; new/updated remote content stays as on-demand
-            // placeholders. Conflicts ride along so the executor counts them as skipped — the UI can
-            // then tell the user there is something to resolve (Manual ▸ Resolve conflicts).
-            var pushOperations = operations
-                .Where(o => o.Kind is SyncOperationKind.UploadFile or SyncOperationKind.CreateRemoteFolder or SyncOperationKind.DeleteRemote or SyncOperationKind.Conflict)
-                // Hard safety guard: only trash on Drive when the item's parent folder is actually
-                // populated (fully materialized) locally, so lazy population can never be read as a delete.
-                .Where(o => o.Kind != SyncOperationKind.DeleteRemote || populated.Contains(ParentFolderOf(o.RelativePath)))
-                .ToList();
-
-            var result = await new SyncExecutor(client, throttle)
-                .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
-
-            // Re-capture and persist state so the next run starts from a clean baseline. Local is again
-            // scoped to populated folders, which keeps the saved state "materialized-only" — the property
-            // that makes un-browsed remote content read as new (ignored by push), never as a deletion.
-            var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
-            var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
-            if (newRemote is not null && newLocal is not null)
-            {
-                stateStore.Save(SyncStateBuilder.Build(pair.Id, newRemote, newLocal));
-            }
-
-            // Turn each successfully-uploaded file into a dehydratable, in-sync placeholder carrying its
-            // NEW revision id: brand-new local files convert in place; edited placeholders get their
-            // identity refreshed (else a later dehydrate + open would download the old revision).
-            if (newRemote is not null)
-            {
-                var failedPaths = result.Failures
-                    .Select(f => f.Operation.RelativePath)
-                    .ToHashSet(StringComparer.Ordinal);
-                var remoteFiles = newRemote.Entries
-                    .Where(e => !e.IsFolder)
-                    .ToDictionary(e => e.RelativePath, StringComparer.Ordinal);
-
-                foreach (var op in pushOperations)
-                {
-                    if (op.Kind != SyncOperationKind.UploadFile || failedPaths.Contains(op.RelativePath))
-                    {
-                        continue;
-                    }
-
-                    if (remoteFiles.TryGetValue(op.RelativePath, out var entry) && (entry.RevisionUid ?? entry.Uid) is { } identity)
-                    {
-                        var localFile = Path.Combine(pair.LocalPath, op.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-                        placeholderEngine.FinalizeUploadedFile(localFile, identity);
-                    }
-                }
-            }
-
-            return result;
+            await action(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -730,24 +754,28 @@ public sealed class CloudSyncService(
     {
         var errors = new List<string>();
         var resolved = 0;
+        var populated = GetPopulated(pair.Id);
 
-        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        IProtonDriveClient client = null!;
+        RemoteNode root = null!;
+        RemoteSnapshot remote = null!;
+        await GateAsync(async ct =>
         {
             // Fresh session for current Drive truth (per-session cache would hide remote-side changes).
             await EvictClientAsync(accountId).ConfigureAwait(false);
-            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+            client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
 
-            var populated = GetPopulated(pair.Id);
-
-            var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
+            root = await client.ResolvePathAsync(pair.RemotePath, ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
-                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
-            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+        }, cancellationToken).ConfigureAwait(false);
 
+        var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
+            ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+        var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+
+        {
             var conflicts = new Reconciler().Reconcile(remote, local, lastKnown)
                 .Where(o => o.Kind == SyncOperationKind.Conflict && resolutions.ContainsKey(o.RelativePath))
                 .Where(o => populated.Contains(ParentFolderOf(o.RelativePath)))
@@ -816,8 +844,11 @@ public sealed class CloudSyncService(
             var failedPaths = new HashSet<string>(StringComparer.Ordinal);
             if (executorOps.Count > 0)
             {
+                // Gated per operation (see SyncExecutor's remarks) rather than one lock held across the
+                // whole batch — a conflict resolution can include a large upload, which must not starve
+                // pending Explorer callbacks any more than an ordinary push would.
                 var result = await new SyncExecutor(client, throttle)
-                    .ExecuteAsync(pair.LocalPath, root, remote, executorOps, cancellationToken: cancellationToken)
+                    .ExecuteAsync(pair.LocalPath, root, remote, executorOps, gate: GateAsync, cancellationToken: cancellationToken)
                     .ConfigureAwait(false);
 
                 foreach (var failure in result.Failures)
@@ -840,7 +871,12 @@ public sealed class CloudSyncService(
 
             // Re-capture remote so uploads get their NEW revision recorded (and their placeholders
             // finalized as dehydratable, identity-refreshed — same as a normal push).
-            var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
+            RemoteSnapshot? newRemote = null;
+            await GateAsync(async ct =>
+            {
+                newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+
             if (newRemote is not null)
             {
                 var remoteFiles = newRemote.Entries
@@ -871,10 +907,6 @@ public sealed class CloudSyncService(
 
             var localAfter = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
             stateStore.Save(MergePulledState(lastKnown, pair.Id, stateOps, localAfter));
-        }
-        finally
-        {
-            _clientUseGate.Release();
         }
 
         return new ConflictResolveResult(resolved, errors);

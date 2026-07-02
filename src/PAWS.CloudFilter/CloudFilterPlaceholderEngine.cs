@@ -667,6 +667,11 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 return;
             }
 
+            // Keeps this request alive across whatever we're about to wait on (see ProviderHeartbeat) —
+            // listing a folder means calling into the shared Drive client, which can be busy for a long
+            // time behind an unrelated push.
+            using var heartbeat = new ProviderHeartbeat(operation);
+
             // The network listing runs outside the gate so it doesn't block hydration; a listing failure
             // reports the enumeration as failed (and leaves on-demand population ON) so a re-browse retries
             // rather than caching an empty folder.
@@ -754,6 +759,11 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             {
                 return;
             }
+
+            // Keeps this request alive across whatever we're about to wait on (see ProviderHeartbeat) —
+            // downloading a file means calling into the shared Drive client, which can be busy for a
+            // long time behind an unrelated push, before a single byte of this fetch has moved.
+            using var heartbeat = new ProviderHeartbeat(operation);
 
             try
             {
@@ -978,6 +988,67 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             };
             operation.StructSize = (uint)Marshal.SizeOf(operation);
             return operation;
+        }
+
+        /// <summary>
+        /// Keeps a pending Cloud Filter callback alive across a long wait. The platform gives every
+        /// FETCH_DATA/FETCH_PLACEHOLDERS request a FIXED 60-SECOND timeout, and a valid operation on any
+        /// pending request resets the timer for ALL of them — but that only happens automatically once
+        /// something is actively moving bytes through <c>CfExecute</c>. Our two callbacks both start by
+        /// calling into the shared Drive client (<see cref="_fetchData"/> / <see cref="_fetchChildren"/>),
+        /// which serializes against the app's crypto gate — so a busy push can leave a brand-new request
+        /// waiting, with ZERO progress reported, for as long as that push takes. Past 60s with nothing
+        /// running, Explorer shows "Location is not available ... the cloud operation was not completed
+        /// before the time-out period expired" and the whole window locks up (reported after a large
+        /// local push: Explorer froze, then that exact error appeared for bigger files).
+        /// <para>This pings <c>CfReportProviderProgress</c> on the SAME connection/transfer key every 20s
+        /// (well under the 60s limit) starting the instant the callback fires — before we've even tried
+        /// to acquire any lock — so the platform sees the operation as alive no matter how long the wait
+        /// turns out to be. The reported percentage creeps upward but never reaches 100% until the real
+        /// operation's own <c>CfExecute</c> call finishes it, so Explorer shows a visible (if
+        /// approximate) "still working" indicator instead of a dead freeze.</para>
+        /// </summary>
+        private sealed class ProviderHeartbeat : IDisposable
+        {
+            private const int HeartbeatSeconds = 20;
+
+            private readonly CF_CONNECTION_KEY _connectionKey;
+            private readonly CF_TRANSFER_KEY _transferKey;
+            private readonly Timer _timer;
+            private long _ticks;
+            private volatile bool _stopped;
+
+            public ProviderHeartbeat(CF_OPERATION_INFO operation)
+            {
+                _connectionKey = operation.ConnectionKey;
+                _transferKey = operation.TransferKey;
+                _timer = new Timer(_ => Beat(), null, TimeSpan.FromSeconds(HeartbeatSeconds), TimeSpan.FromSeconds(HeartbeatSeconds));
+            }
+
+            private void Beat()
+            {
+                if (_stopped)
+                {
+                    return;
+                }
+
+                var completed = Math.Min(Interlocked.Increment(ref _ticks) * 10, 90);
+                try
+                {
+                    CfReportProviderProgress(_connectionKey, _transferKey, 100, completed);
+                }
+                catch
+                {
+                    // Best-effort — a failed ping just means this tick didn't refresh the platform's timer;
+                    // the next one (or the real operation's own CfExecute) still can.
+                }
+            }
+
+            public void Dispose()
+            {
+                _stopped = true;
+                _timer.Dispose();
+            }
         }
 
         private string ToRelativeFolder(string normalizedPath)

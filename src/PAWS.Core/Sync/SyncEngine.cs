@@ -57,20 +57,35 @@ public sealed class SyncEngine(
         IReadOnlyDictionary<string, ConflictResolution>? conflictResolutions = null,
         CancellationToken cancellationToken = default)
     {
-        await driveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        IProtonDriveClient client = null!;
+        await GateAsync(async ct => client = await clientFactory.CreateAsync(accountId, ct).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
+
         try
         {
-            await using var client = await clientFactory.CreateAsync(accountId, cancellationToken).ConfigureAwait(false);
-
             var executor = new SyncExecutor(client, throttle);
+
+            // Gated PER OPERATION (see SyncExecutor's remarks on `gate`) rather than one lock held across
+            // the whole apply: a large/slow sync (many files, or one big one under a low speed limit)
+            // must not starve pending Explorer-triggered hydration/browse callbacks on any on-demand pair
+            // sharing this same drive gate for its entire duration — that starvation is what previously
+            // froze Explorer and produced "the cloud operation was not completed before the time-out
+            // period expired". Releasing the lock between files lets those requests through.
             var result = await executor.ExecuteAsync(
-                plan.Pair.LocalPath, plan.RemoteRoot, plan.RemoteSnapshot, plan.Operations, progress, conflictResolutions, cancellationToken).ConfigureAwait(false);
+                plan.Pair.LocalPath, plan.RemoteRoot, plan.RemoteSnapshot, plan.Operations,
+                progress: progress, conflictResolutions: conflictResolutions, gate: GateAsync, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
 
             // Persist new last-known state from the now-current trees (best effort — don't fail the sync if
             // the re-capture hiccups; the next run will simply recompute).
             try
             {
-                var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(plan.Pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false);
+                RemoteSnapshot? remote = null;
+                await GateAsync(async ct =>
+                {
+                    remote = await new RemoteSnapshotBuilder(client).CaptureAsync(plan.Pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
+                }, cancellationToken).ConfigureAwait(false);
+
                 var local = new LocalSnapshotBuilder().Capture(plan.Pair.LocalPath, null, cancellationToken);
                 if (remote is not null && local is not null)
                 {
@@ -87,6 +102,23 @@ public sealed class SyncEngine(
             }
 
             return result;
+        }
+        finally
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    // Acquires the shared crypto/SDK gate for exactly the duration of one inner action — used both
+    // directly (client creation, the final re-capture) and as the `gate` handed to SyncExecutor (for
+    // each individual upload/download/create/trash) — rather than one lock held across the whole apply.
+    // See SyncExecutor's remarks for why a continuously-held lock is a problem.
+    private async Task GateAsync(Func<CancellationToken, Task> action, CancellationToken cancellationToken)
+    {
+        await driveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await action(cancellationToken).ConfigureAwait(false);
         }
         finally
         {

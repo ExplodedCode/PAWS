@@ -4,6 +4,13 @@ using PAWS.Core.Drive;
 namespace PAWS.Core.Sync;
 
 /// <summary>
+/// Runs <paramref name="action"/> "gated" — e.g. holding a shared semaphore for just that action's
+/// duration — rather than the caller holding one lock across an entire multi-step operation. See
+/// <see cref="SyncExecutor.ExecuteAsync"/> for why this matters.
+/// </summary>
+public delegate Task SyncGate(Func<CancellationToken, Task> action, CancellationToken cancellationToken);
+
+/// <summary>
 /// Applies a reconciled list of <see cref="SyncOperation"/>s against the local filesystem and Proton
 /// Drive (via <see cref="IProtonDriveClient"/>). Operations are assumed already ordered by the
 /// reconciler (creates/transfers parent-first, deletes child-first). Each operation is independent:
@@ -12,6 +19,15 @@ namespace PAWS.Core.Sync;
 ///
 /// Safety: downloads are written to a temp file and atomically moved into place, so a failed download
 /// never leaves a half-written file. First sync (empty state) yields no deletes.
+///
+/// <para><paramref name="gate"/> (via <see cref="ExecuteAsync"/>): the caller's Drive client shares a
+/// process-wide lock with on-demand hydration (the native crypto is not concurrency-safe — see
+/// <c>CloudSyncService</c>'s remarks). If the caller held that lock for this WHOLE call, a batch of many
+/// files — or one big/throttled one — would starve any Explorer-triggered hydration/browse request for
+/// its entire duration; Cloud Filter gives those requests a fixed 60s timeout, so a long enough push
+/// makes Explorer show "the cloud operation was not completed before the time-out period expired" and
+/// the folder locks up. Passing <paramref name="gate"/> lets the caller instead acquire/release its lock
+/// around each individual operation, freeing it between files so a pending request can get its turn.</para>
 /// </summary>
 public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? throttle = null)
 {
@@ -22,6 +38,7 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
         IReadOnlyList<SyncOperation> operations,
         IProgress<SyncProgress>? progress = null,
         IReadOnlyDictionary<string, ConflictResolution>? conflictResolutions = null,
+        SyncGate? gate = null,
         CancellationToken cancellationToken = default)
     {
         // Relative folder path -> remote node: existing folders from the snapshot, plus ones we create
@@ -69,7 +86,7 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
 
                     foreach (var step in plan.Operations)
                     {
-                        await ApplyAsync(step, localRoot, remoteFolders, cancellationToken).ConfigureAwait(false);
+                        await Gated(step, localRoot, remoteFolders, gate, cancellationToken).ConfigureAwait(false);
                     }
 
                     completed++;
@@ -85,7 +102,7 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
 
             try
             {
-                await ApplyAsync(op, localRoot, remoteFolders, cancellationToken).ConfigureAwait(false);
+                await Gated(op, localRoot, remoteFolders, gate, cancellationToken).ConfigureAwait(false);
                 completed++;
             }
             catch (Exception ex)
@@ -98,6 +115,14 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
 
         return new SyncResult { Completed = completed, Skipped = skipped, Failures = failures };
     }
+
+    // Applies one operation, optionally serialized through the caller's gate instead of a lock the
+    // caller holds for the whole batch — see the class remarks on <paramref name="gate"/>.
+    private Task Gated(
+        SyncOperation op, string localRoot, Dictionary<string, RemoteNode> remoteFolders, SyncGate? gate, CancellationToken cancellationToken)
+        => gate is null
+            ? ApplyAsync(op, localRoot, remoteFolders, cancellationToken)
+            : gate(ct => ApplyAsync(op, localRoot, remoteFolders, ct), cancellationToken);
 
     /// <summary>
     /// Translates a user's <see cref="ConflictResolution"/> for one conflicted path into the concrete
