@@ -8,31 +8,23 @@
     mc:Ignorable="d">
 
     <ScrollViewer>
-        <StackPanel Padding="40" Spacing="16" MaxWidth="760" HorizontalAlignment="Center">
+        <StackPanel Padding="40,32,40,24" Spacing="16" MaxWidth="840" HorizontalAlignment="Center">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <TextBlock Text="Accounts &amp; folders" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
+                <TextBlock Text="Folders" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
                 <Button Grid.Column="1" Content="Add account" Click="OnAddAccountClicked" Style="{StaticResource AccentButtonStyle}" VerticalAlignment="Center" />
             </Grid>
 
-            <InfoBar
-                IsOpen="True"
-                IsClosable="False"
-                Severity="Success"
-                Title="Running in the background"
-                Message="Closing this window keeps PAWS running. Use the tray icon in the notification area to reopen or quit." />
-
             <StackPanel x:Name="AccountsPanel" Spacing="12" />
 
-            <InfoBar
-                IsOpen="True"
-                IsClosable="False"
-                Severity="Informational"
-                Title="Preview build"
-                Message="Sign-in and Proton Drive access are live. On-demand folders show as placeholders and download on open (&quot;Sync up&quot;/&quot;Sync down&quot; to push/pull manually); full-sync folders mirror both ways (&quot;Sync now&quot;). Turn on &quot;Auto&quot; on any folder to sync it automatically in the background. Manual syncs still let you review changes first." />
+            <TextBlock
+                FontSize="12"
+                Opacity="0.6"
+                TextWrapping="Wrap"
+                Text="PAWS keeps syncing in the background when you close this window — reopen it any time from the tray icon." />
         </StackPanel>
     </ScrollViewer>
 </Page>

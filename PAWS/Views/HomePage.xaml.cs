@@ -4,11 +4,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.UI;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Media;
 using PAWS.Core.Configuration;
 using PAWS.Core.Sync;
 using Windows.Storage.Pickers;
@@ -17,14 +18,35 @@ using WinRT.Interop;
 namespace PAWS.Views
 {
     /// <summary>
-    /// Manages the configured Proton accounts and their folder mappings. Supports multiple accounts
-    /// (including the same email more than once) and multiple folders per account.
+    /// Manages the configured Proton accounts and their folder mappings. Each folder is a card with a
+    /// clear sync status (animated while syncing, ✓ up to date, ⚠ needs attention), a play/pause button
+    /// for automatic sync, Open, and a "Manual" menu for on-demand sync actions. Account-level actions
+    /// (add folder, sign in again, remove) live in an "Options" menu on the account header.
     /// </summary>
     public sealed partial class HomePage : Page
     {
-        // Per-pair status line for auto-sync, rebuilt on each Refresh and updated from the (background)
-        // CloudSync auto-sync events, marshalled back to the UI thread.
-        private readonly Dictionary<string, TextBlock> _pairStatus = new(StringComparer.Ordinal);
+        private const string PlayGlyph = "";
+        private const string PauseGlyph = "";
+
+        private enum PairState
+        {
+            Auto,      // automatic sync on, idle — watching for changes
+            Paused,    // automatic sync off
+            Syncing,   // a sync is running right now (animated)
+            UpToDate,  // last sync finished clean
+            Attention, // last sync had an error / held deletions
+        }
+
+        private sealed class PairStatusUi
+        {
+            public required ProgressRing Ring { get; init; }
+            public required FontIcon Icon { get; init; }
+            public required TextBlock Text { get; init; }
+        }
+
+        // Per-pair status UI, rebuilt on each Refresh and updated from the (background) sync events,
+        // marshalled back to the UI thread.
+        private readonly Dictionary<string, PairStatusUi> _pairStatus = new(StringComparer.Ordinal);
 
         public HomePage()
         {
@@ -77,46 +99,55 @@ namespace PAWS.Views
 
         private Expander BuildAccountCard(ProtonAccount account)
         {
-            var title = new TextBlock
+            var title = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
+            title.Children.Add(new FontIcon { Glyph = "", FontSize = 14, Opacity = 0.8, VerticalAlignment = VerticalAlignment.Center }); // person
+            title.Children.Add(new TextBlock
             {
                 Text = account.Label,
                 VerticalAlignment = VerticalAlignment.Center,
                 FontWeight = FontWeights.SemiBold,
-            };
+            });
 
-            var reSignIn = new Button { Content = "Sign in again" };
-            reSignIn.Click += async (_, _) => await ReSignInAsync(account);
+            var addFolder = new MenuFlyoutItem { Text = "Add folder…", Icon = new FontIcon { Glyph = "" } };
+            addFolder.Click += async (_, _) => await AddFolderAsync(account);
 
-            var removeAccount = new Button { Content = "Remove account", Margin = new Thickness(8, 0, 0, 0) };
+            var signIn = new MenuFlyoutItem { Text = "Sign in again", Icon = new FontIcon { Glyph = "" } };
+            signIn.Click += async (_, _) => await ReSignInAsync(account);
+
+            var removeAccount = new MenuFlyoutItem { Text = "Remove account…", Icon = new FontIcon { Glyph = "" } };
             removeAccount.Click += async (_, _) => await RemoveAccountAsync(account);
 
-            var headerButtons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            headerButtons.Children.Add(reSignIn);
-            headerButtons.Children.Add(removeAccount);
+            var optionsFlyout = new MenuFlyout();
+            optionsFlyout.Items.Add(addFolder);
+            optionsFlyout.Items.Add(signIn);
+            optionsFlyout.Items.Add(new MenuFlyoutSeparator());
+            optionsFlyout.Items.Add(removeAccount);
+
+            var options = new DropDownButton { Content = "Options", Flyout = optionsFlyout, VerticalAlignment = VerticalAlignment.Center };
 
             var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             header.Children.Add(title);
-            Grid.SetColumn(headerButtons, 1);
-            header.Children.Add(headerButtons);
+            Grid.SetColumn(options, 1);
+            header.Children.Add(options);
 
-            var content = new StackPanel { Spacing = 6 };
+            var content = new StackPanel { Spacing = 8 };
             if (account.SyncPairs.Count == 0)
             {
-                content.Children.Add(new TextBlock { Text = "No folders yet.", Opacity = 0.7 });
+                content.Children.Add(new TextBlock
+                {
+                    Text = "No folders yet — use Options ▸ Add folder to start syncing one.",
+                    Opacity = 0.7,
+                });
             }
             else
             {
                 foreach (var pair in account.SyncPairs)
                 {
-                    content.Children.Add(BuildPairRow(account, pair));
+                    content.Children.Add(BuildFolderCard(account, pair));
                 }
             }
-
-            var addFolder = new Button { Content = "Add folder", Margin = new Thickness(0, 8, 0, 0) };
-            addFolder.Click += async (_, _) => await AddFolderAsync(account);
-            content.Children.Add(addFolder);
 
             return new Expander
             {
@@ -128,40 +159,73 @@ namespace PAWS.Views
             };
         }
 
-        private FrameworkElement BuildPairRow(ProtonAccount account, SyncPair pair)
+        private FrameworkElement BuildFolderCard(ProtonAccount account, SyncPair pair)
         {
-            var row = new Grid();
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            row.Children.Add(new TextBlock
+            // --- Left: name + mode, paths, status ---------------------------------------------------
+            var nameRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            nameRow.Children.Add(new FontIcon { Glyph = "", FontSize = 16, VerticalAlignment = VerticalAlignment.Center }); // folder
+            nameRow.Children.Add(new TextBlock
             {
-                Text = $"{pair.LocalPath}    ⇄    {pair.RemotePath}     [{pair.Mode}]",
+                Text = FolderDisplayName(pair.LocalPath),
+                FontWeight = FontWeights.SemiBold,
                 VerticalAlignment = VerticalAlignment.Center,
-                TextWrapping = TextWrapping.Wrap,
             });
+            nameRow.Children.Add(BuildModePill(pair.Mode));
 
-            var browse = new Button { Content = "Browse" };
-            browse.Click += async (_, _) => await BrowseRemoteAsync(account, pair);
-
-            var snapshot = new Button { Content = "Snapshot", Margin = new Thickness(8, 0, 0, 0) };
-            snapshot.Click += async (_, _) => await ShowSnapshotAsync(account, pair);
-
-            var accent = (Style)Application.Current.Resources["AccentButtonStyle"];
-            var action = new Button { Margin = new Thickness(8, 0, 0, 0), Style = accent };
-            if (pair.Mode == SyncMode.OnDemand)
+            var paths = new TextBlock
             {
-                // Always available — the handler sets up on-demand on first use, then pushes local changes.
-                action.Content = "Sync up";
-                action.Click += async (_, _) => await SyncUpAsync(account, pair);
-            }
-            else
+                Text = $"{pair.LocalPath}  ⇄  {pair.RemotePath}",
+                FontSize = 12,
+                Opacity = 0.6,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Margin = new Thickness(0, 2, 0, 0),
+            };
+            ToolTipService.SetToolTip(paths, $"Local: {pair.LocalPath}\nProton Drive: {pair.RemotePath}");
+
+            var ring = new ProgressRing { Width = 14, Height = 14, IsActive = false, Visibility = Visibility.Collapsed };
+            var icon = new FontIcon { FontSize = 12, Glyph = PauseGlyph, Opacity = 0.6 };
+            var indicator = new Grid { Width = 16, Height = 16, VerticalAlignment = VerticalAlignment.Center };
+            indicator.Children.Add(ring);
+            indicator.Children.Add(icon);
+
+            var statusText = new TextBlock
             {
-                action.Content = "Sync now";
-                action.Click += async (_, _) => await SyncNowAsync(account, pair);
+                FontSize = 12,
+                Opacity = 0.75,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+
+            var statusRow = new Grid { ColumnSpacing = 6, Margin = new Thickness(0, 6, 0, 0) };
+            statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            statusRow.Children.Add(indicator);
+            Grid.SetColumn(statusText, 1);
+            statusRow.Children.Add(statusText);
+
+            var info = new StackPanel();
+            info.Children.Add(nameRow);
+            info.Children.Add(paths);
+            info.Children.Add(statusRow);
+
+            _pairStatus[pair.Id] = new PairStatusUi { Ring = ring, Icon = icon, Text = statusText };
+
+            // --- Right: play/pause · Open · Manual ▾ ------------------------------------------------
+            var actions = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(16, 0, 0, 0),
+            };
+
+            if (pair.Mode is SyncMode.OnDemand or SyncMode.FullSync)
+            {
+                actions.Children.Add(BuildPlayPauseButton(account, pair));
             }
 
-            var open = new Button { Content = "Open", Margin = new Thickness(8, 0, 0, 0) };
+            var open = new Button { Content = "Open" };
+            ToolTipService.SetToolTip(open, "Open this folder in File Explorer.");
             open.Click += (_, _) =>
             {
                 if (Directory.Exists(pair.LocalPath))
@@ -169,73 +233,223 @@ namespace PAWS.Views
                     Process.Start(new ProcessStartInfo { FileName = pair.LocalPath, UseShellExecute = true });
                 }
             };
+            actions.Children.Add(open);
 
-            var remove = new Button { Content = "Remove", Margin = new Thickness(8, 0, 0, 0) };
-            remove.Click += (_, _) =>
+            actions.Children.Add(BuildManualMenu(account, pair));
+
+            // --- Card --------------------------------------------------------------------------------
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.Children.Add(info);
+            Grid.SetColumn(actions, 1);
+            grid.Children.Add(actions);
+
+            var card = new Border
             {
-                App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the on-demand watcher/poll, if any
-                App.Instance.FullSync.StopAutoSync(pair.Id); // stop the full-sync watcher/poll, if any
-                App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
-                App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
-                Refresh();
+                Background = ThemeBrush("CardBackgroundFillColorDefaultBrush"),
+                BorderBrush = ThemeBrush("CardStrokeColorDefaultBrush"),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(16, 12, 16, 12),
+                Child = grid,
             };
 
-            var buttons = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            buttons.Children.Add(browse);
-            buttons.Children.Add(snapshot);
-            buttons.Children.Add(action);
+            SetIdleStatus(pair);
+            return card;
+        }
 
-            // On-demand folders: pull remote changes down and run a background watcher that auto-pushes.
+        private Button BuildPlayPauseButton(ProtonAccount account, SyncPair pair)
+        {
+            var playIcon = new FontIcon { FontSize = 12, Glyph = pair.AutoSync ? PauseGlyph : PlayGlyph };
+            var playPause = new Button { Content = playIcon, Padding = new Thickness(9, 7, 9, 7) };
+            ToolTipService.SetToolTip(playPause, pair.AutoSync ? "Pause automatic sync" : "Start automatic sync");
+
+            playPause.Click += async (_, _) =>
+            {
+                playPause.IsEnabled = false;
+                try
+                {
+                    if (pair.AutoSync)
+                    {
+                        if (pair.Mode == SyncMode.OnDemand)
+                        {
+                            DisableAutoSync(account, pair);
+                        }
+                        else
+                        {
+                            DisableFullAutoSync(account, pair);
+                        }
+
+                        playIcon.Glyph = PlayGlyph;
+                        ToolTipService.SetToolTip(playPause, "Start automatic sync");
+                    }
+                    else
+                    {
+                        playIcon.Glyph = PauseGlyph;
+                        ToolTipService.SetToolTip(playPause, "Pause automatic sync");
+
+                        if (pair.Mode == SyncMode.OnDemand)
+                        {
+                            await EnableAutoSyncAsync(account, pair);
+                        }
+                        else
+                        {
+                            await EnableFullAutoSyncAsync(account, pair);
+                        }
+                    }
+                }
+                finally
+                {
+                    playPause.IsEnabled = true;
+                }
+            };
+
+            return playPause;
+        }
+
+        private DropDownButton BuildManualMenu(ProtonAccount account, SyncPair pair)
+        {
+            var flyout = new MenuFlyout();
+
             if (pair.Mode == SyncMode.OnDemand)
             {
-                var syncDown = new Button { Content = "Sync down", Margin = new Thickness(8, 0, 0, 0) };
-                ToolTipService.SetToolTip(syncDown, "Bring changes made on Proton Drive (new, changed, or deleted files) down into this folder as placeholders.");
-                syncDown.Click += async (_, _) => await SyncDownAsync(account, pair);
-                buttons.Children.Add(syncDown);
+                var push = new MenuFlyoutItem { Text = "Push local changes to Drive", Icon = new FontIcon { Glyph = "" } };
+                push.Click += async (_, _) => await SyncUpAsync(account, pair);
+                flyout.Items.Add(push);
 
-                // IsChecked is set before the handlers are attached so the initial state doesn't fire them.
-                var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
-                ToolTipService.SetToolTip(auto, "Keep this folder in sync automatically: push local changes up a few seconds after they settle, and periodically pull changes made on Proton Drive down.");
-                auto.Checked += async (_, _) => await EnableAutoSyncAsync(account, pair);
-                auto.Unchecked += (_, _) => DisableAutoSync(account, pair);
-                buttons.Children.Add(auto);
+                var pull = new MenuFlyoutItem { Text = "Pull remote changes from Drive", Icon = new FontIcon { Glyph = "" } };
+                pull.Click += async (_, _) => await SyncDownAsync(account, pair);
+                flyout.Items.Add(pull);
             }
-            else if (pair.Mode == SyncMode.FullSync)
+            else
             {
-                // Full two-way auto-sync: watch local + poll Drive, applying the full plan automatically.
-                var auto = new ToggleButton { Content = "Auto", Margin = new Thickness(8, 0, 0, 0), IsChecked = pair.AutoSync };
-                ToolTipService.SetToolTip(auto, "Keep this folder mirrored with Proton Drive automatically both ways. Large deletions are held for you to review with \"Sync now\" rather than applied unattended.");
-                auto.Checked += async (_, _) => await EnableFullAutoSyncAsync(account, pair);
-                auto.Unchecked += (_, _) => DisableFullAutoSync(account, pair);
-                buttons.Children.Add(auto);
+                var syncNow = new MenuFlyoutItem { Text = "Sync now (review changes first)", Icon = new FontIcon { Glyph = "" } };
+                syncNow.Click += async (_, _) => await SyncNowAsync(account, pair);
+                flyout.Items.Add(syncNow);
             }
 
-            buttons.Children.Add(open);
-            buttons.Children.Add(remove);
-            Grid.SetColumn(buttons, 1);
-            row.Children.Add(buttons);
+            flyout.Items.Add(new MenuFlyoutSeparator());
 
-            var status = new TextBlock
-            {
-                FontSize = 12,
-                Opacity = 0.7,
-                TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 2, 0, 0),
-                Visibility = Visibility.Collapsed,
-            };
-            if (pair.AutoSync && pair.Mode is SyncMode.OnDemand or SyncMode.FullSync)
-            {
-                status.Text = "Auto-sync on — watching local changes and polling Drive.";
-                status.Visibility = Visibility.Visible;
-            }
+            var remove = new MenuFlyoutItem { Text = "Stop syncing this folder…", Icon = new FontIcon { Glyph = "" } };
+            remove.Click += async (_, _) => await RemoveFolderAsync(account, pair);
+            flyout.Items.Add(remove);
 
-            _pairStatus[pair.Id] = status;
-
-            var container = new StackPanel();
-            container.Children.Add(row);
-            container.Children.Add(status);
-            return container;
+            var manual = new DropDownButton { Content = "Manual", Flyout = flyout };
+            ToolTipService.SetToolTip(manual, "Run a sync yourself, or stop syncing this folder.");
+            return manual;
         }
+
+        private async Task RemoveFolderAsync(ProtonAccount account, SyncPair pair)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = "Stop syncing this folder?",
+                Content = $"PAWS will stop syncing \"{FolderDisplayName(pair.LocalPath)}\".\n\n"
+                          + "Nothing is deleted — the files stay on your PC and on Proton Drive; they just won't sync anymore.",
+                PrimaryButtonText = "Stop syncing",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = XamlRoot,
+            };
+
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            App.Instance.CloudSync.StopAutoSync(pair.Id); // stop the on-demand watcher/poll, if any
+            App.Instance.FullSync.StopAutoSync(pair.Id); // stop the full-sync watcher/poll, if any
+            App.Instance.CloudSync.Disable(pair.Id); // disconnect the on-demand provider, if any
+            App.Instance.CreateSetupWorkflow().RemoveSyncPair(account.Id, pair.Id);
+            Refresh();
+        }
+
+        private static string FolderDisplayName(string localPath)
+        {
+            var name = Path.GetFileName(localPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            return string.IsNullOrEmpty(name) ? localPath : name;
+        }
+
+        private static Border BuildModePill(SyncMode mode)
+        {
+            var label = mode switch
+            {
+                SyncMode.OnDemand => "On-demand",
+                SyncMode.FullSync => "Full sync",
+                _ => "Cloud-only",
+            };
+
+            return new Border
+            {
+                Background = ThemeBrush("SubtleFillColorSecondaryBrush"),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(6, 1, 6, 2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock { Text = label, FontSize = 11, Opacity = 0.8 },
+            };
+        }
+
+        private static Brush? ThemeBrush(string key)
+        {
+            var resources = Application.Current.Resources;
+            return resources.ContainsKey(key) ? resources[key] as Brush : null;
+        }
+
+        // ---- Status handling ------------------------------------------------------------------------
+
+        /// <summary>The resting status for a pair (no sync running): auto on, paused, or manual-only.</summary>
+        private void SetIdleStatus(SyncPair pair)
+        {
+            if (pair.Mode is not (SyncMode.OnDemand or SyncMode.FullSync))
+            {
+                SetPairStatus(pair.Id, PairState.Paused, "Manual sync only — use Manual ▸ Sync now.");
+            }
+            else if (pair.AutoSync)
+            {
+                SetPairStatus(pair.Id, PairState.Auto, "Automatic sync on — watching for changes.");
+            }
+            else
+            {
+                SetPairStatus(pair.Id, PairState.Paused, "Automatic sync paused — press ▶ to resume.");
+            }
+        }
+
+        private void SetPairStatus(string pairId, PairState state, string text)
+        {
+            if (!_pairStatus.TryGetValue(pairId, out var ui))
+            {
+                return;
+            }
+
+            ui.Text.Text = text;
+
+            var syncing = state == PairState.Syncing;
+            ui.Ring.IsActive = syncing;
+            ui.Ring.Visibility = syncing ? Visibility.Visible : Visibility.Collapsed;
+            ui.Icon.Visibility = syncing ? Visibility.Collapsed : Visibility.Visible;
+
+            var (glyph, brush, opacity) = state switch
+            {
+                PairState.UpToDate => ("", ThemeBrush("SystemFillColorSuccessBrush") ?? new SolidColorBrush(Colors.SeaGreen), 1.0),
+                PairState.Attention => ("", ThemeBrush("SystemFillColorCautionBrush") ?? new SolidColorBrush(Colors.Orange), 1.0),
+                PairState.Paused => (PauseGlyph, null, 0.6),
+                _ => ("", null, 0.6), // Auto (sync arrows)
+            };
+
+            ui.Icon.Glyph = glyph;
+            ui.Icon.Opacity = opacity;
+            if (brush is not null)
+            {
+                ui.Icon.Foreground = brush;
+            }
+            else
+            {
+                ui.Icon.ClearValue(IconElement.ForegroundProperty);
+            }
+        }
+
+        // ---- Automatic sync (play/pause) --------------------------------------------------------------
 
         /// <summary>
         /// Turns on background auto-sync for an on-demand pair: persists the preference, makes sure the
@@ -245,7 +459,7 @@ namespace PAWS.Views
         {
             pair.AutoSync = true;
             App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, true);
-            SetPairStatus(pair.Id, "Auto-sync: setting up…");
+            SetPairStatus(pair.Id, PairState.Syncing, "Setting up automatic sync…");
 
             try
             {
@@ -255,11 +469,11 @@ namespace PAWS.Views
                 }
 
                 App.Instance.CloudSync.StartAutoSync(account.Id, pair);
-                SetPairStatus(pair.Id, "Auto-sync on — watching local changes and polling Drive.");
+                SetIdleStatus(pair);
             }
             catch (Exception ex)
             {
-                SetPairStatus(pair.Id, $"Auto-sync setup failed: {ex.Message}");
+                SetPairStatus(pair.Id, PairState.Attention, $"Couldn't start automatic sync: {ex.Message}");
             }
         }
 
@@ -269,7 +483,7 @@ namespace PAWS.Views
             pair.AutoSync = false;
             App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, false);
             App.Instance.CloudSync.StopAutoSync(pair.Id);
-            SetPairStatus(pair.Id, "Auto-sync off.");
+            SetIdleStatus(pair);
         }
 
         /// <summary>Turns on automatic two-way sync for a full-sync pair (local watcher + Drive poll).</summary>
@@ -281,11 +495,11 @@ namespace PAWS.Views
             try
             {
                 App.Instance.FullSync.StartAutoSync(account.Id, pair);
-                SetPairStatus(pair.Id, "Auto-sync on — watching local changes and polling Drive.");
+                SetIdleStatus(pair);
             }
             catch (Exception ex)
             {
-                SetPairStatus(pair.Id, $"Auto-sync setup failed: {ex.Message}");
+                SetPairStatus(pair.Id, PairState.Attention, $"Couldn't start automatic sync: {ex.Message}");
             }
 
             return Task.CompletedTask;
@@ -297,11 +511,13 @@ namespace PAWS.Views
             pair.AutoSync = false;
             App.Instance.CreateSetupWorkflow().SetPairAutoSync(account.Id, pair.Id, false);
             App.Instance.FullSync.StopAutoSync(pair.Id);
-            SetPairStatus(pair.Id, "Auto-sync off.");
+            SetIdleStatus(pair);
         }
 
+        // ---- Background sync events → status line -----------------------------------------------------
+
         private void OnFullSyncStarted(string pairId)
-            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: syncing…"));
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, PairState.Syncing, "Syncing…"));
 
         private void OnFullSyncCompleted(FullSyncEventArgs e)
         {
@@ -309,13 +525,13 @@ namespace PAWS.Views
             {
                 if (e.NeedsReview)
                 {
-                    SetPairStatus(e.PairId, $"Auto-sync paused: {e.PendingDeletes} deletions detected — review with \"Sync now\".");
+                    SetPairStatus(e.PairId, PairState.Attention, $"{e.PendingDeletes} deletions held for review — check Manual ▸ Sync now.");
                     return;
                 }
 
                 if (!e.Succeeded)
                 {
-                    SetPairStatus(e.PairId, $"Auto-sync error: {e.Error!.Message}");
+                    SetPairStatus(e.PairId, PairState.Attention, $"Sync error: {e.Error!.Message}");
                     return;
                 }
 
@@ -323,18 +539,18 @@ namespace PAWS.Views
                 var when = DateTime.Now.ToString("t");
                 if (result.Failures.Count > 0)
                 {
-                    SetPairStatus(e.PairId, $"Auto-sync: {result.Completed} applied, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
+                    SetPairStatus(e.PairId, PairState.Attention, $"{result.Completed} synced, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
                     return;
                 }
 
-                SetPairStatus(e.PairId, result.Total == 0
-                    ? $"Auto-sync: up to date · {when}"
-                    : $"Auto-sync: {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s)" : string.Empty)} · {when}");
+                SetPairStatus(e.PairId, PairState.UpToDate, result.Total == 0
+                    ? $"Up to date · {when}"
+                    : $"Synced {result.Completed} change(s){(result.Skipped > 0 ? $", {result.Skipped} conflict(s) skipped" : string.Empty)} · {when}");
             });
         }
 
         private void OnAutoSyncStarted(string pairId)
-            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: syncing…"));
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, PairState.Syncing, "Syncing local changes…"));
 
         private void OnAutoSyncCompleted(AutoSyncEventArgs e)
         {
@@ -342,7 +558,7 @@ namespace PAWS.Views
             {
                 if (!e.Succeeded)
                 {
-                    SetPairStatus(e.PairId, $"Auto-sync error: {e.Error!.Message}");
+                    SetPairStatus(e.PairId, PairState.Attention, $"Sync error: {e.Error!.Message}");
                     return;
                 }
 
@@ -351,18 +567,18 @@ namespace PAWS.Views
                 if (result.Failures.Count > 0)
                 {
                     // Show the actual reason (first failure); full detail + stack is in the log file.
-                    SetPairStatus(e.PairId, $"Auto-sync: {result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
+                    SetPairStatus(e.PairId, PairState.Attention, $"{result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}");
                     return;
                 }
 
-                SetPairStatus(e.PairId, result.Total == 0
-                    ? $"Auto-sync: up to date · {when}"
-                    : $"Auto-sync: pushed {result.Completed} change(s) · {when}");
+                SetPairStatus(e.PairId, PairState.UpToDate, result.Total == 0
+                    ? $"Up to date · {when}"
+                    : $"Pushed {result.Completed} change(s) · {when}");
             });
         }
 
         private void OnAutoPullStarted(string pairId)
-            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, "Auto-sync: checking Drive for changes…"));
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, PairState.Syncing, "Checking Proton Drive for changes…"));
 
         private void OnAutoPullCompleted(AutoPullEventArgs e)
         {
@@ -370,26 +586,19 @@ namespace PAWS.Views
             {
                 if (!e.Succeeded)
                 {
-                    SetPairStatus(e.PairId, $"Auto-sync (pull) error: {e.Error!.Message}");
+                    SetPairStatus(e.PairId, PairState.Attention, $"Sync error: {e.Error!.Message}");
                     return;
                 }
 
                 var result = e.Result!;
                 var when = DateTime.Now.ToString("t");
-                SetPairStatus(e.PairId, result.Total == 0
-                    ? $"Auto-sync: up to date · {when}"
-                    : $"Auto-sync: pulled {result.Created} new, {result.Updated} changed, {result.Deleted} removed · {when}");
+                SetPairStatus(e.PairId, PairState.UpToDate, result.Total == 0
+                    ? $"Up to date · {when}"
+                    : $"Pulled {result.Created} new, {result.Updated} changed, {result.Deleted} removed · {when}");
             });
         }
 
-        private void SetPairStatus(string pairId, string text)
-        {
-            if (_pairStatus.TryGetValue(pairId, out var tb))
-            {
-                tb.Text = text;
-                tb.Visibility = Visibility.Visible;
-            }
-        }
+        // ---- Manual sync actions ----------------------------------------------------------------------
 
         /// <summary>
         /// Pulls changes made on Proton Drive (new, changed, deleted files/folders) down into an on-demand
@@ -409,7 +618,7 @@ namespace PAWS.Views
 
             var dialog = new ContentDialog
             {
-                Title = $"Sync down: {pair.RemotePath}",
+                Title = $"Pull changes — {FolderDisplayName(pair.LocalPath)}",
                 Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
                 CloseButtonText = "Close",
                 XamlRoot = XamlRoot,
@@ -417,20 +626,26 @@ namespace PAWS.Views
 
             dialog.Opened += async (_, _) =>
             {
+                SetPairStatus(pair.Id, PairState.Syncing, "Checking Proton Drive for changes…");
                 try
                 {
                     var result = await App.Instance.CloudSync.PullChangesAsync(account.Id, pair);
                     ring.IsActive = false;
 
+                    var when = DateTime.Now.ToString("t");
                     status.Text = result.Total == 0
                         ? "No remote changes — already up to date."
                         : $"Pulled remote changes: {result.Created} new, {result.Updated} changed, {result.Deleted} removed. "
                           + "New and changed files appear as on-demand placeholders (open them to download).";
+                    SetPairStatus(pair.Id, PairState.UpToDate, result.Total == 0
+                        ? $"Up to date · {when}"
+                        : $"Pulled {result.Created} new, {result.Updated} changed, {result.Deleted} removed · {when}");
                 }
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
-                    status.Text = $"Sync down failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                    status.Text = $"Pull failed: {ex.Message}\n\nIf this mentions a session or token, use Options ▸ Sign in again on the account, then retry.";
+                    SetPairStatus(pair.Id, PairState.Attention, $"Pull failed: {ex.Message}");
                 }
             };
 
@@ -455,7 +670,7 @@ namespace PAWS.Views
 
             var dialog = new ContentDialog
             {
-                Title = $"Files-on-demand: {pair.LocalPath}  ⇄  {pair.RemotePath}",
+                Title = $"Files-on-demand — {FolderDisplayName(pair.LocalPath)}",
                 Content = panel,
                 CloseButtonText = "Close",
                 XamlRoot = XamlRoot,
@@ -479,7 +694,7 @@ namespace PAWS.Views
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
-                    status.Text = $"Setup failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                    status.Text = $"Setup failed: {ex.Message}\n\nIf this mentions a session or token, use Options ▸ Sign in again on the account, then retry.";
                 }
             };
 
@@ -506,7 +721,7 @@ namespace PAWS.Views
 
             var dialog = new ContentDialog
             {
-                Title = $"Sync up: {pair.LocalPath}",
+                Title = $"Push changes — {FolderDisplayName(pair.LocalPath)}",
                 Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
                 CloseButtonText = "Close",
                 XamlRoot = XamlRoot,
@@ -514,6 +729,7 @@ namespace PAWS.Views
 
             dialog.Opened += async (_, _) =>
             {
+                SetPairStatus(pair.Id, PairState.Syncing, "Pushing local changes…");
                 try
                 {
                     // First use this session: register the sync root + placeholders + provider.
@@ -527,6 +743,7 @@ namespace PAWS.Views
                     var result = await App.Instance.CloudSync.SyncChangesAsync(account.Id, pair);
                     ring.IsActive = false;
 
+                    var when = DateTime.Now.ToString("t");
                     status.Text = result.Total == 0
                         ? "No local changes to push — already up to date."
                         : $"Pushed {result.Completed} change(s) up.{(result.Failures.Count > 0 ? $" {result.Failures.Count} failed." : string.Empty)}";
@@ -535,11 +752,18 @@ namespace PAWS.Views
                     {
                         results.Children.Add(new TextBlock { Text = $"⚠ {failure.Operation.RelativePath}: {failure.Error}", TextWrapping = TextWrapping.Wrap });
                     }
+
+                    SetPairStatus(pair.Id,
+                        result.Failures.Count > 0 ? PairState.Attention : PairState.UpToDate,
+                        result.Failures.Count > 0
+                            ? $"{result.Completed} pushed, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}"
+                            : result.Total == 0 ? $"Up to date · {when}" : $"Pushed {result.Completed} change(s) · {when}");
                 }
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
-                    status.Text = $"Sync up failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                    status.Text = $"Push failed: {ex.Message}\n\nIf this mentions a session or token, use Options ▸ Sign in again on the account, then retry.";
+                    SetPairStatus(pair.Id, PairState.Attention, $"Push failed: {ex.Message}");
                 }
             };
 
@@ -547,9 +771,9 @@ namespace PAWS.Views
         }
 
         /// <summary>
-        /// Phase 4b in the UI: compute the sync plan (capture + reconcile against persisted state) and
-        /// show it. Files move only if the user clicks the primary "Sync N items" button — Close cancels
-        /// (so it doubles as a dry-run preview). After applying, the new last-known state is persisted.
+        /// Full-sync: compute the sync plan (capture + reconcile against persisted state) and show it.
+        /// Files move only if the user clicks the primary "Sync N items" button — Close cancels (so it
+        /// doubles as a dry-run preview). After applying, the new last-known state is persisted.
         /// </summary>
         private async Task SyncNowAsync(ProtonAccount account, SyncPair pair)
         {
@@ -567,16 +791,18 @@ namespace PAWS.Views
 
             var dialog = new ContentDialog
             {
-                Title = $"Sync: {pair.LocalPath}  ⇄  {pair.RemotePath}",
+                Title = $"Sync — {FolderDisplayName(pair.LocalPath)}",
                 Content = new ScrollViewer { Content = panel, MaxHeight = 480 },
                 CloseButtonText = "Close",
                 XamlRoot = XamlRoot,
             };
 
             SyncPlan? plan = null;
+            var applied = false;
 
             dialog.Opened += async (_, _) =>
             {
+                SetPairStatus(pair.Id, PairState.Syncing, "Comparing local and remote…");
                 try
                 {
                     plan = await App.Instance.SyncEngine.PlanAsync(account.Id, pair);
@@ -585,10 +811,12 @@ namespace PAWS.Views
                     if (plan.Operations.Count == 0)
                     {
                         status.Text = "Already in sync — nothing to do.";
+                        SetPairStatus(pair.Id, PairState.UpToDate, $"Up to date · {DateTime.Now:t}");
                         return;
                     }
 
                     status.Text = $"{plan.Operations.Count} planned operation(s). Review, then Sync — or Close to cancel.";
+                    SetPairStatus(pair.Id, PairState.Auto, $"{plan.Operations.Count} change(s) waiting for confirmation…");
                     foreach (var op in plan.Operations)
                     {
                         results.Children.Add(new TextBlock
@@ -604,7 +832,8 @@ namespace PAWS.Views
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
-                    status.Text = $"Could not plan: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
+                    status.Text = $"Could not plan: {ex.Message}\n\nIf this mentions a session or token, use Options ▸ Sign in again on the account, then retry.";
+                    SetPairStatus(pair.Id, PairState.Attention, $"Sync failed: {ex.Message}");
                 }
             };
 
@@ -623,6 +852,7 @@ namespace PAWS.Views
                 results.Children.Clear();
                 ring.IsActive = true;
                 status.Text = "Applying…";
+                SetPairStatus(pair.Id, PairState.Syncing, "Syncing…");
 
                 try
                 {
@@ -630,6 +860,7 @@ namespace PAWS.Views
                         status.Text = $"Applying… [{p.Completed + 1}/{p.Total}] {OperationGlyph(p.Current.Kind)} {p.Current.RelativePath}");
 
                     var result = await App.Instance.SyncEngine.ApplyAsync(account.Id, plan, progress);
+                    applied = true;
 
                     ring.IsActive = false;
                     status.Text = $"Done — {result.Completed} applied, {result.Skipped} skipped (conflicts), {result.Failures.Count} failed.";
@@ -639,12 +870,20 @@ namespace PAWS.Views
                         results.Children.Add(new TextBlock { Text = $"⚠ {failure.Operation.RelativePath}: {failure.Error}", TextWrapping = TextWrapping.Wrap });
                     }
 
+                    var when = DateTime.Now.ToString("t");
+                    SetPairStatus(pair.Id,
+                        result.Failures.Count > 0 ? PairState.Attention : PairState.UpToDate,
+                        result.Failures.Count > 0
+                            ? $"{result.Completed} synced, {result.Failures.Count} failed — {result.Failures[0].Error} · {when}"
+                            : $"Synced {result.Completed} change(s) · {when}");
+
                     dialog.PrimaryButtonText = string.Empty; // sync finished — only Close remains
                 }
                 catch (Exception ex)
                 {
                     ring.IsActive = false;
                     status.Text = $"Sync failed: {ex.Message}";
+                    SetPairStatus(pair.Id, PairState.Attention, $"Sync failed: {ex.Message}");
                     dialog.IsPrimaryButtonEnabled = true;
                 }
                 finally
@@ -654,6 +893,12 @@ namespace PAWS.Views
             };
 
             await dialog.ShowAsync();
+
+            // Closed without applying — restore the resting status.
+            if (!applied)
+            {
+                SetIdleStatus(pair);
+            }
         }
 
         private static string OperationGlyph(SyncOperationKind kind) => kind switch
@@ -668,127 +913,7 @@ namespace PAWS.Views
             _ => kind.ToString(),
         };
 
-        /// <summary>
-        /// Phase 2 in the UI: capture the full recursive remote snapshot for a folder and show it as an
-        /// indented tree with counts/sizes. Exercises <see cref="RemoteSnapshotBuilder"/> and the
-        /// active-only listing filter via the same connected client as Browse.
-        /// </summary>
-        private async Task ShowSnapshotAsync(ProtonAccount account, SyncPair pair)
-        {
-            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
-            var status = new TextBlock { Text = "Capturing remote snapshot…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85, TextWrapping = TextWrapping.Wrap };
-            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-            header.Children.Add(ring);
-            header.Children.Add(status);
-
-            var results = new StackPanel { Spacing = 2 };
-
-            var panel = new StackPanel { Spacing = 10, MinWidth = 420 };
-            panel.Children.Add(header);
-            panel.Children.Add(results);
-
-            var dialog = new ContentDialog
-            {
-                Title = $"Snapshot: {pair.RemotePath}",
-                Content = new ScrollViewer { Content = panel, MaxHeight = 460 },
-                CloseButtonText = "Close",
-                XamlRoot = XamlRoot,
-            };
-
-            dialog.Opened += async (_, _) =>
-            {
-                try
-                {
-                    // Goes through CloudSync so it serializes on the shared drive gate — a "check status"
-                    // must never run a second SDK operation concurrently with a sync/hydration.
-                    var snapshot = await App.Instance.CloudSync.CaptureSnapshotAsync(account.Id, pair.RemotePath);
-                    if (snapshot is null)
-                    {
-                        ring.IsActive = false;
-                        status.Text = $"\"{pair.RemotePath}\" is not a folder on Drive.";
-                        return;
-                    }
-
-                    foreach (var entry in snapshot.Entries)
-                    {
-                        var depth = entry.RelativePath.AsSpan().Count('/');
-                        var indent = new string(' ', depth * 4);
-                        var size = entry.IsFile && entry.Size is { } s ? $"   ({FormatSize(s)})" : string.Empty;
-                        results.Children.Add(new TextBlock { Text = $"{indent}{(entry.IsFolder ? "📁" : "📄")} {entry.Name}{size}" });
-                    }
-
-                    ring.IsActive = false;
-                    status.Text = snapshot.Entries.Count == 0
-                        ? "This folder tree is empty."
-                        : $"{snapshot.FolderCount} folder(s), {snapshot.FileCount} file(s), {FormatSize(snapshot.TotalFileBytes)} total.";
-                }
-                catch (Exception ex)
-                {
-                    ring.IsActive = false;
-                    status.Text = $"Snapshot failed: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
-                }
-            };
-
-            await dialog.ShowAsync();
-        }
-
-        /// <summary>
-        /// Live proof of the app↔Drive wiring: resume the account's stored session, resolve the pair's
-        /// remote path, and list its contents in a dialog. Runs entirely off the persisted browser login.
-        /// </summary>
-        private async Task BrowseRemoteAsync(ProtonAccount account, SyncPair pair)
-        {
-            var ring = new ProgressRing { IsActive = true, Width = 24, Height = 24 };
-            var status = new TextBlock { Text = "Connecting to Proton Drive…", VerticalAlignment = VerticalAlignment.Center, Opacity = 0.85 };
-            var header = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-            header.Children.Add(ring);
-            header.Children.Add(status);
-
-            var results = new StackPanel { Spacing = 2 };
-
-            var panel = new StackPanel { Spacing = 10, MinWidth = 380 };
-            panel.Children.Add(header);
-            panel.Children.Add(results);
-
-            var dialog = new ContentDialog
-            {
-                Title = $"Remote folder: {pair.RemotePath}",
-                Content = new ScrollViewer { Content = panel, MaxHeight = 440 },
-                CloseButtonText = "Close",
-                XamlRoot = XamlRoot,
-            };
-
-            dialog.Opened += async (_, _) =>
-            {
-                try
-                {
-                    // Goes through CloudSync so it serializes on the shared drive gate (see ShowSnapshotAsync).
-                    var children = await App.Instance.CloudSync.ListChildrenAsync(account.Id, pair.RemotePath);
-                    if (children is null)
-                    {
-                        ring.IsActive = false;
-                        status.Text = $"Folder not found on Drive: {pair.RemotePath}";
-                        return;
-                    }
-
-                    foreach (var child in children)
-                    {
-                        var size = child.Size is { } s ? $"   ({FormatSize(s)})" : string.Empty;
-                        results.Children.Add(new TextBlock { Text = $"{(child.IsFolder ? "📁" : "📄")}  {child.Name}{size}" });
-                    }
-
-                    ring.IsActive = false;
-                    status.Text = children.Count == 0 ? "This folder is empty." : $"{children.Count} item(s).";
-                }
-                catch (Exception ex)
-                {
-                    ring.IsActive = false;
-                    status.Text = $"Could not list folder: {ex.Message}\n\nIf this mentions a session or token, use \"Sign in again\" on the account, then retry.";
-                }
-            };
-
-            await dialog.ShowAsync();
-        }
+        // ---- Account actions ----------------------------------------------------------------------------
 
         /// <summary>
         /// Re-runs the browser login for an existing account and refreshes its stored session (fresh
@@ -851,7 +976,7 @@ namespace PAWS.Views
                         }
 
                         App.Instance.CreateSetupWorkflow().RefreshAccountSession(account.Id, result.Session!);
-                        status.Text = $"✓ Signed in as {result.Session!.Username}. Session refreshed — you can Browse remote again.";
+                        status.Text = $"✓ Signed in as {result.Session!.Username}. Session refreshed.";
                         dialog.CloseButtonText = "Done";
                     });
                 }
@@ -870,20 +995,6 @@ namespace PAWS.Views
             };
 
             await dialog.ShowAsync();
-        }
-
-        private static string FormatSize(long bytes)
-        {
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
-            double size = bytes;
-            var unit = 0;
-            while (size >= 1024 && unit < units.Length - 1)
-            {
-                size /= 1024;
-                unit++;
-            }
-
-            return unit == 0 ? $"{bytes} B" : $"{size:0.#} {units[unit]}";
         }
 
         private async Task RemoveAccountAsync(ProtonAccount account)
@@ -929,8 +1040,8 @@ namespace PAWS.Views
 
             var remoteBox = new TextBox { Header = "Proton Drive folder", Text = "/", PlaceholderText = "/Backup/Laptop" };
             var modeBox = new ComboBox { Header = "Sync mode", SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
-            modeBox.Items.Add("On-demand");
-            modeBox.Items.Add("Full sync");
+            modeBox.Items.Add("On-demand — files download when you open them");
+            modeBox.Items.Add("Full sync — keep complete copies both ways");
             modeBox.Items.Add("Cloud-only");
 
             var panel = new StackPanel { Spacing = 8 };
