@@ -614,10 +614,14 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
         // Serializes hydration: the Proton SDK's native crypto is not safe under concurrent downloads,
         // and a single file open fires several FETCH_DATA (multiple ranges + thumbnail/preview). We
-        // download each file once and cache it, serving every requested range from memory.
+        // download each file once and cache it, serving every requested range from a TEMP FILE rather
+        // than an in-memory buffer — the SDK's only public download path is whole-file/sequential (no
+        // true byte-range fetch — see the class remarks on TransferAsync), so a large file still gets
+        // downloaded in full on first access, but keeping that content on disk instead of in a `byte[]`
+        // means opening a multi-GB file doesn't balloon the app's memory.
         private readonly SemaphoreSlim _downloadGate = new(1, 1);
         private string? _cachedIdentity;
-        private byte[]? _cachedData;
+        private string? _cachedFilePath;
         private bool _disposed;
 
         public HydrationConnection(string localRoot, FetchFolderChildren fetchChildren, FetchPlaceholderData fetchData)
@@ -751,6 +755,18 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             _ = Task.Run(() => TransferAsync(operation, identity, offset, length));
         }
 
+        // <summary>
+        // NOTE on byte-range downloads: Cloud Filter hands us the exact [offset, offset+length) the
+        // platform actually wants for this open — but Proton's SDK exposes only a whole-file, sequential
+        // download (`FileDownloader.DownloadToStream`); the block-level machinery that could fetch just
+        // the blocks overlapping a range (`BlockDownloader`, the block manifest, etc.) is all `internal`
+        // to the SDK, not something this app can safely reach without reflecting into its
+        // decryption/integrity-verification internals — a security-sensitive path we deliberately do not
+        // reimplement (see paws-architecture memory, 2026-07-02 decision). So every first access still
+        // downloads the WHOLE file regardless of the requested range; what changed is WHERE that content
+        // is cached — a temp file on disk, not a `byte[]`, so a huge file no longer bloats memory (a
+        // multi-GB open used to hold the entire decrypted file in RAM via `_cachedData`/`ToArray()`).
+        // </summary>
         private async Task TransferAsync(CF_OPERATION_INFO operation, string identity, long offset, long length)
         {
             // Bail before touching the connection if it's being torn down (reconnect / disable): running
@@ -777,10 +793,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                         return;
                     }
 
-                    if (string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) && _cachedData is { } cached)
+                    if (string.Equals(_cachedIdentity, identity, StringComparison.Ordinal) && _cachedFilePath is { } cachedPath)
                     {
-                        // Already downloaded (e.g. a later range of the same open) — serve from memory.
-                        var total = cached.Length;
+                        // Already downloaded (e.g. a later range of the same open) — serve from the spill file.
+                        var total = new FileInfo(cachedPath).Length;
                         if (offset > total)
                         {
                             offset = total;
@@ -791,20 +807,47 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                             length = total - offset;
                         }
 
-                        TransferRange(operation, cached, offset, length);
+                        TransferRangeFromFile(operation, cachedPath, offset, length);
                         return;
                     }
+
+                    // A different file than whatever we cached before — that spill file is now stale.
+                    DeleteCachedFile();
 
                     // First access: STREAM the download straight to the platform as bytes arrive, so a slow
                     // (e.g. throttled) transfer keeps reporting progress via CfExecute instead of buffering
                     // the whole file and only then sending it — which would blow Cloud Filter's hydration
                     // timeout on a large/slow download. The sink forwards the bytes falling in the requested
-                    // range as they download, and keeps the full content so any other range of the same open
-                    // is served from memory without re-downloading.
-                    using var sink = new CfHydrationSink(operation, offset, offset + length);
-                    await _fetchData(identity, sink, CancellationToken.None).ConfigureAwait(false);
-                    _cachedData = sink.ToArray();
-                    _cachedIdentity = identity;
+                    // range as they download, and ALSO spills every byte to a temp file so any other range
+                    // of the same open is served from disk without re-downloading or holding it in memory.
+                    var spillPath = NewTempFilePath();
+                    var cached = false;
+                    try
+                    {
+                        using (var sink = new CfHydrationSink(operation, offset, offset + length, spillPath))
+                        {
+                            await _fetchData(identity, sink, CancellationToken.None).ConfigureAwait(false);
+                        }
+
+                        _cachedFilePath = spillPath;
+                        _cachedIdentity = identity;
+                        cached = true;
+                    }
+                    finally
+                    {
+                        // A failed/cancelled download never gets cached — clean up its partial spill file
+                        // rather than leaving it for the OS to reclaim later.
+                        if (!cached)
+                        {
+                            try
+                            {
+                                File.Delete(spillPath);
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
                 }
                 finally
                 {
@@ -824,32 +867,96 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             }
         }
 
-        private static unsafe void TransferRange(CF_OPERATION_INFO operation, byte[] data, long offset, long length)
+        // A fresh, collision-free path for a hydration's spill file, under a dedicated temp subfolder.
+        private static string NewTempFilePath()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "PAWS-hydrate");
+            Directory.CreateDirectory(directory);
+            return Path.Combine(directory, Guid.NewGuid().ToString("N") + ".tmp");
+        }
+
+        // Drops the current spill file (a different file is about to be cached, or the connection is
+        // tearing down). Best-effort: a failed delete just leaves an orphaned temp file for the OS to
+        // reclaim later, not a functional problem.
+        private void DeleteCachedFile()
+        {
+            if (_cachedFilePath is { } path)
+            {
+                try
+                {
+                    File.Delete(path);
+                }
+                catch
+                {
+                }
+
+                _cachedFilePath = null;
+                _cachedIdentity = null;
+            }
+        }
+
+        private static unsafe void TransferRangeFromFile(CF_OPERATION_INFO operation, string filePath, long offset, long length)
         {
             if (length <= 0)
             {
                 return;
             }
 
-            long sent = 0;
-            while (sent < length)
+            using var file = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            file.Seek(offset, SeekOrigin.Begin);
+
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(ChunkSize);
+            try
             {
-                var chunk = (int)Math.Min(ChunkSize, length - sent);
-                fixed (byte* pointer = &data[(int)(offset + sent)])
+                long sent = 0;
+                while (sent < length)
                 {
-                    var transfer = new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                    var want = (int)Math.Min(ChunkSize, length - sent);
+                    var read = ReadFully(file, buffer, want);
+                    if (read <= 0)
                     {
-                        Length = chunk,
-                        Offset = offset + sent,
-                        Buffer = (IntPtr)pointer,
-                        Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-                    };
-                    var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
-                    CfExecute(operation, ref parameters);
+                        break; // spill file ended early — nothing more to send for this range
+                    }
+
+                    fixed (byte* pointer = buffer)
+                    {
+                        var transfer = new CF_OPERATION_PARAMETERS.TRANSFERDATA
+                        {
+                            Length = read,
+                            Offset = offset + sent,
+                            Buffer = (IntPtr)pointer,
+                            Flags = CF_OPERATION_TRANSFER_DATA_FLAGS.CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
+                        };
+                        var parameters = CF_OPERATION_PARAMETERS.Create(transfer);
+                        CfExecute(operation, ref parameters);
+                    }
+
+                    sent += read;
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        // Stream.Read may return fewer bytes than requested even mid-file; loop until `count` bytes are
+        // in hand or the stream is actually exhausted.
+        private static int ReadFully(Stream stream, byte[] buffer, int count)
+        {
+            var total = 0;
+            while (total < count)
+            {
+                var read = stream.Read(buffer, total, count - total);
+                if (read == 0)
+                {
+                    break;
                 }
 
-                sent += chunk;
+                total += read;
             }
+
+            return total;
         }
 
         private static void TransferError(CF_OPERATION_INFO operation, long offset, long length)
@@ -871,11 +978,13 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         /// portion overlapping the requested range [<c>sendStart</c>, <c>sendEnd</c>) to the platform via
         /// <c>CfExecute(TRANSFER_DATA)</c> at the correct file offset — so hydration reports progress
         /// continuously during a slow download instead of stalling until the whole file is buffered. Every
-        /// byte is also accumulated so the caller can cache the full content for other ranges of the open.
+        /// byte is also spilled to <paramref name="spillFilePath"/> (rather than kept in memory) so the
+        /// caller can cache the full content on disk for other ranges of the same open, without a huge
+        /// file ballooning the app's memory — see the class remarks on <c>TransferAsync</c>.
         /// </summary>
-        private sealed class CfHydrationSink(CF_OPERATION_INFO operation, long sendStart, long sendEnd) : Stream
+        private sealed class CfHydrationSink(CF_OPERATION_INFO operation, long sendStart, long sendEnd, string spillFilePath) : Stream
         {
-            private readonly MemoryStream _accumulated = new();
+            private readonly FileStream _spill = new(spillFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16, FileOptions.SequentialScan);
 
             public override bool CanWrite => true;
 
@@ -883,17 +992,15 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
             public override bool CanSeek => false;
 
-            public override long Length => _accumulated.Length;
+            public override long Length => _spill.Length;
 
             public override long Position
             {
-                get => _accumulated.Length;
+                get => _spill.Position;
                 set => throw new NotSupportedException();
             }
 
-            public override void Flush()
-            {
-            }
+            public override void Flush() => _spill.Flush();
 
             public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
@@ -917,12 +1024,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 return ValueTask.CompletedTask;
             }
 
-            public byte[] ToArray() => _accumulated.ToArray();
-
             private void Emit(ReadOnlySpan<byte> data)
             {
-                var fileStart = _accumulated.Length; // file offset of this write's first byte
-                _accumulated.Write(data);            // keep everything for the caller's cache
+                var fileStart = _spill.Position; // file offset of this write's first byte
+                _spill.Write(data);               // spill everything to disk for the caller's cache
                 var fileEnd = fileStart + data.Length;
 
                 // The slice of this write that the platform is actually waiting on.
@@ -963,7 +1068,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             {
                 if (disposing)
                 {
-                    _accumulated.Dispose();
+                    // Closes the write handle (flushing to disk) but does NOT delete the file — the
+                    // connection keeps it around as the cache for other ranges of the same open, and
+                    // cleans it up itself (a new identity, or connection teardown).
+                    _spill.Dispose();
                 }
 
                 base.Dispose(disposing);
@@ -1089,7 +1197,7 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
             // Intentionally not disposing _downloadGate: a late transfer could still touch it, and a
             // disposed SemaphoreSlim throws. Let the GC reclaim it.
-            _cachedData = null;
+            DeleteCachedFile();
             GC.KeepAlive(_fetchDataCallback);
             GC.KeepAlive(_fetchPlaceholdersCallback);
             GC.KeepAlive(_callbacks);

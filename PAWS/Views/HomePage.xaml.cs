@@ -795,7 +795,9 @@ namespace PAWS.Views
             {
                 SyncMode.OnDemand => "On-demand",
                 SyncMode.FullSync => "Full sync",
-                _ => "Cloud-only",
+                // Cloud-only mode is commented out/TODO (see SyncMode.cs) — this only catches a
+                // corrupted/future Mode value, not a real selectable option.
+                _ => "Unknown mode",
             };
 
             return new Border
@@ -1490,7 +1492,8 @@ namespace PAWS.Views
             var modeBox = new ComboBox { Header = "Sync mode", SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
             modeBox.Items.Add("On-demand — files download when you open them");
             modeBox.Items.Add("Full sync — keep complete copies both ways");
-            modeBox.Items.Add("Cloud-only");
+            // TODO: Cloud-only mode is commented out — not implemented (see SyncMode.cs).
+            // modeBox.Items.Add("Cloud-only");
 
             var panel = new StackPanel { Spacing = 8 };
             panel.Children.Add(localBox);

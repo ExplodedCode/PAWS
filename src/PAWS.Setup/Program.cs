@@ -177,9 +177,10 @@ internal static class Program
                 "Work");
 
             // Same account can be added again, and accounts can have multiple folders.
+            // (Was Mode = SyncMode.CloudOnly — that mode is commented out/TODO, see SyncMode.cs.)
             if (personal.IsSuccess)
             {
-                workflow.AddSyncPair(personal.Account!.Id, new SyncPair { LocalPath = @"C:\Users\me\Photos", RemotePath = "/Photos", Mode = SyncMode.CloudOnly });
+                workflow.AddSyncPair(personal.Account!.Id, new SyncPair { LocalPath = @"C:\Users\me\Photos", RemotePath = "/Photos", Mode = SyncMode.FullSync });
             }
 
             var settings = settingsStore.Load();

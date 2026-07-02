@@ -191,6 +191,12 @@ static async Task<int> StreamTestAsync(string? localOverride, string? remoteOver
         await drive.DownloadAsync(NodeFromIdentity(identity), output, cancellationToken: ct).ConfigureAwait(false);
     });
 
+    // The temp-file spill cache lives under here (see CloudFilterPlaceholderEngine.HydrationConnection) —
+    // snapshot what's already there so we can tell OUR spill file apart from anything else on the
+    // machine, and prove it's cleaned up once the connection is disposed.
+    var hydrateTempDir = Path.Combine(Path.GetTempPath(), "PAWS-hydrate");
+    var tempFilesBefore = Directory.Exists(hydrateTempDir) ? Directory.GetFiles(hydrateTempDir).ToHashSet(StringComparer.OrdinalIgnoreCase) : [];
+
     var localFile = Path.Combine(localOverride, newName);
     Console.WriteLine("  reading the placeholder (streaming hydration)…");
     var ok = false;
@@ -200,6 +206,32 @@ static async Task<int> StreamTestAsync(string? localOverride, string? remoteOver
         var actual = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(read));
         ok = read.Length == payload.Length && string.Equals(actual, expected, StringComparison.Ordinal);
         Console.WriteLine($"  read {read.Length:N0} B, sha256 {actual[..16]}… → {(ok ? "MATCH" : "MISMATCH")}");
+
+        // The spill file backing this open should exist now — proves content landed on DISK, not in a
+        // growing in-memory buffer (the point of the byte-range/memory-bloat fix).
+        var spillFiles = Directory.Exists(hydrateTempDir)
+            ? Directory.GetFiles(hydrateTempDir).Where(f => !tempFilesBefore.Contains(f)).ToList()
+            : [];
+        var spillOk = spillFiles.Count == 1 && new FileInfo(spillFiles[0]).Length == payload.Length;
+        Console.WriteLine($"  spill file on disk: {(spillOk ? $"YES ({spillFiles.FirstOrDefault()})" : "NO / wrong size")}");
+        ok = ok && spillOk;
+
+        // A SECOND, mid-file byte-range read: once the platform has a range marked in-sync it may serve
+        // it straight from NTFS without calling our provider again, so this mainly guards against
+        // corruption in what got spilled to disk — genuine same-open overlapping requests (e.g. a
+        // thumbnail probe racing the real read, both hitting TransferRangeFromFile while the first
+        // download is still in flight) are what actually exercises the cache-hit path day to day.
+        const int rangeOffset = 3 * 1024 * 1024 + 777;
+        const int rangeLength = 65536;
+        using (var handle = File.OpenRead(localFile))
+        {
+            handle.Seek(rangeOffset, SeekOrigin.Begin);
+            var buffer = new byte[rangeLength];
+            var readCount = await handle.ReadAsync(buffer.AsMemory(0, rangeLength)).ConfigureAwait(false);
+            var rangeOk = readCount == rangeLength && buffer.AsSpan().SequenceEqual(payload.AsSpan(rangeOffset, rangeLength));
+            Console.WriteLine($"  second range read [{rangeOffset}, {rangeOffset + rangeLength}) from cache: {(rangeOk ? "MATCH" : "MISMATCH")}");
+            ok = ok && rangeOk;
+        }
     }
     catch (Exception ex)
     {
@@ -208,6 +240,11 @@ static async Task<int> StreamTestAsync(string? localOverride, string? remoteOver
 
     connection.Dispose();
     engine.UnregisterSyncRoot(localOverride);
+
+    // The spill file must not outlive the connection.
+    var leaked = Directory.Exists(hydrateTempDir) && Directory.GetFiles(hydrateTempDir).Any(f => !tempFilesBefore.Contains(f));
+    Console.WriteLine($"  spill file cleaned up after disconnect: {(!leaked ? "YES" : "NO — LEAKED")}");
+    ok = ok && !leaked;
 
     await using (var verify = await ConnectFromStoredAsync().ConfigureAwait(false))
     {
