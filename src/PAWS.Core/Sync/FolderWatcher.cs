@@ -53,6 +53,15 @@ public sealed class FolderWatcher : IDisposable
         _watcher.EnableRaisingEvents = true;
     }
 
+    /// <summary>
+    /// Arms the debounce as if a change had just been observed, so the callback runs once after the
+    /// quiet period (through the same non-reentrant pipeline as real events). Used when the watcher
+    /// starts, to catch changes made while it wasn't running — files added or edited while the app was
+    /// closed, or an upload cut short by an exit. A no-op change costs one reconcile that plans zero
+    /// operations.
+    /// </summary>
+    public void Poke() => Bump();
+
     private void OnFsEvent(object sender, FileSystemEventArgs e) => Bump();
 
     private void OnFsError(object sender, ErrorEventArgs e) => Bump();

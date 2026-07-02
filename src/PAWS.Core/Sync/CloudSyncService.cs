@@ -94,12 +94,21 @@ public sealed class CloudSyncService(
             };
             placeholderEngine.CreatePlaceholders(pair.LocalPath, rootSnapshot);
 
-            // Record the synced state for just what's materialized (the root) — a later SyncChangesAsync
-            // compares against this. It grows as folders are browsed and synced.
-            var localState = new LocalSnapshotBuilder().Capture(pair.LocalPath, GetPopulated(pair.Id), cancellationToken);
-            if (localState is not null)
+            // Record the adopt-everything baseline ONLY on true first-time setup (no saved state yet).
+            // On every later enable — i.e. every app launch — the existing baseline MUST survive: it is
+            // the only evidence of what was actually synced before, and rebuilding it from the current
+            // trees would bless whatever is on disk right now as "already uploaded". That exact bug hid
+            // files added or edited while the app was closed, and marked uploads that were cut short by
+            // an exit as complete (their new local size/mtime got adopted, so no change was ever
+            // detected — not even as a conflict). The catch-up push at auto-sync start reconciles any
+            // offline delta against the preserved baseline instead.
+            if (stateStore.Load(pair.Id) is null)
             {
-                stateStore.Save(SyncStateBuilder.Build(pair.Id, rootSnapshot, localState));
+                var localState = new LocalSnapshotBuilder().Capture(pair.LocalPath, GetPopulated(pair.Id), cancellationToken);
+                if (localState is not null)
+                {
+                    stateStore.Save(SyncStateBuilder.Build(pair.Id, rootSnapshot, localState));
+                }
             }
 
             var connection = placeholderEngine.Connect(pair.LocalPath, fetchChildren, CreateFetchCallback(accountId));
@@ -517,6 +526,7 @@ public sealed class CloudSyncService(
     /// </summary>
     public void StartAutoSync(string accountId, SyncPair pair)
     {
+        FolderWatcher watcher;
         lock (_watchers)
         {
             if (_disposed || _watchers.ContainsKey(pair.Id))
@@ -524,7 +534,7 @@ public sealed class CloudSyncService(
                 return;
             }
 
-            var watcher = new FolderWatcher(pair.LocalPath, async ct =>
+            watcher = new FolderWatcher(pair.LocalPath, async ct =>
             {
                 AutoSyncStarted?.Invoke(pair.Id);
                 try
@@ -544,6 +554,12 @@ public sealed class CloudSyncService(
 
             _watchers[pair.Id] = watcher;
         }
+
+        // Catch-up push: the watcher only sees LIVE events, so anything that happened while it wasn't
+        // running (files added/edited while the app was closed, an upload cut short by an exit) would
+        // otherwise sit unnoticed until the next local change. One poked run reconciles the current
+        // tree against the preserved baseline and pushes the delta — or plans nothing if there is none.
+        watcher.Poke();
 
         lock (_pullTimers)
         {

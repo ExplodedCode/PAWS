@@ -43,6 +43,7 @@ return mode switch
     "--removetest" or "removetest" => RemoveTest(localArg),
     "--popfailtest" or "popfailtest" => PopFailTest(localArg),
     "--conflicttest" or "conflicttest" => ConflictPlanSelfTest(),
+    "--relaunchtest" or "relaunchtest" => await RelaunchTestAsync(localArg, remoteArg),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
@@ -1020,6 +1021,160 @@ static int DirTest(string? localOverride, string? _)
 
     conn.Dispose();
     try { engine.UnregisterSyncRoot(localOverride); } catch { }
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// LIVE regression for changes made while the app is NOT running. Session 1 enables an on-demand pair
+// (baseline state) and hydrates a file, then shuts down — simulating the app closing. While "closed",
+// the file is edited and a brand-new file is added (no watcher is alive to see either). Session 2
+// re-enables (the app relaunching) and starts auto-sync; it must (a) NOT clobber the saved baseline
+// with an adopt-current-tree rebuild (the bug that marked interrupted/offline edits as already
+// uploaded, invisible even to conflict checks) and (b) run the catch-up push (watcher Poke) with no
+// live filesystem event, uploading both offline changes. `--relaunchtest <localFolder> <remoteParent>`.
+static async Task<int> RelaunchTestAsync(string? localOverride, string? remoteOverride)
+{
+    if (localOverride is null || remoteOverride is null)
+    {
+        Console.WriteLine("  x Usage: --relaunchtest <localFolder> <remoteParent>");
+        return 1;
+    }
+
+    var paths = new PawsPaths();
+    var account = new JsonSettingsStore(paths).Load().Accounts.FirstOrDefault();
+    if (account is null)
+    {
+        Console.WriteLine("  x No account configured.");
+        return 1;
+    }
+
+    var stamp = DateTime.UtcNow.ToString("HHmmss");
+    var testRoot = $"{remoteOverride.TrimEnd('/')}/_relaunchtest_{stamp}";
+    const string oldContent = "old content";
+    const string newContent = "NEW content, longer than the old one";
+    const string addedContent = "added while the app was closed";
+
+    // Build the remote side: a folder holding one file the pair will sync down as a placeholder.
+    await using (var setup = await ConnectFromStoredAsync().ConfigureAwait(false))
+    {
+        if (setup is null)
+        {
+            return 1;
+        }
+
+        var parent = await setup.ResolvePathAsync(remoteOverride).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"Remote parent not found: {remoteOverride}");
+        var folder = await setup.CreateFolderAsync(parent, $"_relaunchtest_{stamp}").ConfigureAwait(false);
+        using var content = new MemoryStream(Encoding.UTF8.GetBytes(oldContent));
+        await setup.UploadAsync(folder, "edited.txt", content).ConfigureAwait(false);
+    }
+
+    Console.WriteLine($"  built remote tree {testRoot}/ (edited.txt)\n");
+
+    Directory.CreateDirectory(localOverride);
+    var engine = new CloudFilterPlaceholderEngine();
+    var pair = new SyncPair { Id = $"relaunchtest{stamp}", LocalPath = localOverride, RemotePath = testRoot, Mode = SyncMode.OnDemand };
+    var editedPath = Path.Combine(localOverride, "edited.txt");
+    var addedPath = Path.Combine(localOverride, "added.txt");
+    var ok = true;
+
+    try
+    {
+        // ---- Session 1: the app before the close — enable (first-time baseline) and hydrate. ----
+        await using (var cloud1 = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1)))
+        {
+            await cloud1.EnableAsync(account.Id, pair);
+            var hydrated = File.ReadAllText(editedPath); // hydrate so the file is editable offline
+
+            // Browse the root once from a separate process (the Explorer flow): that marks the directory
+            // fully populated on disk, which is what lets files be created in it while no provider is
+            // running — the state a real user's folder is in when they add files with the app closed.
+            var (rootOk, rootNames) = EnumerateInSeparateProcess(localOverride);
+            Console.WriteLine($"  session 1: enabled, hydrated edited.txt ({hydrated.Length} B), browsed root ({(rootOk ? string.Join(", ", rootNames) : rootNames[0])}) — closing the app…");
+        }
+
+        // ---- While "closed": edit the synced file and add a brand-new one. No watcher sees this. ----
+        File.WriteAllText(editedPath, newContent);
+        File.WriteAllText(addedPath, addedContent);
+        Console.WriteLine("  while closed: edited edited.txt + created added.txt\n");
+
+        // ---- Session 2: the relaunch. ----
+        await using (var cloud2 = new CloudSyncService(engine, new ProtonDriveClientFactory(new DpapiSecretStore(paths)), new JsonSyncStateStore(paths), new JsonPopulatedFolderStore(paths), new SemaphoreSlim(1, 1)))
+        {
+            await cloud2.EnableAsync(account.Id, pair);
+
+            // (a) The baseline must be the PRE-close one — edited.txt's state entry still shows the old
+            // size. (The old clobber rebuilt it from the current tree, adopting the offline edit as
+            // "already uploaded".)
+            var state = new JsonSyncStateStore(paths).Load(pair.Id);
+            var entry = state?.Entries.FirstOrDefault(e => e.RelativePath == "edited.txt");
+            var preserved = entry is not null && entry.Size == Encoding.UTF8.GetByteCount(oldContent);
+            Console.WriteLine($"  session 2: baseline preserved across relaunch: {(preserved ? "YES" : $"NO (state size {entry?.Size?.ToString() ?? "-"})")}");
+            ok &= preserved;
+
+            // (b) StartAutoSync's catch-up poke must push both offline changes with NO live fs event.
+            var done = new TaskCompletionSource<AutoSyncEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+            cloud2.AutoSyncCompleted += e =>
+            {
+                if (e.PairId == pair.Id)
+                {
+                    done.TrySetResult(e);
+                }
+            };
+
+            cloud2.StartAutoSync(account.Id, pair);
+            var result = await done.Task.WaitAsync(TimeSpan.FromMinutes(3)).ConfigureAwait(false);
+            Console.WriteLine(result.Succeeded
+                ? $"  catch-up push: {result.Result!.Completed} applied, {result.Result.Skipped} skipped, {result.Result.Failures.Count} failed"
+                : $"  catch-up push FAILED: {result.Error!.Message}");
+            ok &= result.Succeeded && result.Result!.Completed >= 2 && result.Result.Failures.Count == 0;
+
+            cloud2.StopAutoSync(pair.Id);
+            cloud2.Disable(pair.Id);
+        }
+
+        // Verify on Drive with a fresh session: the new file arrived and the edit's new size landed.
+        await using (var verify = await ConnectFromStoredAsync().ConfigureAwait(false))
+        {
+            var snap = verify is null ? null : await new RemoteSnapshotBuilder(verify).CaptureAsync(testRoot).ConfigureAwait(false);
+            var added = snap?.Entries.FirstOrDefault(e => e.RelativePath == "added.txt");
+            var edited = snap?.Entries.FirstOrDefault(e => e.RelativePath == "edited.txt");
+            var addedOk = added is not null && added.Size == Encoding.UTF8.GetByteCount(addedContent);
+            var editedOk = edited is not null && edited.Size == Encoding.UTF8.GetByteCount(newContent);
+            Console.WriteLine($"  on Drive: added.txt uploaded: {(addedOk ? "YES" : "NO")}; edited.txt new revision: {(editedOk ? "YES" : "NO")}");
+            ok &= addedOk && editedOk;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  x Test error: {ex.GetType().Name}: {ex.Message}");
+        ok = false;
+    }
+    finally
+    {
+        try
+        {
+            engine.UnregisterSyncRoot(localOverride);
+        }
+        catch
+        {
+        }
+
+        new JsonSyncStateStore(paths).Clear(pair.Id);
+        new JsonPopulatedFolderStore(paths).Clear(pair.Id);
+
+        await using var cleanup = await ConnectFromStoredAsync().ConfigureAwait(false);
+        if (cleanup is not null)
+        {
+            var node = await cleanup.ResolvePathAsync(testRoot).ConfigureAwait(false);
+            if (node is not null)
+            {
+                await cleanup.TrashAsync(node).ConfigureAwait(false);
+                Console.WriteLine("\n  cleaned up the remote test tree.");
+            }
+        }
+    }
+
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
 }
