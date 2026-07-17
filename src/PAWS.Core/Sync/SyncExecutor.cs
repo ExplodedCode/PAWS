@@ -29,8 +29,15 @@ public delegate Task SyncGate(Func<CancellationToken, Task> action, Cancellation
 /// the folder locks up. Passing <paramref name="gate"/> lets the caller instead acquire/release its lock
 /// around each individual operation, freeing it between files so a pending request can get its turn.</para>
 /// </summary>
-public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? throttle = null)
+public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? throttle = null, IReadOnlyList<TimeSpan>? transientRetryDelays = null)
 {
+    // A transient network hiccup gets a couple of extra tries (short, then longer, backoff) before the
+    // operation is finally recorded as failed — see IsTransientNetworkFailure. Overridable (for tests
+    // only — production always uses this default) so a retry self-test doesn't need to wait ~13s/case.
+    private static readonly TimeSpan[] DefaultTransientRetryDelays = [TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(10)];
+
+    private readonly IReadOnlyList<TimeSpan> _transientRetryDelays = transientRetryDelays ?? DefaultTransientRetryDelays;
+
     public async Task<SyncResult> ExecuteAsync(
         string localRoot,
         RemoteNode remoteRoot,
@@ -117,12 +124,61 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
     }
 
     // Applies one operation, optionally serialized through the caller's gate instead of a lock the
-    // caller holds for the whole batch — see the class remarks on <paramref name="gate"/>.
-    private Task Gated(
+    // caller holds for the whole batch — see the class remarks on <paramref name="gate"/>. Retries a
+    // TRANSIENT failure (see IsTransientNetworkFailure) a bounded number of times; each attempt (and any
+    // wait between attempts) happens OUTSIDE the gate, so a retry backoff can't itself starve Explorer's
+    // callbacks the same way a long-held lock would.
+    private async Task Gated(
         SyncOperation op, string localRoot, Dictionary<string, RemoteNode> remoteFolders, SyncGate? gate, CancellationToken cancellationToken)
-        => gate is null
-            ? ApplyAsync(op, localRoot, remoteFolders, cancellationToken)
-            : gate(ct => ApplyAsync(op, localRoot, remoteFolders, ct), cancellationToken);
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                if (gate is null)
+                {
+                    await ApplyAsync(op, localRoot, remoteFolders, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await gate(ct => ApplyAsync(op, localRoot, remoteFolders, ct), cancellationToken).ConfigureAwait(false);
+                }
+
+                return;
+            }
+            catch (Exception ex) when (attempt < _transientRetryDelays.Count
+                && !cancellationToken.IsCancellationRequested
+                && IsTransientNetworkFailure(ex))
+            {
+                PawsLog.Write(
+                    $"Sync op transient failure, retrying ({attempt + 1}/{_transientRetryDelays.Count}): {op.Kind} \"{op.RelativePath}\"{Environment.NewLine}{ex}");
+                await Task.Delay(_transientRetryDelays[attempt], cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether an exception looks like an ordinary, short-lived network hiccup (a dropped connection, a
+    /// DNS blip, a stalled request) rather than a real data/logic problem retrying blindly can't fix (a
+    /// name collision, a conflict, a decryption/integrity failure). Matters most for a heavily
+    /// speed-limited transfer: the slower it moves, the longer it stays exposed to an ordinary blip that
+    /// a normal-speed transfer would sail past — without a retry, one such blip near the end of an
+    /// hours-long throttled upload would otherwise throw the whole thing away, when trying again a few
+    /// seconds later (safe: a retried upload takes over any stale draft the failed attempt left behind)
+    /// usually just works. <see cref="HttpRequestException"/> here specifically means the HTTP client
+    /// never got a response at all (a transport-level failure) — Proton's SDK reports actual API/server
+    /// error responses as its own typed exceptions, not this one, so this never masks a real error.
+    /// </summary>
+    private static bool IsTransientNetworkFailure(Exception ex) => ex switch
+    {
+        HttpRequestException => true,
+        TimeoutException => true,
+        System.Net.Sockets.SocketException => true,
+        // Broad, but the cost of a wrong guess is small: a couple of short waits before the same failure
+        // is reported anyway (e.g. a genuine local disk-full error won't be fixed by retrying it).
+        IOException => true,
+        _ => false,
+    };
 
     /// <summary>
     /// Translates a user's <see cref="ConflictResolution"/> for one conflicted path into the concrete

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,10 +27,19 @@ namespace PAWS
     {
         private MainWindow? _window;
         private readonly SemaphoreSlim _driveGate;
+        private readonly Microsoft.UI.Dispatching.DispatcherQueue _uiDispatcher;
+        private readonly HashSet<string> _sessionExpiredAccounts = new(StringComparer.Ordinal);
+        private readonly object _sessionExpiredLock = new();
 
         public App()
         {
             InitializeComponent();
+
+            // By construction this is the single instance for the session (Program.Main already bounced
+            // any second launch before constructing anything) — start listening for a FUTURE second
+            // launch to ask us to come to the foreground instead of starting its own copy.
+            _uiDispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            SingleInstanceGuard.ListenForActivation(() => _uiDispatcher.TryEnqueue(() => _window?.ShowFromTray()));
 
             Paths = new PawsPaths();
 
@@ -64,6 +74,26 @@ namespace PAWS
             // Builds a connected Proton Drive client for an account by resuming its stored session.
             DriveClientFactory = new ProtonDriveClientFactory(SecretStore);
 
+            // A dead refresh token means the user must sign in again — no automatic recovery is possible
+            // past that point. Detected lazily wherever it's next discovered (any pair's on-demand
+            // hydration/push/pull, a full-sync cycle), and can fire from a background thread and more
+            // than once for the same account (several sessions can be active for one account at once) —
+            // de-duplicated here so the user gets ONE notification per expiry, not one per sync path
+            // that happens to notice it; ClearSessionExpired re-arms it once they sign back in.
+            DriveClientFactory.SessionExpired += accountId =>
+            {
+                bool isNew;
+                lock (_sessionExpiredLock)
+                {
+                    isNew = _sessionExpiredAccounts.Add(accountId);
+                }
+
+                if (isNew)
+                {
+                    _uiDispatcher.TryEnqueue(() => AccountSessionExpired?.Invoke(accountId));
+                }
+            };
+
             // Shared across every Drive-touching service: the native crypto (proton_crypto.dll) is
             // process-global and not concurrency-safe, so on-demand hydration/push/pull and full-sync
             // plan/apply must all serialize on this one gate.
@@ -94,6 +124,26 @@ namespace PAWS
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
         public static App Instance => (App)Current;
+
+        /// <summary>
+        /// Raised (already marshalled to the UI thread) when an account's Proton session has expired and
+        /// needs the browser sign-in flow again — at most once per expiry per account (see the ctor
+        /// wiring). <see cref="MainWindow"/> shows a tray notification; <see cref="Views.HomePage"/>
+        /// refreshes so the account's card reflects it immediately if the window is already open.
+        /// </summary>
+        public event Action<string>? AccountSessionExpired;
+
+        /// <summary>
+        /// Re-arms expiry notifications for an account after it successfully signs in again — otherwise
+        /// a SECOND expiry later in the same app run would be silently swallowed by the de-dup guard.
+        /// </summary>
+        public void ClearSessionExpired(string accountId)
+        {
+            lock (_sessionExpiredLock)
+            {
+                _sessionExpiredAccounts.Remove(accountId);
+            }
+        }
 
         public PawsPaths Paths { get; }
 

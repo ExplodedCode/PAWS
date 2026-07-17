@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
 using PAWS.CloudFilter;
 using PAWS.Core.Configuration;
@@ -44,6 +45,11 @@ return mode switch
     "--popfailtest" or "popfailtest" => PopFailTest(localArg),
     "--conflicttest" or "conflicttest" => ConflictPlanSelfTest(),
     "--relaunchtest" or "relaunchtest" => await RelaunchTestAsync(localArg, remoteArg),
+    "--retrytest" or "retrytest" => await RetryTestAsync(),
+    "--singleinstancetest" or "singleinstancetest" => await SingleInstanceTestAsync(),
+    "--siprimary" or "siprimary" => SingleInstancePrimaryChild(),
+    "--sisecondary" or "sisecondary" => SingleInstanceSecondaryChild(),
+    "--reauthtest" or "reauthtest" => ReauthTest(),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
@@ -1214,6 +1220,229 @@ static async Task<int> RelaunchTestAsync(string? localOverride, string? remoteOv
 
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
+}
+
+// OFFLINE pure self-test (no Proton, no cfapi — a fake IProtonDriveClient) for SyncExecutor's transient-
+// network retry, reported live: a large, heavily speed-limited upload hit an HttpRequestException at
+// AuthorizationHandler.SendAsync partway through. Root cause understood from the vendored SDK source
+// (Proton.Drive.Sdk/Nodes/Upload/BlockUploader.cs): each 4 MiB block is fully encrypted+hashed from our
+// (throttled) source stream INTO MEMORY first, and only THEN sent over HTTP — so throttling doesn't
+// literally stall an in-flight HTTP request, but a heavily throttled multi-block/multi-hour transfer
+// spends far longer exposed to an ORDINARY short-lived network blip than a normal-speed one would, and
+// there was previously NO retry at the PAWS layer for that — one blip anywhere in the transfer discarded
+// the whole op until the next sync cycle. Verifies: (1) a transient failure (HttpRequestException) that
+// clears within the retry budget succeeds with nothing recorded as failed; (2) a transient failure that
+// NEVER clears is retried the bounded number of times, then correctly recorded as a failure; (3) a
+// NON-transient (data/logic) failure is NOT retried at all — fails on the very first attempt, since
+// retrying it can't help and would only delay reporting a real error. Uses near-zero retry delays (via
+// SyncExecutor's testable `transientRetryDelays` ctor param) so the whole test runs in well under a
+// second instead of the ~13s/case the production 3s+10s backoff would take. `--retrytest`.
+static async Task<int> RetryTestAsync()
+{
+    var ok = true;
+    void Case(string name, bool pass)
+    {
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}");
+        ok &= pass;
+    }
+
+    var root = Path.Combine(Path.GetTempPath(), "paws-retrytest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+        File.WriteAllText(Path.Combine(root, "a.txt"), "hello");
+        var uploadOp = new SyncOperation { Kind = SyncOperationKind.UploadFile, RelativePath = "a.txt", IsFolder = false };
+        var remoteRoot = new RemoteNode { Uid = "vol~root", Name = string.Empty, IsFolder = true };
+        var remoteSnapshot = new RemoteSnapshot { RootPath = "/", CapturedUtc = DateTimeOffset.UtcNow, Entries = new List<RemoteEntry>() };
+        var noDelay = new TimeSpan[] { TimeSpan.FromMilliseconds(5), TimeSpan.FromMilliseconds(5) };
+
+        {
+            var client = new FakeUploadClient(failCount: 2, () => new HttpRequestException("simulated transport failure"));
+            var executor = new SyncExecutor(client, transientRetryDelays: noDelay);
+            var result = await executor.ExecuteAsync(root, remoteRoot, remoteSnapshot, new List<SyncOperation> { uploadOp });
+            Case("transient failure x2 then success -> completes, nothing recorded as failed",
+                result.Completed == 1 && result.Failures.Count == 0 && client.Attempts == 3);
+        }
+
+        {
+            var client = new FakeUploadClient(failCount: int.MaxValue, () => new HttpRequestException("simulated transport failure"));
+            var executor = new SyncExecutor(client, transientRetryDelays: noDelay);
+            var result = await executor.ExecuteAsync(root, remoteRoot, remoteSnapshot, new List<SyncOperation> { uploadOp });
+            Case("persistent transient failure -> retried fully (3 attempts), then recorded as failed",
+                result.Completed == 0 && result.Failures.Count == 1 && client.Attempts == 3);
+        }
+
+        {
+            var client = new FakeUploadClient(failCount: int.MaxValue, () => new InvalidOperationException("simulated logic error"));
+            var executor = new SyncExecutor(client, transientRetryDelays: noDelay);
+            var result = await executor.ExecuteAsync(root, remoteRoot, remoteSnapshot, new List<SyncOperation> { uploadOp });
+            Case("non-transient failure -> NOT retried (1 attempt only)",
+                result.Completed == 0 && result.Failures.Count == 1 && client.Attempts == 1);
+        }
+    }
+    finally
+    {
+        Directory.Delete(root, recursive: true);
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE pure self-test (no Proton, no network) for ProtonDriveClientFactory's refresh-token-expiry
+// handling (TODO: "RefreshTokenExpired not auto-handled"). Reflects into the private HandleSessionExpired
+// method — the SAME code CreateAsync wires to the SDK's TokenCredential.RefreshTokenExpired event, not a
+// reimplementation; it's `private` only to avoid exposing internal plumbing publicly, and a real
+// end-to-end trigger would need an actual dead refresh token rejected by Proton's server, which isn't
+// something to safely provoke against the user's real account. Verifies: (1) the account's stored tokens
+// are cleared (HasResumableSession flips to false) so a LATER CreateAsync fails FAST with a clear
+// sign-in message instead of wasting a resume + first-call round trip on a token already known dead;
+// (2) the public SessionExpired event fires with the correct account id, exactly once. `--reauthtest`.
+static int ReauthTest()
+{
+    var ok = true;
+    void Case(string name, bool pass)
+    {
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}");
+        ok &= pass;
+    }
+
+    var store = new FakeSecretStore();
+    const string accountId = "acct-1";
+    store.SaveSecrets(accountId, new PAWS.Core.Security.ProtonSecrets
+    {
+        Username = "person@proton.me",
+        DataPassword = "pw",
+        SessionId = "sess-1",
+        AccessToken = "access-1",
+        RefreshToken = "refresh-1",
+        UserId = "user-1",
+    });
+
+    Case("fixture starts with a resumable session", store.LoadSecrets(accountId)?.HasResumableSession == true);
+
+    var factory = new ProtonDriveClientFactory(store);
+    string? raisedAccountId = null;
+    var raiseCount = 0;
+    factory.SessionExpired += id =>
+    {
+        raisedAccountId = id;
+        raiseCount++;
+    };
+
+    var handleExpired = typeof(ProtonDriveClientFactory).GetMethod("HandleSessionExpired", BindingFlags.NonPublic | BindingFlags.Instance)
+        ?? throw new InvalidOperationException("HandleSessionExpired not found on ProtonDriveClientFactory — did it get renamed?");
+    handleExpired.Invoke(factory, [accountId]);
+
+    var after = store.LoadSecrets(accountId);
+    Case("tokens cleared after expiry", after is not null && after.AccessToken is null && after.RefreshToken is null);
+    Case("HasResumableSession now false", after?.HasResumableSession == false);
+    Case("SessionExpired fired once with the right account id", raiseCount == 1 && raisedAccountId == accountId);
+
+    try
+    {
+        factory.CreateAsync(accountId).GetAwaiter().GetResult();
+        Case("CreateAsync after expiry throws (should never reach here)", false);
+    }
+    catch (InvalidOperationException ex)
+    {
+        Case("CreateAsync after expiry fails fast with a clear sign-in message",
+            ex.Message.Contains("sign in again", StringComparison.OrdinalIgnoreCase));
+    }
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// LIVE (spawns real child processes of ITSELF) verification of PAWS.SingleInstanceGuard — the actual
+// mechanism PAWS.exe uses to ensure only one process runs per session (a second launch must bounce
+// instead of spinning up duplicate sync engines/tray icon, which would race the same on-demand sync
+// roots and Drive client). Exercises the REAL class (linked source from PAWS/SingleInstanceGuard.cs, not
+// a copy) via two hidden child modes: --siprimary (becomes primary, waits to be activated) and
+// --sisecondary (tries to become primary once, reports the result, exits). Verifies: (1) a lone process
+// successfully becomes primary; (2) a SECOND process launched while the first is still running detects
+// it (SECONDARY) and exits quickly rather than sitting around; (3) the primary actually RECEIVES the
+// cross-process activation signal (proves the EventWaitHandle signaling works, not just Mutex
+// detection); (4) after the primary exits (its Mutex released with the process), a NEW process can
+// become primary again — no orphaned lock. `--singleinstancetest`.
+static async Task<int> SingleInstanceTestAsync()
+{
+    var exePath = Process.GetCurrentProcess().MainModule?.FileName
+        ?? throw new InvalidOperationException("Could not determine this process's own executable path.");
+
+    var ok = true;
+    void Case(string name, bool pass)
+    {
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}");
+        ok &= pass;
+    }
+
+    Process StartChild(string arg) => Process.Start(new ProcessStartInfo(exePath, arg)
+    {
+        RedirectStandardOutput = true,
+        UseShellExecute = false,
+    })!;
+
+    // Step 1: start the "primary" child and let it actually acquire the mutex + register its
+    // activation listener before racing a second process against it.
+    var primary = StartChild("--siprimary");
+    var primaryFirstLine = await primary.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    Case("lone process becomes PRIMARY", primaryFirstLine == "PRIMARY");
+    await Task.Delay(500); // give ListenForActivation's background thread time to actually start waiting
+
+    // Step 2: a second process launched while the primary is still running must detect it and bail —
+    // fast (it must NOT sit around running a whole second copy of the app).
+    var sw = Stopwatch.StartNew();
+    var secondary = StartChild("--sisecondary");
+    var secondaryLine = await secondary.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    secondary.WaitForExit(5000);
+    sw.Stop();
+    Case("second launch detects SECONDARY", secondaryLine == "SECONDARY");
+    Case("second launch exits quickly (<3s, no app spun up)", sw.ElapsedMilliseconds < 3000);
+
+    // Step 3: the primary must have been signalled by the secondary's launch and reacted — proves the
+    // cross-process EventWaitHandle activation actually fires, not just that the Mutex check works.
+    var primarySecondLine = await primary.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    primary.WaitForExit(5000);
+    Case("primary receives the activation signal", primarySecondLine == "ACTIVATED");
+
+    // Step 4: once the primary has exited (its Mutex released along with the process), a brand-new
+    // process must be able to become primary again — no orphaned lock left behind.
+    var successor = StartChild("--sisecondary");
+    var successorLine = await successor.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    successor.WaitForExit(5000);
+    Case("a new process becomes primary after the old one exits (no orphaned lock)", successorLine == "PRIMARY");
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// Hidden child mode for SingleInstanceTestAsync: becomes primary, registers the activation listener,
+// prints progress lines the orchestrator reads, and exits once activated (or after a bounded timeout so
+// a broken signaling path fails the test instead of hanging forever).
+static int SingleInstancePrimaryChild()
+{
+    if (!PAWS.SingleInstanceGuard.TryBecomePrimary())
+    {
+        Console.WriteLine("SECONDARY");
+        return 1;
+    }
+
+    Console.WriteLine("PRIMARY");
+
+    var activated = new ManualResetEventSlim(false);
+    PAWS.SingleInstanceGuard.ListenForActivation(() => activated.Set());
+
+    var wasActivated = activated.Wait(TimeSpan.FromSeconds(15));
+    Console.WriteLine(wasActivated ? "ACTIVATED" : "TIMED_OUT");
+    return wasActivated ? 0 : 1;
+}
+
+// Hidden child mode for SingleInstanceTestAsync: tries once to become primary and reports which.
+static int SingleInstanceSecondaryChild()
+{
+    Console.WriteLine(PAWS.SingleInstanceGuard.TryBecomePrimary() ? "PRIMARY" : "SECONDARY");
+    return 0;
 }
 
 // OFFLINE pure self-test (no Proton, no cfapi) for conflict-resolution planning: every conflict shape
@@ -2607,4 +2836,82 @@ static string FormatSize(long bytes)
     }
 
     return unit == 0 ? $"{bytes} B" : $"{size:0.#} {units[unit]}";
+}
+
+// Minimal in-memory ISecretStore test double for ReauthTest: no encryption, no disk — just enough for
+// ProtonDriveClientFactory to load/save a ProtonSecrets record. (Type declarations in a top-level-
+// statements file must come after every top-level statement/local function, hence living down here.)
+sealed class FakeSecretStore : PAWS.Core.Abstractions.ISecretStore
+{
+    private readonly Dictionary<string, PAWS.Core.Security.ProtonSecrets> _store = new();
+
+    public bool HasSecrets(string accountId) => _store.ContainsKey(accountId);
+
+    public void SaveSecrets(string accountId, PAWS.Core.Security.ProtonSecrets secrets) => _store[accountId] = secrets;
+
+    public PAWS.Core.Security.ProtonSecrets? LoadSecrets(string accountId) => _store.TryGetValue(accountId, out var s) ? s : null;
+
+    public void ClearSecrets(string accountId) => _store.Remove(accountId);
+}
+
+// Minimal IProtonDriveClient test double for RetryTestAsync: only UploadAsync does anything (fails
+// `failCount` times, then succeeds) — SyncExecutor's UploadFile path for a brand-new file (no existing
+// remote entry) only calls UploadAsync, so every other member is unused and throws if ever called.
+// (Type declarations in a top-level-statements file must come after every top-level statement/local
+// function, hence living down here rather than next to RetryTestAsync.)
+sealed class FakeUploadClient(int failCount, Func<Exception> exceptionFactory) : IProtonDriveClient
+{
+    public int Attempts { get; private set; }
+
+    public Task ConnectAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    public Task<RemoteNode> GetRootAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public Task<RemoteNode?> ResolvePathAsync(string remotePath, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public IAsyncEnumerable<RemoteNode> ListChildrenAsync(RemoteNode folder, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public Task DownloadAsync(RemoteNode file, Stream destination, IProgress<TransferProgress>? progress = null, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException();
+
+    public Task<RemoteNode> UploadAsync(
+        RemoteNode parentFolder,
+        string name,
+        Stream content,
+        DateTimeOffset? lastModifiedUtc = null,
+        IProgress<TransferProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        Attempts++;
+        if (Attempts <= failCount)
+        {
+            throw exceptionFactory();
+        }
+
+        return Task.FromResult(new RemoteNode
+        {
+            Uid = "vol~new", ParentUid = parentFolder.Uid, Name = name, IsFolder = false, RevisionUid = "vol~new~r1",
+        });
+    }
+
+    public Task<RemoteNode> UploadRevisionAsync(
+        RemoteNode existingFile,
+        Stream content,
+        DateTimeOffset? lastModifiedUtc = null,
+        IProgress<TransferProgress>? progress = null,
+        CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public Task<RemoteNode> CreateFolderAsync(RemoteNode parentFolder, string name, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException();
+
+    public Task RenameAsync(RemoteNode node, string newName, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public Task MoveAsync(RemoteNode node, RemoteNode newParent, string? nameAtDestination = null, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException();
+
+    public Task TrashAsync(RemoteNode node, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public Task<string?> GetWebUrlAsync(RemoteNode node, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

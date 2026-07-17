@@ -11,9 +11,12 @@ namespace PAWS.Proton.Drive;
 /// </summary>
 public sealed class ProtonDriveClientFactory(ISecretStore secretStore) : IProtonDriveClientFactory
 {
-    // Serializes the read-modify-write when persisting rotated tokens (the refresh event can fire on a
-    // background thread, and multiple clients may be active at once).
+    // Serializes the read-modify-write when persisting rotated (or cleared) tokens — the refresh/expiry
+    // events can fire on a background thread, and multiple clients for the same account may be active
+    // at once (on-demand + full-sync, or several sync pairs, each resuming their own session).
     private readonly object _persistLock = new();
+
+    public event Action<string>? SessionExpired;
 
     public async Task<IProtonDriveClient> CreateAsync(string accountId, CancellationToken cancellationToken = default)
     {
@@ -45,6 +48,11 @@ public sealed class ProtonDriveClientFactory(ISecretStore secretStore) : IProton
         apiSession.TokenCredential.TokensRefreshed += (accessToken, refreshToken)
             => PersistRotatedTokens(accountId, accessToken, refreshToken);
 
+        // The refresh token itself has been rejected as invalid (fires once the SDK actually attempts —
+        // and fails — a refresh; it does NOT poll ahead of time). No automatic recovery is possible past
+        // this point — the user must complete the browser sign-in flow again.
+        apiSession.TokenCredential.RefreshTokenExpired += () => HandleSessionExpired(accountId);
+
         var client = new ProtonDriveClientAdapter(apiSession);
         await client.ConnectAsync(cancellationToken).ConfigureAwait(false);
         return client;
@@ -64,5 +72,27 @@ public sealed class ProtonDriveClientFactory(ISecretStore secretStore) : IProton
             current.RefreshToken = refreshToken;
             secretStore.SaveSecrets(accountId, current);
         }
+    }
+
+    // Clears the dead tokens (so HasResumableSession correctly reports false and a NEXT CreateAsync
+    // fails immediately with a clear "sign in again" message, instead of wasting a resume + first-call
+    // round trip on a token already known not to work) and tells the app so it can prompt the user
+    // proactively rather than waiting for them to notice a cryptic sync failure.
+    private void HandleSessionExpired(string accountId)
+    {
+        lock (_persistLock)
+        {
+            var current = secretStore.LoadSecrets(accountId);
+            if (current is null)
+            {
+                return;
+            }
+
+            current.AccessToken = null;
+            current.RefreshToken = null;
+            secretStore.SaveSecrets(accountId, current);
+        }
+
+        SessionExpired?.Invoke(accountId);
     }
 }

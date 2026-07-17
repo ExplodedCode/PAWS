@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
 using Microsoft.UI.Windowing;
@@ -36,6 +37,11 @@ namespace PAWS
             AppWindow.Closing += OnClosing;
             TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
 
+            // Proactively tell the user when an account's Proton session has expired, rather than
+            // leaving them to notice a cryptic sync failure and connect the dots themselves — this is
+            // the one case that needs a notification even while the window is hidden in the tray.
+            App.Instance.AccountSessionExpired += OnAccountSessionExpired;
+
             // Set the tray image from a real .ico via the Icon property — H.NotifyIcon's XAML IconSource
             // (ms-appx URI) conversion path throws COMException 0x800C000E on every launch. Best-effort:
             // without an image the tray item still works (tooltip + menu).
@@ -68,6 +74,27 @@ namespace PAWS
         {
             AppWindow.Show();
             Activate();
+        }
+
+        // A Proton session's refresh token has expired — no automatic recovery is possible past this
+        // point, so tell the user right away (even if the window is hidden in the tray) rather than
+        // leaving them to notice a sync failure and connect the dots. Best-effort: a failed notification
+        // still leaves the account visibly flagged next time the window is opened (HomePage checks the
+        // account's stored session directly), so there's no silent dead end either way.
+        private void OnAccountSessionExpired(string accountId)
+        {
+            try
+            {
+                var account = App.Instance.SettingsStore.Load().Accounts.FirstOrDefault(a => a.Id == accountId);
+                var label = account?.Label ?? "Your Proton account";
+                TrayIcon.ShowNotification(
+                    "PAWS — sign-in required",
+                    $"{label}'s Proton session has expired. Open PAWS and use Options ▸ Sign in again to keep syncing.",
+                    H.NotifyIcon.Core.NotificationIcon.Warning);
+            }
+            catch
+            {
+            }
         }
 
         private void OnTrayOpen(object sender, RoutedEventArgs e) => ShowFromTray();

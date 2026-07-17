@@ -64,6 +64,7 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoPullCompleted += OnAutoPullCompleted;
             App.Instance.FullSync.SyncStarted += OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted += OnFullSyncCompleted;
+            App.Instance.AccountSessionExpired += OnAccountSessionExpired;
             Refresh();
         }
 
@@ -75,7 +76,13 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoPullCompleted -= OnAutoPullCompleted;
             App.Instance.FullSync.SyncStarted -= OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted -= OnFullSyncCompleted;
+            App.Instance.AccountSessionExpired -= OnAccountSessionExpired;
         }
+
+        // A Proton session expired while this page is open — refresh immediately so the affected
+        // account's card shows the "Sign-in required" banner without waiting for the user to navigate
+        // away and back. Fires off the UI thread's dispatcher already (see App's ctor wiring).
+        private void OnAccountSessionExpired(string accountId) => Refresh();
 
         private void Refresh()
         {
@@ -103,6 +110,12 @@ namespace PAWS.Views
 
         private Expander BuildAccountCard(ProtonAccount account)
         {
+            // Reflects the account's persisted session directly (rather than a separate in-memory flag)
+            // so it's correct on every Refresh regardless of WHY the session isn't resumable — a just-
+            // detected refresh-token expiry (see App.AccountSessionExpired) clears the stored tokens the
+            // same way, and a successful "Sign in again" clears this banner the moment the page refreshes.
+            var needsReauth = App.Instance.SecretStore.LoadSecrets(account.Id)?.HasResumableSession != true;
+
             var title = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
             title.Children.Add(new FontIcon { Glyph = "", FontSize = 14, Opacity = 0.8, VerticalAlignment = VerticalAlignment.Center }); // person
             title.Children.Add(new TextBlock
@@ -111,6 +124,18 @@ namespace PAWS.Views
                 VerticalAlignment = VerticalAlignment.Center,
                 FontWeight = FontWeights.SemiBold,
             });
+
+            if (needsReauth)
+            {
+                var cautionBrush = ThemeBrush("SystemFillColorCautionBrush") ?? new SolidColorBrush(Colors.Orange);
+                var warningIcon = new FontIcon { Glyph = "", FontSize = 14, VerticalAlignment = VerticalAlignment.Center, Foreground = cautionBrush };
+                var warningText = new TextBlock { Text = "Sign-in required", VerticalAlignment = VerticalAlignment.Center, Foreground = cautionBrush, FontSize = 12 };
+                var warning = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, VerticalAlignment = VerticalAlignment.Center };
+                warning.Children.Add(warningIcon);
+                warning.Children.Add(warningText);
+                ToolTipService.SetToolTip(warning, "This Proton session has expired -- sign in again to keep syncing.");
+                title.Children.Add(warning);
+            }
 
             var addFolder = new MenuFlyoutItem { Text = "Add folder…", Icon = new FontIcon { Glyph = "" } };
             addFolder.Click += async (_, _) => await AddFolderAsync(account);
@@ -129,12 +154,22 @@ namespace PAWS.Views
 
             var options = new DropDownButton { Content = "Options", Flyout = optionsFlyout, VerticalAlignment = VerticalAlignment.Center };
 
+            var headerActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+            if (needsReauth)
+            {
+                var signInNow = new Button { Content = "Sign in", Style = (Style)Application.Current.Resources["AccentButtonStyle"] };
+                signInNow.Click += async (_, _) => await ReSignInAsync(account);
+                headerActions.Children.Add(signInNow);
+            }
+
+            headerActions.Children.Add(options);
+
             var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch };
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             header.Children.Add(title);
-            Grid.SetColumn(options, 1);
-            header.Children.Add(options);
+            Grid.SetColumn(headerActions, 1);
+            header.Children.Add(headerActions);
 
             var content = new StackPanel { Spacing = 8 };
             if (account.SyncPairs.Count == 0)
@@ -1427,8 +1462,10 @@ namespace PAWS.Views
                         }
 
                         App.Instance.CreateSetupWorkflow().RefreshAccountSession(account.Id, result.Session!);
+                        App.Instance.ClearSessionExpired(account.Id); // re-arms notification for a LATER expiry
                         status.Text = $"✓ Signed in as {result.Session!.Username}. Session refreshed.";
                         dialog.CloseButtonText = "Done";
+                        Refresh(); // clears the "Sign-in required" banner immediately if it was showing
                     });
                 }
                 catch (OperationCanceledException)

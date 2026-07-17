@@ -15,4 +15,10 @@
     <ProjectReference Include="..\PAWS.Proton\PAWS.Proton.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Links the REAL single-instance guard from the WinUI app (not a copy) so the singleinstancetest
+         verb exercises the exact code PAWS.exe uses, without this pure-console harness needing WindowsAppSDK. -->
+    <Compile Include="..\..\PAWS\SingleInstanceGuard.cs" Link="SingleInstanceGuard.cs" />
+  </ItemGroup>
+
 </Project>
