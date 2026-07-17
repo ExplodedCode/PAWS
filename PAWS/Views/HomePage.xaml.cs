@@ -63,6 +63,7 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoPullStarted += OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted += OnAutoPullCompleted;
             App.Instance.CloudSync.DriveTimeout += OnDriveTimeout;
+            App.Instance.CloudSync.DriveSessionWedged += OnDriveSessionWedged;
             App.Instance.FullSync.SyncStarted += OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted += OnFullSyncCompleted;
             App.Instance.AccountSessionExpired += OnAccountSessionExpired;
@@ -76,6 +77,7 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoPullStarted -= OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted -= OnAutoPullCompleted;
             App.Instance.CloudSync.DriveTimeout -= OnDriveTimeout;
+            App.Instance.CloudSync.DriveSessionWedged -= OnDriveSessionWedged;
             App.Instance.FullSync.SyncStarted -= OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted -= OnFullSyncCompleted;
             App.Instance.AccountSessionExpired -= OnAccountSessionExpired;
@@ -88,6 +90,20 @@ namespace PAWS.Views
         private void OnDriveTimeout(string accountId, string pairId)
             => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, PairState.Attention,
                 "Couldn't reach Proton Drive — try Options ▸ Sign in again, or wait and retry."));
+
+        // Drive access is now permanently disabled for the rest of this run (see
+        // CloudSyncService.DriveSessionWedged's remarks) — unlike OnDriveTimeout, "wait and retry" is
+        // known NOT to help here, so every affected pair's status line should say so plainly. pairId is
+        // the specific pair whose call got stuck; every OTHER pair sharing the same Drive gate is equally
+        // unusable now, so reflect it everywhere rather than only on the one row that happened to detect it.
+        private void OnDriveSessionWedged(string accountId, string pairId)
+            => DispatcherQueue.TryEnqueue(() =>
+            {
+                foreach (var pid in _pairStatus.Keys.ToList())
+                {
+                    SetPairStatus(pid, PairState.Attention, "Proton Drive connection stuck — quit and reopen PAWS to recover.");
+                }
+            });
 
         // A Proton session expired while this page is open — refresh immediately so the affected
         // account's card shows the "Sign-in required" banner without waiting for the user to navigate
@@ -285,7 +301,7 @@ namespace PAWS.Views
                 var uri = new Uri("https://drive.proton.me/");
                 try
                 {
-                    var url = await App.Instance.CloudSync.GetWebUrlAsync(account.Id, pair.RemotePath);
+                    var url = await App.Instance.CloudSync.GetWebUrlAsync(account.Id, pair.RemotePath, pair.Id);
                     if (url is not null)
                     {
                         uri = new Uri(url);

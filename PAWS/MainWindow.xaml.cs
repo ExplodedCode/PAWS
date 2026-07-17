@@ -58,6 +58,7 @@ namespace PAWS
             // the one case that needs a notification even while the window is hidden in the tray.
             App.Instance.AccountSessionExpired += OnAccountSessionExpired;
             App.Instance.DriveTimedOut += OnDriveTimedOut;
+            App.Instance.DriveSessionWedged += OnDriveSessionWedged;
 
             // Set the tray image from a real .ico via the Icon property — H.NotifyIcon's XAML IconSource
             // (ms-appx URI) conversion path throws COMException 0x800C000E on every launch. Best-effort:
@@ -130,6 +131,24 @@ namespace PAWS
                 TrayIcon.ShowNotification(
                     "PAWS — connection trouble",
                     $"Couldn't reach Proton Drive for '{label}'. If this keeps happening, try Options ▸ Sign in again.",
+                    H.NotifyIcon.Core.NotificationIcon.Warning);
+            }
+            catch
+            {
+            }
+        }
+
+        // A Drive call never returned even after being cancelled (see CloudSyncService.DriveSessionWedged's
+        // remarks) — unlike OnDriveTimedOut, this is not a "maybe try again" nudge: Drive access is
+        // permanently unusable for the rest of THIS run, proven by the fact that letting the app keep
+        // waiting won't help. Fires at most once per process lifetime, so no cooldown needed here.
+        private void OnDriveSessionWedged(string accountId, string pairId)
+        {
+            try
+            {
+                TrayIcon.ShowNotification(
+                    "PAWS — restart needed",
+                    "PAWS's connection to Proton Drive got stuck and can't recover on its own. Quit and reopen PAWS to fix it.",
                     H.NotifyIcon.Core.NotificationIcon.Warning);
             }
             catch

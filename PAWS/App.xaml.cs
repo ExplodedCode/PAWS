@@ -149,6 +149,12 @@ namespace PAWS
                     _uiDispatcher.TryEnqueue(() => DriveTimedOut?.Invoke(accountId, pairId));
                 }
             };
+
+            // Drive access is now permanently disabled for the rest of this session (see
+            // CloudSyncService.DriveSessionWedged's remarks) — fires at most once per process lifetime, so
+            // no cooldown/de-dup needed the way DriveTimeout's tray balloon needs one.
+            CloudSync.DriveSessionWedged += (accountId, pairId) =>
+                _uiDispatcher.TryEnqueue(() => DriveSessionWedged?.Invoke(accountId, pairId));
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -181,6 +187,15 @@ namespace PAWS
         /// declaration that the session is dead (unlike <see cref="AccountSessionExpired"/>).
         /// </summary>
         public event Action<string, string>? DriveTimedOut;
+
+        /// <summary>
+        /// Raised (already marshalled to the UI thread, args: accountId, pairId) EXACTLY ONCE per process
+        /// lifetime, the first time a Drive call fails to return even after being cancelled — see
+        /// <see cref="CloudSyncService.DriveSessionWedged"/>. Unlike <see cref="DriveTimedOut"/>, this
+        /// means Drive access is now permanently unusable until PAWS is restarted, so the UI should say
+        /// that plainly rather than suggesting a retry.
+        /// </summary>
+        public event Action<string, string>? DriveSessionWedged;
 
         public PawsPaths Paths { get; }
 

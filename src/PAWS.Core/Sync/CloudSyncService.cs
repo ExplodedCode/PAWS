@@ -17,7 +17,8 @@ public sealed class CloudSyncService(
     ISyncStateStore stateStore,
     IPopulatedFolderStore populatedStore,
     SemaphoreSlim driveGate,
-    TransferThrottle? throttle = null) : IAsyncDisposable
+    TransferThrottle? throttle = null,
+    TimeSpan? driveMetadataCallTimeout = null) : IAsyncDisposable
 {
     // Stable provider identity for PAWS sync roots.
     private const string ProviderId = "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64";
@@ -54,6 +55,23 @@ public sealed class CloudSyncService(
     private readonly SemaphoreSlim _clientUseGate = driveGate;
     private bool _disposed;
 
+    // Bounds every "should always be fast" metadata call (single-folder listing, path resolve) that runs
+    // under _clientUseGate — see RunGatedDriveCallAsync's remarks for why a plain CancellationToken isn't
+    // enough on its own (observed live 2026-07-17: a stuck call can fail to honor cancellation at all).
+    // Overridable only so tests can exercise the watchdog firing without a real 60-second wait.
+    private readonly TimeSpan _driveMetadataCallTimeout = driveMetadataCallTimeout ?? TimeSpan.FromSeconds(60);
+
+    // Set (permanently, for the rest of this process's life) the first time RunGatedDriveCallAsync's
+    // watchdog fires — i.e. a Drive call didn't return even after we gave up waiting and cancelled it.
+    // Once true, _clientUseGate is NEVER released again on that abandoned call's behalf (it may still be
+    // running against the shared client/native crypto library in the background — releasing the gate
+    // and letting a NEW call proceed concurrently would risk exactly the native-crypto concurrency
+    // corruption documented elsewhere in this class), so every current and future gate-waiter must fail
+    // fast instead of queuing behind a lock that will never open again. _drivePoisonCts is what makes
+    // "fail fast" immediate for anyone already waiting, not just new callers.
+    private volatile bool _drivePoisoned;
+    private readonly CancellationTokenSource _drivePoisonCts = new();
+
     /// <summary>Raised (off the UI thread) when a watcher-triggered push for a pair begins.</summary>
     public event Action<string>? AutoSyncStarted;
 
@@ -75,6 +93,16 @@ public sealed class CloudSyncService(
     /// here — this is a nudge ("maybe try signing in again"), not a declaration that it's dead.
     /// </summary>
     public event Action<string, string>? DriveTimeout;
+
+    /// <summary>
+    /// Raised (off the UI thread, args: accountId, pairId) EXACTLY ONCE per process lifetime, the first
+    /// time a Drive metadata call fails to return even after being cancelled — see
+    /// <see cref="RunGatedDriveCallAsync{T}"/>. Unlike <see cref="DriveTimeout"/> (which can fire
+    /// repeatedly for an ordinary, possibly-transient wait), this means Drive access is now permanently
+    /// disabled for the rest of this session: restarting PAWS is the only recovery, so the message shown
+    /// for this should say that plainly rather than suggesting a retry.
+    /// </summary>
+    public event Action<string, string>? DriveSessionWedged;
 
     public bool IsSupported => placeholderEngine.IsSupported;
 
@@ -177,17 +205,16 @@ public sealed class CloudSyncService(
         {
             var client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
 
-            var entries = new List<RemoteEntry>();
-            await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
-            try
+            var entries = await RunGatedDriveCallAsync(accountId, pair.Id, $"listing '{remotePath}'", async innerCt =>
             {
-                var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false)
+                var list = new List<RemoteEntry>();
+                var folder = await client.ResolvePathAsync(remotePath, innerCt).ConfigureAwait(false)
                     ?? throw new InvalidOperationException($"Remote folder not found: {remotePath}");
 
-                await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+                await foreach (var child in client.ListChildrenAsync(folder, innerCt).ConfigureAwait(false))
                 {
                     var relativePath = string.IsNullOrEmpty(relativeFolder) ? child.Name : $"{relativeFolder}/{child.Name}";
-                    entries.Add(new RemoteEntry
+                    list.Add(new RemoteEntry
                     {
                         RelativePath = relativePath,
                         Name = child.Name,
@@ -199,11 +226,9 @@ public sealed class CloudSyncService(
                         RevisionUid = child.RevisionUid,
                     });
                 }
-            }
-            finally
-            {
-                _clientUseGate.Release();
-            }
+
+                return (IReadOnlyList<RemoteEntry>)list;
+            }, ct).ConfigureAwait(false);
 
             MarkPopulated(pair.Id, relativeFolder);
             return entries;
@@ -405,6 +430,88 @@ public sealed class CloudSyncService(
     }
 
     /// <summary>
+    /// Runs a single-folder-listing/path-resolve style Drive call — metadata only, never a file transfer
+    /// — under <see cref="_clientUseGate"/>, with a hard watchdog on top of the passed-in
+    /// <paramref name="cancellationToken"/> rather than trusting it alone.
+    /// <para><b>Why a plain cancellation token isn't enough:</b> every gated call already gets a
+    /// bounded token from its caller (e.g. <see cref="EnableAsync"/>'s/<c>PopulateAsync</c>'s own 60s
+    /// timeouts), and relying on the SDK call itself to notice that token and return promptly is exactly
+    /// what this method stops assuming. Confirmed live 2026-07-17: a stuck root-folder listing kept
+    /// failing every ~25-35s (Explorer's own retry cadence) with a bare
+    /// <c>OperationCanceledException: The operation was canceled</c> for MINUTES, while an out-of-process
+    /// probe against the very same account/session/folder resolved and listed in under a second — proving
+    /// the account and Drive session were fine, and the ALREADY-RUNNING PAWS process's own
+    /// <see cref="_clientUseGate"/> was never being released: something had acquired it and never
+    /// returned, so every later caller was really just waiting out ITS OWN budget for a lock that would
+    /// never open again, not genuinely retrying against Drive at all.</para>
+    /// <para><b>Why this races the call instead of just cancelling it:</b> once a call is holding the
+    /// gate and doesn't return, cancelling its token again changes nothing if it already isn't observing
+    /// that token — <see cref="Task.WhenAny(Task,Task)"/> against a hard timer is the only way to
+    /// guarantee OUR OWN code regains control. Doing so does NOT make it safe to let a new call proceed:
+    /// the abandoned task may still be running in the background, and this class's own remarks elsewhere
+    /// establish that the native crypto library (proton_crypto.dll) is process-global and corrupts state
+    /// under ANY concurrent use, even across what looks like two independent operations. So instead of
+    /// releasing the gate for someone else to use, the FIRST watchdog firing poisons it PERMANENTLY (see
+    /// <see cref="_drivePoisoned"/>) — every current and future caller then fails fast with a clear,
+    /// accurate message instead of each separately waiting up to their own timeout only to hit the exact
+    /// same generic cancellation, over and over, with no indication that waiting will never help.</para>
+    /// </summary>
+    private async Task<T> RunGatedDriveCallAsync<T>(
+        string accountId,
+        string pairId,
+        string operationDescription,
+        Func<CancellationToken, Task<T>> work,
+        CancellationToken cancellationToken)
+    {
+        if (_drivePoisoned)
+        {
+            throw new OperationCanceledException(
+                $"Proton Drive access is stuck in this session ({operationDescription}) — quit and reopen PAWS to recover.");
+        }
+
+        // Linked so a caller waiting for the gate unblocks immediately if some OTHER concurrent call
+        // poisons it while this one is still queued, instead of sitting out its own full budget first.
+        using var gateWait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _drivePoisonCts.Token);
+        await _clientUseGate.WaitAsync(gateWait.Token).ConfigureAwait(false);
+
+        using var callBound = new CancellationTokenSource(_driveMetadataCallTimeout);
+        using var callToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, callBound.Token);
+
+        var workTask = work(callToken.Token);
+        var winner = await Task.WhenAny(workTask, Task.Delay(_driveMetadataCallTimeout, CancellationToken.None))
+            .ConfigureAwait(false);
+
+        if (winner == workTask)
+        {
+            _clientUseGate.Release();
+            return await workTask.ConfigureAwait(false); // observes the real result, or rethrows the real failure
+        }
+
+        // The watchdog fired and the call STILL hasn't returned control, even though it was handed a
+        // token bound to this exact deadline — deliberately do NOT release the gate (see remarks above).
+        _drivePoisoned = true;
+        PawsLog.Write(
+            $"Proton Drive call appears permanently stuck ({operationDescription}, account '{accountId}', pair '{pairId}') " +
+            $"— did not return within {_driveMetadataCallTimeout.TotalSeconds:0}s even after cancellation. Drive access is now " +
+            "disabled for the rest of this session; restart PAWS to recover.");
+        DriveSessionWedged?.Invoke(accountId, pairId);
+        _drivePoisonCts.Cancel();
+
+        // Best-effort diagnostic: if the abandoned call eventually does complete on its own, log it — the
+        // only way to later tell a genuinely infinite hang apart from one that's merely very slow, without
+        // blocking on it now.
+        _ = workTask.ContinueWith(
+            t => PawsLog.Write(
+                $"Drive call abandoned as stuck ({operationDescription}) later {(t.IsFaulted ? $"failed: {t.Exception?.GetBaseException().GetType().Name}" : t.IsCanceled ? "was cancelled" : "actually completed")}, {DateTimeOffset.UtcNow:O}."),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        throw new OperationCanceledException(
+            $"Proton Drive access appears stuck in this session ({operationDescription}) — quit and reopen PAWS to recover.");
+    }
+
+    /// <summary>
     /// Pulls remote-side changes for an on-demand pair down into the local folder as placeholders — new
     /// remote files/folders appear as on-demand placeholders, files changed on Drive are reset to fresh
     /// placeholders (so the next open downloads the new content), and items deleted on Drive are removed
@@ -555,24 +662,20 @@ public sealed class CloudSyncService(
     /// it can't be determined. Uses the cached client, serialized on the shared drive gate like every
     /// other Drive read.
     /// </summary>
-    public async Task<string?> GetWebUrlAsync(string accountId, string remotePath, CancellationToken cancellationToken = default)
+    public async Task<string?> GetWebUrlAsync(string accountId, string remotePath, string? pairId = null, CancellationToken cancellationToken = default)
     {
         var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
-        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+
+        return await RunGatedDriveCallAsync(accountId, pairId ?? string.Empty, $"resolving web URL for '{remotePath}'", async innerCt =>
         {
-            var node = await client.ResolvePathAsync(remotePath, cancellationToken).ConfigureAwait(false);
+            var node = await client.ResolvePathAsync(remotePath, innerCt).ConfigureAwait(false);
             if (node is null)
             {
                 return null;
             }
 
-            return await client.GetWebUrlAsync(node, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            _clientUseGate.Release();
-        }
+            return await client.GetWebUrlAsync(node, innerCt).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     // Runs a read against a FRESH Drive session, holding the shared drive gate for the whole thing so it
@@ -1180,5 +1283,6 @@ public sealed class CloudSyncService(
         }
 
         _clients.Clear();
+        _drivePoisonCts.Dispose();
     }
 }
