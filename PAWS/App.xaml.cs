@@ -242,8 +242,10 @@ namespace PAWS
             _window = new MainWindow();
             _window.Activate();
 
-            // Keep the Windows sign-in autostart registration in line with the preference (best-effort).
-            StartupRegistration.Apply(settings.RunOnStartup);
+            // Fire-and-forget, NOT awaited: the packaged path (StartupTask.RequestEnableAsync) can show a
+            // one-time Windows consent prompt on first run, which would otherwise gate every startup step
+            // below on a human clicking it — background sync must never depend on that.
+            _ = StartupRegistration.ApplyAsync(settings.RunOnStartup);
 
             // Bring any On-demand folders online in the background (placeholders + hydration provider) —
             // the folders must work regardless; the app-wide switch only gates background auto-sync.

@@ -50,7 +50,7 @@ namespace PAWS.Views
         // One handler for all three behavior switches — they persist together. Run-on-startup applies to
         // the Windows registry right away; the other two are consulted where they act (window close,
         // app launch), so persisting is all they need.
-        private void OnBehaviorToggled(object sender, RoutedEventArgs e)
+        private async void OnBehaviorToggled(object sender, RoutedEventArgs e)
         {
             if (_loading)
             {
@@ -63,7 +63,7 @@ namespace PAWS.Views
             settings.AutoSyncOnLaunch = AutoSyncStartToggle.IsOn;
             App.Instance.SettingsStore.Save(settings);
 
-            StartupRegistration.Apply(settings.RunOnStartup);
+            await StartupRegistration.ApplyAsync(settings.RunOnStartup);
         }
 
         private void OnAutoDehydrateToggled(object sender, RoutedEventArgs e)
