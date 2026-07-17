@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Windows.Input;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
 using PAWS.Views;
 
 namespace PAWS
@@ -36,6 +37,21 @@ namespace PAWS
 
             AppWindow.Closing += OnClosing;
             TrayIcon.LeftClickCommand = new RelayCommand(ShowFromTray);
+
+            // Build the tray context menu in code with Command bindings (NOT XAML Click= handlers): the
+            // H.NotifyIcon flyout renders the items but does not reliably route their Click events to the
+            // code-behind — confirmed live 2026-07-17 (the menu showed "Open PAWS"/"Quit" but clicking
+            // either did nothing, and a diagnostic log line at the very top of each Click handler never
+            // wrote, proving the handlers were never entered). Commands work — same mechanism as
+            // LeftClickCommand above — because they don't depend on routed-event delivery through the
+            // flyout's popup. RelayCommand is defined at the bottom of this file.
+            var trayMenu = new MenuFlyout();
+            var openItem = new MenuFlyoutItem { Text = "Open PAWS", Command = new RelayCommand(OnTrayOpen) };
+            var quitItem = new MenuFlyoutItem { Text = "Quit", Command = new RelayCommand(OnTrayQuit) };
+            trayMenu.Items.Add(openItem);
+            trayMenu.Items.Add(new MenuFlyoutSeparator());
+            trayMenu.Items.Add(quitItem);
+            TrayIcon.ContextFlyout = trayMenu;
 
             // Proactively tell the user when an account's Proton session has expired, rather than
             // leaving them to notice a cryptic sync failure and connect the dots themselves — this is
@@ -121,13 +137,32 @@ namespace PAWS
             }
         }
 
-        private void OnTrayOpen(object sender, RoutedEventArgs e) => ShowFromTray();
-
-        private void OnTrayQuit(object sender, RoutedEventArgs e)
+        // Invoked via the tray menu item's Command (see ctor) — parameterless, not a RoutedEventHandler.
+        private void OnTrayOpen()
         {
+            PAWS.Core.Diagnostics.PawsLog.Write("Tray menu: Open invoked.");
+            ShowFromTray();
+        }
+
+        private void OnTrayQuit()
+        {
+            PAWS.Core.Diagnostics.PawsLog.Write("Tray menu: Quit invoked.");
             _allowClose = true;
             TrayIcon.Dispose();
             Close();
+            Application.Current.Exit();
+
+            // Application.Exit() alone is NOT sufficient here — confirmed live: with only the two calls
+            // above, the process stayed alive and responding (Get-Process showed it running long after
+            // "Quit" was clicked, and a second attempt still needed Task Manager to actually end it).
+            // Something outside the normal WinUI lifecycle — most likely H.NotifyIcon's own native
+            // message-pump window/hook, which TrayIcon.Dispose() may not fully release synchronously —
+            // keeps the process alive past Application.Exit()'s graceful shutdown path. Environment.Exit
+            // is the only thing that reliably ends it. Safe here: the app is already built to tolerate
+            // abrupt termination as a normal occurrence, not an edge case (see the "STARTUP CRASH after
+            // force-close mid-upload" fix and the offline-changes catch-up-push logic elsewhere — both
+            // exist specifically because abrupt process death was already expected, not new risk this adds).
+            Environment.Exit(0);
         }
 
         private void OnClosing(AppWindow sender, AppWindowClosingEventArgs e)

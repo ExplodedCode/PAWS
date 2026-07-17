@@ -37,16 +37,12 @@
         <!-- Notification-area (tray) icon. Keeps PAWS reachable while it runs in the background.
              The image is set in code (TrayIcon.Icon, from Assets\PAWS.ico): H.NotifyIcon's IconSource
              ms-appx conversion throws COMException 0x800C000E at every startup. -->
+        <!-- The context menu is built in code-behind (see MainWindow ctor) with Command bindings rather
+             than XAML Click= handlers: H.NotifyIcon's flyout does not reliably route MenuFlyoutItem.Click
+             to the code-behind (confirmed live 2026-07-17 — the menu rendered but neither Open nor Quit
+             fired), whereas Command binding works (same path as the icon's LeftClickCommand). -->
         <tb:TaskbarIcon
             x:Name="TrayIcon"
-            ToolTipText="PAWS — Proton Drive sync">
-            <tb:TaskbarIcon.ContextFlyout>
-                <MenuFlyout>
-                    <MenuFlyoutItem Text="Open PAWS" Click="OnTrayOpen" />
-                    <MenuFlyoutSeparator />
-                    <MenuFlyoutItem Text="Quit" Click="OnTrayQuit" />
-                </MenuFlyout>
-            </tb:TaskbarIcon.ContextFlyout>
-        </tb:TaskbarIcon>
+            ToolTipText="PAWS — Proton Drive sync" />
     </Grid>
 </Window>

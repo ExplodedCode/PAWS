@@ -59,6 +59,7 @@ return mode switch
     "--shellreg" or "shellreg" => await ShellRegCheckAsync(localArg),
     "--shellquery" or "shellquery" => await ShellQueryAsync(localArg),
     "--shellfix" or "shellfix" => await ShellFixAsync(localArg),
+    "--cleanupsyncroots" or "cleanupsyncroots" => CleanupSyncRoots(pathArg),
     "--deltest" or "deltest" => await DeleteConsistencyTestAsync(localArg, remoteArg),
     "--freshpoll" or "freshpoll" => await FreshClientPollTestAsync(pathArg),
     "--unregister" or "unregister" => Unregister(localArg),
@@ -590,6 +591,67 @@ static async Task<int> ShellFixAsync(string? localOverride)
     var engine = new CloudFilterPlaceholderEngine();
     engine.RegisterSyncRoot(new SyncRootInfo(localOverride, "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64", "PAWS", "1.0.0.0"));
     return await ShellQueryAsync(localOverride);
+}
+
+// Maintenance utility: enumerates every shell-registered PAWS sync root (system-wide, current user — this
+// is exactly what populates the "PAWS - {folder}" entries in Explorer's sidebar) and unregisters every one
+// EXCEPT the one whose leaf name matches keepLeaf. Built to clean up the orphaned test-folder registrations
+// this harness's various --pushtest/--hydrate/--lazytest/etc. runs accumulate over time (each registers its
+// own sync root; not every run's cleanup path runs, e.g. a crashed/killed test, or an unregister that only
+// removed the Win32 registration but not the shell one) — most of the underlying temp folders no longer
+// exist on disk, but the shell registration is independent of the folder existing. Only ever touches ids
+// starting with PAWS's own provider GUID, so another app's sync root (OneDrive, Proton's official client if
+// installed, etc.) is never at risk. Enumerates via the registry directly (HKLM\...\SyncRootManager) rather
+// than StorageProviderSyncRootManager.GetCurrentSyncRoots() — that call returned 0 results for this
+// unpackaged caller even though 21 real registrations existed (confirmed against the registry), so it
+// appears to filter by caller identity in a way that doesn't work for us; still removes via the proper
+// WinRT Unregister(id) API (not a raw registry delete) so the shell's own cleanup (e.g. clearing dehydrated
+// placeholders) still runs. `--cleanupsyncroots <leafNameToKeep>` (e.g. `Sync` for `PAWS - Sync`).
+static int CleanupSyncRoots(string? keepLeafArg)
+{
+    var keepLeaf = string.IsNullOrWhiteSpace(keepLeafArg) || keepLeafArg == "/" ? "Sync" : keepLeafArg;
+    const string ProviderIdPrefix = "30d8b2a4-6f1e-4c93-9c2a-1f7b5e0d3a64!";
+
+    using var syncRootManagerKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager");
+    var ids = syncRootManagerKey?.GetSubKeyNames().Where(id => id.StartsWith(ProviderIdPrefix, StringComparison.Ordinal)).ToList()
+        ?? [];
+
+    Console.WriteLine($"  Found {ids.Count} PAWS-registered sync root(s); keeping leaf '{keepLeaf}', removing every other one.\n");
+
+    var kept = 0;
+    var removed = 0;
+    var errors = 0;
+    foreach (var id in ids)
+    {
+        using var entryKey = syncRootManagerKey!.OpenSubKey(id);
+        var displayName = entryKey?.GetValue("DisplayNameResource") as string ?? id;
+        var leaf = displayName.Contains(" - ", StringComparison.Ordinal)
+            ? displayName[(displayName.IndexOf(" - ", StringComparison.Ordinal) + 3)..]
+            : displayName;
+
+        if (string.Equals(leaf, keepLeaf, StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"  [KEEP]    {displayName}  (id: {id})");
+            kept++;
+            continue;
+        }
+
+        try
+        {
+            Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(id);
+            Console.WriteLine($"  [REMOVED] {displayName}");
+            removed++;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [ERROR]   {displayName}: {ex.Message}");
+            errors++;
+        }
+    }
+
+    Console.WriteLine($"\n  kept={kept} removed={removed} errors={errors}");
+    return errors == 0 ? 0 : 1;
 }
 
 // READ-ONLY: prints what the shell has recorded for an existing sync root (no changes made).
