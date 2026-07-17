@@ -62,6 +62,7 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoSyncCompleted += OnAutoSyncCompleted;
             App.Instance.CloudSync.AutoPullStarted += OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted += OnAutoPullCompleted;
+            App.Instance.CloudSync.DriveTimeout += OnDriveTimeout;
             App.Instance.FullSync.SyncStarted += OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted += OnFullSyncCompleted;
             App.Instance.AccountSessionExpired += OnAccountSessionExpired;
@@ -74,10 +75,19 @@ namespace PAWS.Views
             App.Instance.CloudSync.AutoSyncCompleted -= OnAutoSyncCompleted;
             App.Instance.CloudSync.AutoPullStarted -= OnAutoPullStarted;
             App.Instance.CloudSync.AutoPullCompleted -= OnAutoPullCompleted;
+            App.Instance.CloudSync.DriveTimeout -= OnDriveTimeout;
             App.Instance.FullSync.SyncStarted -= OnFullSyncStarted;
             App.Instance.FullSync.SyncCompleted -= OnFullSyncCompleted;
             App.Instance.AccountSessionExpired -= OnAccountSessionExpired;
         }
+
+        // A Drive call timed out for this pair (root listing at enable-time, or a live folder browse) —
+        // reflects it on the pair's own status line immediately, every time (unlike the app-level tray
+        // notification, this isn't throttled: it's just showing current state, the same as any other
+        // SetPairStatus call, not popping up a new alert each time).
+        private void OnDriveTimeout(string accountId, string pairId)
+            => DispatcherQueue.TryEnqueue(() => SetPairStatus(pairId, PairState.Attention,
+                "Couldn't reach Proton Drive — try Options ▸ Sign in again, or wait and retry."));
 
         // A Proton session expired while this page is open — refresh immediately so the affected
         // account's card shows the "Sign-in required" banner without waiting for the user to navigate
@@ -407,6 +417,10 @@ namespace PAWS.Views
                 flyout.Items.Add(syncNow);
             }
 
+            var speedLimit = new MenuFlyoutItem { Text = "Speed limit for this folder…", Icon = new FontIcon { Glyph = "" } };
+            speedLimit.Click += async (_, _) => await SpeedLimitDialogAsync(account, pair);
+            flyout.Items.Add(speedLimit);
+
             flyout.Items.Add(new MenuFlyoutSeparator());
 
             var remove = new MenuFlyoutItem { Text = "Stop syncing this folder…", Icon = new FontIcon { Glyph = "" } };
@@ -457,6 +471,90 @@ namespace PAWS.Views
 
             await dialog.ShowAsync();
         }
+
+        /// <summary>
+        /// Lets the user override the app-wide upload/download speed limit for just this folder (e.g.
+        /// slow down one heavy backup folder without throttling everything else, or exempt one folder
+        /// from an otherwise-capped app-wide limit). Persists via <see cref="SetupWorkflow.SetPairSpeedLimits"/>.
+        /// </summary>
+        private async Task SpeedLimitDialogAsync(ProtonAccount account, SyncPair pair)
+        {
+            var settings = App.Instance.SettingsStore.Load();
+
+            var (uploadPanel, uploadCombo, uploadBox) = BuildSpeedLimitControl("Upload speed", pair.UploadLimitKBps, settings.UploadLimitKBps);
+            var (downloadPanel, downloadCombo, downloadBox) = BuildSpeedLimitControl("Download speed", pair.DownloadLimitKBps, settings.DownloadLimitKBps);
+
+            var panel = new StackPanel { Spacing = 16, MinWidth = 380 };
+            panel.Children.Add(uploadPanel);
+            panel.Children.Add(downloadPanel);
+
+            var dialog = new ContentDialog
+            {
+                Title = $"Speed limit — {FolderDisplayName(pair.LocalPath)}",
+                Content = panel,
+                PrimaryButtonText = "Save",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = XamlRoot,
+            };
+
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            var newUpload = ResolveSpeedLimitSelection(uploadCombo, uploadBox);
+            var newDownload = ResolveSpeedLimitSelection(downloadCombo, downloadBox);
+
+            App.Instance.CreateSetupWorkflow().SetPairSpeedLimits(account.Id, pair.Id, newUpload, newDownload);
+            pair.UploadLimitKBps = newUpload;
+            pair.DownloadLimitKBps = newDownload;
+        }
+
+        /// <summary>
+        /// Builds one "Upload speed"/"Download speed" section for <see cref="SpeedLimitDialogAsync"/>: a
+        /// 3-way ComboBox (use the app-wide setting / no limit for this folder / a custom KB/s value) plus
+        /// a NumberBox that only matters for "Custom". Mirrors <see cref="SyncPair.UploadLimitKBps"/>'s
+        /// convention (null=inherit, 0=explicit unlimited, positive=custom) so <see
+        /// cref="ResolveSpeedLimitSelection"/> can map the selection straight back to it.
+        /// </summary>
+        private static (StackPanel Panel, ComboBox Combo, NumberBox Box) BuildSpeedLimitControl(string label, int? pairValue, int? appWideValue)
+        {
+            var combo = new ComboBox { Header = label, HorizontalAlignment = HorizontalAlignment.Stretch };
+            combo.Items.Add(new ComboBoxItem
+            {
+                Content = appWideValue is { } kbps ? $"Use the app-wide setting ({kbps} KB/s)" : "Use the app-wide setting (unlimited)",
+            });
+            combo.Items.Add(new ComboBoxItem { Content = "No limit for this folder" });
+            combo.Items.Add(new ComboBoxItem { Content = "Custom limit for this folder" });
+
+            var box = new NumberBox
+            {
+                Header = "KB/s",
+                Minimum = 16,
+                SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact,
+                Margin = new Thickness(0, 4, 0, 0),
+                Value = pairValue is > 0 ? pairValue.Value : 1024,
+            };
+
+            combo.SelectedIndex = pairValue switch { null => 0, 0 => 1, _ => 2 };
+            box.IsEnabled = combo.SelectedIndex == 2;
+            combo.SelectionChanged += (_, _) => box.IsEnabled = combo.SelectedIndex == 2;
+
+            var panel = new StackPanel { Spacing = 0 };
+            panel.Children.Add(combo);
+            panel.Children.Add(box);
+            return (panel, combo, box);
+        }
+
+        // Maps a BuildSpeedLimitControl selection back to the SyncPair.UploadLimitKBps/DownloadLimitKBps
+        // convention: index 0 = inherit (null), 1 = explicit unlimited (0), 2 = the NumberBox's value.
+        private static int? ResolveSpeedLimitSelection(ComboBox combo, NumberBox box) => combo.SelectedIndex switch
+        {
+            1 => 0,
+            2 => double.IsNaN(box.Value) || box.Value < 16 ? 1024 : (int)box.Value,
+            _ => null,
+        };
 
         // ---- Conflict resolution ----------------------------------------------------------------------
 

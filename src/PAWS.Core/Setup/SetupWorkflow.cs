@@ -122,6 +122,23 @@ public sealed class SetupWorkflow
         _settings.Save(settings);
     }
 
+    /// <summary>Updates a folder mapping's per-pair speed-limit overrides (see <see cref="SyncPair.UploadLimitKBps"/>) and persists them.</summary>
+    public void SetPairSpeedLimits(string accountId, string pairId, int? uploadLimitKBps, int? downloadLimitKBps)
+    {
+        var settings = _settings.Load();
+        var pair = settings.Accounts
+            .FirstOrDefault(a => a.Id == accountId)?.SyncPairs
+            .FirstOrDefault(p => p.Id == pairId);
+        if (pair is null)
+        {
+            return;
+        }
+
+        pair.UploadLimitKBps = uploadLimitKBps;
+        pair.DownloadLimitKBps = downloadLimitKBps;
+        _settings.Save(settings);
+    }
+
     /// <summary>Removes a single folder mapping from an account.</summary>
     public void RemoveSyncPair(string accountId, string pairId)
     {

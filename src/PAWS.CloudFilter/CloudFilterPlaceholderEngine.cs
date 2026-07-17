@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 using PAWS.Core.Sync;
 using Vanara.Extensions;
@@ -664,6 +665,17 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             _ = Task.Run(() => PopulateAsync(operation, relativeFolder));
         }
 
+        // A folder listing is one lightweight metadata call — it should never legitimately take long.
+        // Nothing on this path times out on its own (ProviderHeartbeat only pings cfapi so IT doesn't give
+        // up; it never gives up itself), so a stuck/degraded Drive session previously hung this forever —
+        // wedging Explorer's entire browse of the folder (and, since a shell-registered root's provider
+        // integration runs in Explorer's process, potentially the whole window) until PAWS was closed,
+        // which force-tears-down the connection and is the only thing that ever unblocked it. Confirmed
+        // live 2026-07-17: an independent, unrelated harness call (no cfapi, no Explorer, a fresh process)
+        // hung identically on a plain Drive listing — the hang is in the Drive session/transport, not this
+        // code — but PAWS still owes callers a bounded wait instead of propagating that hang forever.
+        private const int ListingTimeoutSeconds = 60;
+
         private async Task PopulateAsync(CF_OPERATION_INFO operation, string relativeFolder)
         {
             if (_disposed)
@@ -677,16 +689,20 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             using var heartbeat = new ProviderHeartbeat(operation);
 
             // The network listing runs outside the gate so it doesn't block hydration; a listing failure
-            // reports the enumeration as failed (and leaves on-demand population ON) so a re-browse retries
-            // rather than caching an empty folder.
+            // (including a timeout) reports the enumeration as failed (and leaves on-demand population ON)
+            // so a re-browse retries rather than caching an empty folder.
             IReadOnlyList<RemoteEntry> children;
             var populated = true;
             try
             {
-                children = await _fetchChildren(relativeFolder, CancellationToken.None).ConfigureAwait(false);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(ListingTimeoutSeconds));
+                children = await _fetchChildren(relativeFolder, timeout.Token).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
+                // Previously silent — a stuck listing left no trace at all. Logged so a recurrence is
+                // visible in the log instead of only inferable from "Explorer hung again".
+                PawsLog.Write($"On-demand folder listing timed out or failed for '{relativeFolder}': {ex.GetType().Name}: {ex.Message}");
                 children = [];
                 populated = false;
             }

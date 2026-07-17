@@ -30,6 +30,12 @@ namespace PAWS
         private readonly Microsoft.UI.Dispatching.DispatcherQueue _uiDispatcher;
         private readonly HashSet<string> _sessionExpiredAccounts = new(StringComparer.Ordinal);
         private readonly object _sessionExpiredLock = new();
+        private readonly Dictionary<string, DateTime> _lastDriveTimeoutNotified = new(StringComparer.Ordinal);
+        private readonly object _driveTimeoutLock = new();
+
+        // A stuck/degraded session can time out repeatedly (every periodic pull, every folder browse) —
+        // one tray balloon per pair per cooldown window is a useful nudge; one per occurrence would spam.
+        private static readonly TimeSpan DriveTimeoutNotifyCooldown = TimeSpan.FromMinutes(10);
 
         public App()
         {
@@ -120,6 +126,29 @@ namespace PAWS
 
             // Automatic two-way sync for Full-sync pairs (over the shared SyncEngine).
             FullSync = new FullSyncService(SyncEngine);
+
+            // A Drive call timed out rather than completing (see CloudSyncService.DriveTimeout's remarks)
+            // — nudge the user toward re-authenticating without declaring the session dead (that's
+            // SessionExpired's job, on an actual rejection from Proton). Throttled per pair so a
+            // persistent or repeated timeout doesn't produce a tray balloon every single time it happens.
+            CloudSync.DriveTimeout += (accountId, pairId) =>
+            {
+                var notify = false;
+                lock (_driveTimeoutLock)
+                {
+                    var now = DateTime.UtcNow;
+                    if (!_lastDriveTimeoutNotified.TryGetValue(pairId, out var last) || now - last > DriveTimeoutNotifyCooldown)
+                    {
+                        _lastDriveTimeoutNotified[pairId] = now;
+                        notify = true;
+                    }
+                }
+
+                if (notify)
+                {
+                    _uiDispatcher.TryEnqueue(() => DriveTimedOut?.Invoke(accountId, pairId));
+                }
+            };
         }
 
         /// <summary>Convenience accessor for the strongly-typed application instance.</summary>
@@ -144,6 +173,14 @@ namespace PAWS
                 _sessionExpiredAccounts.Remove(accountId);
             }
         }
+
+        /// <summary>
+        /// Raised (already marshalled to the UI thread, args: accountId, pairId; throttled per pair — see
+        /// the ctor wiring) when a Drive call timed out instead of completing. <see cref="MainWindow"/>
+        /// shows a tray notification suggesting the user try signing in again — a nudge, not a
+        /// declaration that the session is dead (unlike <see cref="AccountSessionExpired"/>).
+        /// </summary>
+        public event Action<string, string>? DriveTimedOut;
 
         public PawsPaths Paths { get; }
 
@@ -305,9 +342,13 @@ namespace PAWS
                             CloudSync.StartAutoSync(account.Id, pair);
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Surfaced when the user opens the folder card and clicks "Set up on-demand".
+                        // Surfaced when the user opens the folder card and clicks "Set up on-demand". Was
+                        // previously silent even for a real failure (e.g. EnableAsync's listing timeout) —
+                        // logged so a launch-time enable failure leaves a trace instead of just an
+                        // unexplained "provider exited unexpectedly" the next time Explorer touches it.
+                        PawsLog.Write($"Enabling on-demand sync for pair '{pair.Id}' ({pair.LocalPath}) failed at launch: {ex.GetType().Name}: {ex.Message}");
                     }
                 }
             }

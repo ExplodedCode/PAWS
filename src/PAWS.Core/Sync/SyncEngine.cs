@@ -63,7 +63,7 @@ public sealed class SyncEngine(
 
         try
         {
-            var executor = new SyncExecutor(client, throttle);
+            var executor = new SyncExecutor(client, throttle, pairUploadLimitKBps: plan.Pair.UploadLimitKBps, pairDownloadLimitKBps: plan.Pair.DownloadLimitKBps);
 
             // Gated PER OPERATION (see SyncExecutor's remarks on `gate`) rather than one lock held across
             // the whole apply: a large/slow sync (many files, or one big one under a low speed limit)

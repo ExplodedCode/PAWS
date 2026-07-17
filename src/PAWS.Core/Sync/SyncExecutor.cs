@@ -29,7 +29,12 @@ public delegate Task SyncGate(Func<CancellationToken, Task> action, Cancellation
 /// the folder locks up. Passing <paramref name="gate"/> lets the caller instead acquire/release its lock
 /// around each individual operation, freeing it between files so a pending request can get its turn.</para>
 /// </summary>
-public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? throttle = null, IReadOnlyList<TimeSpan>? transientRetryDelays = null)
+public sealed class SyncExecutor(
+    IProtonDriveClient client,
+    TransferThrottle? throttle = null,
+    IReadOnlyList<TimeSpan>? transientRetryDelays = null,
+    int? pairUploadLimitKBps = null,
+    int? pairDownloadLimitKBps = null)
 {
     // A transient network hiccup gets a couple of extra tries (short, then longer, backoff) before the
     // operation is finally recorded as failed — see IsTransientNetworkFailure. Overridable (for tests
@@ -348,11 +353,11 @@ public sealed class SyncExecutor(IProtonDriveClient client, TransferThrottle? th
         }
     }
 
-    // Apply the app-wide speed limits (when configured) to the streams a transfer actually moves bytes
-    // through: uploads read from the local file, downloads write to the temp file.
-    private Stream ThrottledRead(Stream source) => throttle?.WrapUploadSource(source) ?? source;
+    // Apply the app-wide (or this pair's overriding) speed limits to the streams a transfer actually
+    // moves bytes through: uploads read from the local file, downloads write to the temp file.
+    private Stream ThrottledRead(Stream source) => throttle?.WrapUploadSource(source, pairUploadLimitKBps) ?? source;
 
-    private Stream ThrottledWrite(Stream destination) => throttle?.WrapDownloadDestination(destination) ?? destination;
+    private Stream ThrottledWrite(Stream destination) => throttle?.WrapDownloadDestination(destination, pairDownloadLimitKBps) ?? destination;
 
     private static RemoteNode ToNode(RemoteEntry e) => new()
     {

@@ -41,6 +41,7 @@ namespace PAWS
             // leaving them to notice a cryptic sync failure and connect the dots themselves — this is
             // the one case that needs a notification even while the window is hidden in the tray.
             App.Instance.AccountSessionExpired += OnAccountSessionExpired;
+            App.Instance.DriveTimedOut += OnDriveTimedOut;
 
             // Set the tray image from a real .ico via the Icon property — H.NotifyIcon's XAML IconSource
             // (ms-appx URI) conversion path throws COMException 0x800C000E on every launch. Best-effort:
@@ -90,6 +91,29 @@ namespace PAWS
                 TrayIcon.ShowNotification(
                     "PAWS — sign-in required",
                     $"{label}'s Proton session has expired. Open PAWS and use Options ▸ Sign in again to keep syncing.",
+                    H.NotifyIcon.Core.NotificationIcon.Warning);
+            }
+            catch
+            {
+            }
+        }
+
+        // A Drive call timed out (see CloudSyncService.DriveTimeout's remarks) — this is a nudge, not a
+        // confirmed-dead session (that's OnAccountSessionExpired's job), so the wording deliberately
+        // suggests re-signing-in as something worth TRYING rather than something required. Throttled per
+        // pair at the App layer, so this fires at most once per pair per cooldown window, not on every
+        // retry of a persistent hang.
+        private void OnDriveTimedOut(string accountId, string pairId)
+        {
+            try
+            {
+                var pair = App.Instance.SettingsStore.Load().Accounts
+                    .FirstOrDefault(a => a.Id == accountId)?.SyncPairs
+                    .FirstOrDefault(p => p.Id == pairId);
+                var label = pair is null ? "A synced folder" : System.IO.Path.GetFileName(pair.LocalPath.TrimEnd('\\', '/'));
+                TrayIcon.ShowNotification(
+                    "PAWS — connection trouble",
+                    $"Couldn't reach Proton Drive for '{label}'. If this keeps happening, try Options ▸ Sign in again.",
                     H.NotifyIcon.Core.NotificationIcon.Warning);
             }
             catch

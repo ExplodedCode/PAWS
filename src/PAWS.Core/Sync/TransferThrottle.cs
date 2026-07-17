@@ -27,13 +27,28 @@ public sealed class TransferThrottle
         set => Volatile.Write(ref _downloadKBps, value.GetValueOrDefault());
     }
 
-    /// <summary>Rate-limits reads from an upload's source stream at the current upload cap.</summary>
-    public Stream WrapUploadSource(Stream source, bool leaveOpen = false)
-        => new ThrottledStream(source, () => UploadLimitKBps, leaveOpen);
+    /// <summary>
+    /// Rate-limits reads from an upload's source stream. <paramref name="pairOverrideKBps"/> follows the
+    /// <see cref="Configuration.SyncPair.UploadLimitKBps"/> convention: null = use the current app-wide
+    /// cap (live re-read, same as with no override), 0 = explicitly unlimited for this transfer even if
+    /// the app-wide setting is capped, positive = a fixed custom cap for this transfer.
+    /// </summary>
+    public Stream WrapUploadSource(Stream source, int? pairOverrideKBps = null, bool leaveOpen = false)
+        => new ThrottledStream(source, () => Resolve(UploadLimitKBps, pairOverrideKBps), leaveOpen);
 
-    /// <summary>Rate-limits writes to a download's destination stream at the current download cap.</summary>
-    public Stream WrapDownloadDestination(Stream destination, bool leaveOpen = false)
-        => new ThrottledStream(destination, () => DownloadLimitKBps, leaveOpen);
+    /// <summary>Rate-limits writes to a download's destination stream — same override convention as <see cref="WrapUploadSource"/>.</summary>
+    public Stream WrapDownloadDestination(Stream destination, int? pairOverrideKBps = null, bool leaveOpen = false)
+        => new ThrottledStream(destination, () => Resolve(DownloadLimitKBps, pairOverrideKBps), leaveOpen);
+
+    // The override is captured once per wrapped stream (a pair's own cap isn't meant to change mid-
+    // transfer the way the live app-wide setting is); the app-wide fallback still re-reads live via the
+    // caller's closure over UploadLimitKBps/DownloadLimitKBps.
+    private static int? Resolve(int? appWideLimitKBps, int? pairOverrideKBps) => pairOverrideKBps switch
+    {
+        null => appWideLimitKBps,
+        <= 0 => null,
+        var custom => custom,
+    };
 }
 
 /// <summary>

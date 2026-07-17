@@ -19,6 +19,13 @@ public sealed class FullSyncService(SyncEngine syncEngine) : IDisposable
     // A plan deleting more than this many items is held for manual review instead of auto-applied.
     private const int MaxAutoDeletes = 50;
 
+    // A flat count alone lets a small-folder "wipe" through un-reviewed too easily — e.g. 6 of 8 files
+    // vanishing is only 6 deletes (nowhere near MaxAutoDeletes) but is proportionally catastrophic. The
+    // proportion check is skipped below MinTreeSizeForProportionGuard so an ordinary one- or two-file
+    // deletion in a tiny folder doesn't demand manual review just because it happens to be "most" of it.
+    private const double ProportionAutoDeleteThreshold = 0.5;
+    private const int MinTreeSizeForProportionGuard = 4;
+
     // The watcher catches local edits; this poll catches remote-side changes (SyncEngine resumes a fresh
     // client per plan, so it sees current Drive state — no stale-cache problem).
     private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(5);
@@ -117,9 +124,11 @@ public sealed class FullSyncService(SyncEngine syncEngine) : IDisposable
             }
 
             var deletes = plan.Operations.Count(o => o.Kind is SyncOperationKind.DeleteLocal or SyncOperationKind.DeleteRemote);
-            if (deletes > MaxAutoDeletes)
+            var totalKnown = Math.Max(plan.RemoteSnapshot.Entries.Count, plan.LocalSnapshot.Entries.Count);
+            if (ExceedsAutoDeleteThreshold(deletes, totalKnown))
             {
-                // Too many deletions to apply unattended — hand it to the user's manual, confirmed sync.
+                // Too many deletions (in absolute count or as a share of the known tree) to apply
+                // unattended — hand it to the user's manual, confirmed sync.
                 SyncCompleted?.Invoke(new FullSyncEventArgs(pair.Id, null, deletes, true, null));
                 return;
             }
@@ -143,6 +152,16 @@ public sealed class FullSyncService(SyncEngine syncEngine) : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Whether an auto-sync plan's deletions are too risky to apply unattended — either a flat count over
+    /// <see cref="MaxAutoDeletes"/>, or (for trees with at least <see cref="MinTreeSizeForProportionGuard"/>
+    /// known items) more than <see cref="ProportionAutoDeleteThreshold"/> of the known tree at once. Pure
+    /// and public so it's directly testable (see <c>--deleteguardtest</c>) without a live Drive plan.
+    /// </summary>
+    public static bool ExceedsAutoDeleteThreshold(int deletes, int totalKnown)
+        => deletes > MaxAutoDeletes
+            || (totalKnown >= MinTreeSizeForProportionGuard && deletes > totalKnown * ProportionAutoDeleteThreshold);
 
     private static SyncResult EmptyResult => new() { Completed = 0, Skipped = 0, Failures = [] };
 

@@ -1,4 +1,5 @@
 using PAWS.Core.Abstractions;
+using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 using PAWS.Core.Proton;
 
@@ -72,6 +73,11 @@ public sealed class ProtonDriveClientFactory(ISecretStore secretStore) : IProton
             current.RefreshToken = refreshToken;
             secretStore.SaveSecrets(accountId, current);
         }
+
+        // Every periodic on-demand pull / full-sync poll resumes a fresh session, so this can fire often
+        // for an active account — logged (not just persisted) so a pattern of unusually frequent rotation
+        // is visible after the fact instead of only inferable from a later "Invalid refresh token" failure.
+        PawsLog.Write($"Proton session tokens rotated for account '{accountId}'.");
     }
 
     // Clears the dead tokens (so HasResumableSession correctly reports false and a NEXT CreateAsync
@@ -80,6 +86,10 @@ public sealed class ProtonDriveClientFactory(ISecretStore secretStore) : IProton
     // proactively rather than waiting for them to notice a cryptic sync failure.
     private void HandleSessionExpired(string accountId)
     {
+        // The end state of "churn": a rotation that never came, or landed on a token Proton no longer
+        // honors. Logged before the clear so the log shows exactly when recovery stopped being possible.
+        PawsLog.Write($"Proton refresh token for account '{accountId}' was rejected as expired — clearing stored tokens; user must sign in again.");
+
         lock (_persistLock)
         {
             var current = secretStore.LoadSecrets(accountId);

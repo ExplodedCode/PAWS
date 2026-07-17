@@ -1,5 +1,6 @@
 using PAWS.Core.Abstractions;
 using PAWS.Core.Configuration;
+using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 
 namespace PAWS.Core.Sync;
@@ -36,6 +37,15 @@ public sealed class CloudSyncService(
     // population is never mistaken for a local deletion. Guarded by its own lock.
     private readonly Dictionary<string, HashSet<string>> _populated = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _enableGate = new(1, 1);
+
+    // Bounds EnableAsync's own initial root listing (see the try/catch around fetchChildren below) — a
+    // degraded/hung Drive session would otherwise block this call indefinitely, leaving the sync root
+    // REGISTERED but never CONNECTED (Explorer shows "The cloud file provider exited unexpectedly" the
+    // whole time — there's no live connection to answer it). Because _enableGate is ONE gate shared by
+    // every pair, a single stuck pair would also block every other pair's EnableAsync from ever running
+    // — and StartOnDemandPairsAsync awaits pairs sequentially at launch, so it's not just this pair's
+    // problem. Same bound and rationale as CloudFilterPlaceholderEngine.PopulateAsync's listing timeout.
+    private const int EnableListingTimeoutSeconds = 60;
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     // The native crypto (proton_crypto.dll) is process-global and NOT concurrency-safe, so serialize every
     // operation that touches it — hydration downloads, snapshot captures, uploads — against each other AND
@@ -55,6 +65,16 @@ public sealed class CloudSyncService(
 
     /// <summary>Raised (off the UI thread) when a periodic auto-pull for a pair finishes.</summary>
     public event Action<AutoPullEventArgs>? AutoPullCompleted;
+
+    /// <summary>
+    /// Raised (off the UI thread, args: accountId, pairId) when an on-demand Drive call — the root
+    /// listing at enable-time, or a live Explorer folder browse — hit its bounded timeout instead of
+    /// completing: a stuck/degraded session, not a clean success or a clean rejection. Unlike <see
+    /// cref="IProtonDriveClientFactory.SessionExpired"/> (fires only when Proton explicitly rejects a
+    /// refresh), a timeout gives no such confirmation, so nothing about the stored session is touched
+    /// here — this is a nudge ("maybe try signing in again"), not a declaration that it's dead.
+    /// </summary>
+    public event Action<string, string>? DriveTimeout;
 
     public bool IsSupported => placeholderEngine.IsSupported;
 
@@ -85,7 +105,24 @@ public sealed class CloudSyncService(
 
             // Materialize only the root's direct children (one folder listing, not the whole tree). This
             // also marks "" populated. Sub-folders come in lazily on browse via the provider.
-            var rootChildren = await fetchChildren(string.Empty, cancellationToken).ConfigureAwait(false);
+            IReadOnlyList<RemoteEntry> rootChildren;
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(EnableListingTimeoutSeconds));
+                rootChildren = await fetchChildren(string.Empty, timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Our own bound fired, not the caller's — surface a real, actionable failure instead of a
+                // plain cancellation a caller might otherwise treat as "nothing to report" (see
+                // StartOnDemandPairsAsync's catch, which previously swallowed every EnableAsync failure
+                // silently regardless of cause).
+                PawsLog.Write($"Enabling on-demand sync for '{pair.LocalPath}' timed out listing the root of '{pair.RemotePath}' after {EnableListingTimeoutSeconds}s.");
+                throw new TimeoutException(
+                    $"Listing the root of '{pair.RemotePath}' timed out after {EnableListingTimeoutSeconds}s — the Drive session may be degraded; try again or sign in again.");
+            }
+
             var rootSnapshot = new RemoteSnapshot
             {
                 RootPath = pair.RemotePath,
@@ -111,7 +148,7 @@ public sealed class CloudSyncService(
                 }
             }
 
-            var connection = placeholderEngine.Connect(pair.LocalPath, fetchChildren, CreateFetchCallback(accountId));
+            var connection = placeholderEngine.Connect(pair.LocalPath, fetchChildren, CreateFetchCallback(accountId, pair));
 
             lock (_connections)
             {
@@ -136,38 +173,54 @@ public sealed class CloudSyncService(
             ? pair.RemotePath
             : $"{pair.RemotePath.TrimEnd('/')}/{relativeFolder}";
 
-        var client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
-
-        var entries = new List<RemoteEntry>();
-        await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote folder not found: {remotePath}");
+            var client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
 
-            await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+            var entries = new List<RemoteEntry>();
+            await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
+            try
             {
-                var relativePath = string.IsNullOrEmpty(relativeFolder) ? child.Name : $"{relativeFolder}/{child.Name}";
-                entries.Add(new RemoteEntry
-                {
-                    RelativePath = relativePath,
-                    Name = child.Name,
-                    IsFolder = child.IsFolder,
-                    Size = child.Size,
-                    ModifiedUtc = child.ModifiedUtc,
-                    Uid = child.Uid,
-                    ParentUid = child.ParentUid,
-                    RevisionUid = child.RevisionUid,
-                });
-            }
-        }
-        finally
-        {
-            _clientUseGate.Release();
-        }
+                var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException($"Remote folder not found: {remotePath}");
 
-        MarkPopulated(pair.Id, relativeFolder);
-        return entries;
+                await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
+                {
+                    var relativePath = string.IsNullOrEmpty(relativeFolder) ? child.Name : $"{relativeFolder}/{child.Name}";
+                    entries.Add(new RemoteEntry
+                    {
+                        RelativePath = relativePath,
+                        Name = child.Name,
+                        IsFolder = child.IsFolder,
+                        Size = child.Size,
+                        ModifiedUtc = child.ModifiedUtc,
+                        Uid = child.Uid,
+                        ParentUid = child.ParentUid,
+                        RevisionUid = child.RevisionUid,
+                    });
+                }
+            }
+            finally
+            {
+                _clientUseGate.Release();
+            }
+
+            MarkPopulated(pair.Id, relativeFolder);
+            return entries;
+        }
+        catch (OperationCanceledException)
+        {
+            // The only cancellation this delegate ever sees today is one of our OWN bounded timeouts
+            // (EnableAsync's initial listing, or HydrationConnection.PopulateAsync's live-browse listing —
+            // both pass a fresh CancellationTokenSource, never a token tied to a genuine user action) — so
+            // this always means "the Drive call didn't come back in time", not "someone asked to cancel".
+            // Raised here (this delegate is the ONE place both timeout call sites funnel through) rather
+            // than at each call site, so the signal covers both without duplicating the detection logic.
+            // Deliberately does NOT touch the stored session (unlike SessionExpired, which fires only on
+            // an explicit rejection from Proton) — a timeout doesn't confirm the token is actually bad.
+            DriveTimeout?.Invoke(accountId, pair.Id);
+            throw;
+        }
     };
 
     // The live populated set for a pair (loaded on first use; the root "" is always populated). Caller
@@ -218,16 +271,17 @@ public sealed class CloudSyncService(
     /// into <c>output</c>. Serialized behind <see cref="_clientUseGate"/> because the shared client's
     /// native crypto is not concurrency-safe (see the class remarks).
     /// </summary>
-    private FetchPlaceholderData CreateFetchCallback(string accountId) => async (identity, output, ct) =>
+    private FetchPlaceholderData CreateFetchCallback(string accountId, SyncPair pair) => async (identity, output, ct) =>
     {
         var downloadClient = await GetClientAsync(accountId, ct).ConfigureAwait(false);
         await _clientUseGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // Hydration honors the download speed limit too. leaveOpen: the hydration connection owns
-            // the sink; the wrapper holds no state of its own. Throttled hydration stays timeout-safe —
-            // the sink streams each chunk to Cloud Filter as it arrives, so progress keeps reporting.
-            var destination = throttle?.WrapDownloadDestination(output, leaveOpen: true) ?? output;
+            // Hydration honors the download speed limit too (the pair's own override, if it has one).
+            // leaveOpen: the hydration connection owns the sink; the wrapper holds no state of its own.
+            // Throttled hydration stays timeout-safe — the sink streams each chunk to Cloud Filter as it
+            // arrives, so progress keeps reporting.
+            var destination = throttle?.WrapDownloadDestination(output, pair.DownloadLimitKBps, leaveOpen: true) ?? output;
             await downloadClient.DownloadAsync(NodeFromIdentity(identity), destination, cancellationToken: ct).ConfigureAwait(false);
         }
         finally
@@ -282,7 +336,7 @@ public sealed class CloudSyncService(
         // starve pending Explorer-triggered hydration/browse callbacks for its entire duration — that is
         // what previously froze Explorer and produced "the cloud operation was not completed before the
         // time-out period expired". Releasing the lock between files lets those requests through.
-        var result = await new SyncExecutor(client, throttle)
+        var result = await new SyncExecutor(client, throttle, pairUploadLimitKBps: pair.UploadLimitKBps, pairDownloadLimitKBps: pair.DownloadLimitKBps)
             .ExecuteAsync(pair.LocalPath, root, remote, pushOperations, gate: GateAsync, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
@@ -847,7 +901,7 @@ public sealed class CloudSyncService(
                 // Gated per operation (see SyncExecutor's remarks) rather than one lock held across the
                 // whole batch — a conflict resolution can include a large upload, which must not starve
                 // pending Explorer callbacks any more than an ordinary push would.
-                var result = await new SyncExecutor(client, throttle)
+                var result = await new SyncExecutor(client, throttle, pairUploadLimitKBps: pair.UploadLimitKBps, pairDownloadLimitKBps: pair.DownloadLimitKBps)
                     .ExecuteAsync(pair.LocalPath, root, remote, executorOps, gate: GateAsync, cancellationToken: cancellationToken)
                     .ConfigureAwait(false);
 
@@ -927,7 +981,7 @@ public sealed class CloudSyncService(
 
             DisposeConnection(pair.Id);
             placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
-            var connection = placeholderEngine.Connect(pair.LocalPath, CreateFetchChildren(accountId, pair), CreateFetchCallback(accountId));
+            var connection = placeholderEngine.Connect(pair.LocalPath, CreateFetchChildren(accountId, pair), CreateFetchCallback(accountId, pair));
 
             lock (_connections)
             {

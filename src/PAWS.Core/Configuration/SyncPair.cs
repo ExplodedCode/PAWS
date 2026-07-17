@@ -25,4 +25,15 @@ public sealed class SyncPair
     /// watcher is re-established on the next launch.
     /// </summary>
     public bool AutoSync { get; set; }
+
+    /// <summary>
+    /// Per-folder upload speed override in KB/s, using the same convention as the app-wide setting:
+    /// <see langword="null"/> = inherit the app-wide limit (the default for every pair), <c>0</c> =
+    /// explicitly unlimited for this folder even if the app-wide setting is capped, positive = a custom
+    /// cap just for this folder.
+    /// </summary>
+    public int? UploadLimitKBps { get; set; }
+
+    /// <summary>Per-folder download speed override in KB/s — same convention as <see cref="UploadLimitKBps"/>.</summary>
+    public int? DownloadLimitKBps { get; set; }
 }

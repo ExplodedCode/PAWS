@@ -52,6 +52,8 @@ return mode switch
     "--reauthtest" or "reauthtest" => ReauthTest(),
     "--weburl" or "weburl" => await WebUrlAsync(pathArg),
     "--throttletest" or "throttletest" => await ThrottleTestAsync(),
+    "--deleteguardtest" or "deleteguardtest" => DeleteGuardTest(),
+    "--drivetimeouttest" or "drivetimeouttest" => DriveTimeoutTest(),
     "--pausetest" or "pausetest" => await PauseTestAsync(localArg, remoteArg),
     "--dehydratetest" or "dehydratetest" => await DehydrateTestAsync(localArg, remoteArg),
     "--shellreg" or "shellreg" => await ShellRegCheckAsync(localArg),
@@ -983,7 +985,139 @@ static async Task<int> ThrottleTestAsync()
     var passOk = sw.Elapsed.TotalSeconds < 0.5;
     Console.WriteLine($"  unlimited WRITE  768 KB:                    {sw.Elapsed.TotalSeconds:0.00}s (expect ~0s)  -> {(passOk ? "PASS" : "FAIL")}");
 
-    var ok = writeOk && readOk && passOk;
+    // Per-pair override (TransferThrottle.WrapUploadSource/WrapDownloadDestination's pairOverrideKBps):
+    // a fast app-wide limit combined with a SLOWER per-pair override must still take the slow path.
+    var overrideGlobal = new TransferThrottle { DownloadLimitKBps = 2048 }; // would be ~0.4s unthrottled by the pair
+    sw.Restart();
+    await using (var dest = overrideGlobal.WrapDownloadDestination(new MemoryStream(), pairOverrideKBps: limitKBps))
+    {
+        await dest.WriteAsync(payload);
+    }
+
+    sw.Stop();
+    var overrideSlowsOk = sw.Elapsed.TotalSeconds is >= 2.0 and <= 5.0;
+    Console.WriteLine($"  pair override (256 KB/s) beats a faster app-wide limit (2048 KB/s): {sw.Elapsed.TotalSeconds:0.00}s (expect ~3s)  -> {(overrideSlowsOk ? "PASS" : "FAIL")}");
+
+    // Per-pair override = 0 (explicit unlimited) must win over a SLOW app-wide limit.
+    var overrideUnlimited = new TransferThrottle { DownloadLimitKBps = limitKBps };
+    sw.Restart();
+    await using (var dest = overrideUnlimited.WrapDownloadDestination(new MemoryStream(), pairOverrideKBps: 0))
+    {
+        await dest.WriteAsync(payload);
+    }
+
+    sw.Stop();
+    var overrideUnlimitedOk = sw.Elapsed.TotalSeconds < 0.5;
+    Console.WriteLine($"  pair override (unlimited) beats a slower app-wide limit (256 KB/s):  {sw.Elapsed.TotalSeconds:0.00}s (expect ~0s)  -> {(overrideUnlimitedOk ? "PASS" : "FAIL")}");
+
+    var ok = writeOk && readOk && passOk && overrideSlowsOk && overrideUnlimitedOk;
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE pure self-test (no Proton, no I/O) for FullSyncService.ExceedsAutoDeleteThreshold — the guard
+// that holds an auto-sync plan for manual review instead of applying it unattended. Verifies both halves:
+// the original flat MaxAutoDeletes(50) count, AND the newer proportion check ("> half of the known
+// tree") added to also catch a small-folder wipe that a flat count alone would let through un-reviewed
+// (e.g. 6 of 8 files vanishing). Also verifies the MinTreeSizeForProportionGuard floor: an ordinary one-
+// or two-file deletion in a tiny folder must NOT be flagged just because it happens to be "most" of it.
+// `--deleteguardtest`.
+static int DeleteGuardTest()
+{
+    var ok = true;
+    void Case(string name, bool expected, bool actual)
+    {
+        var pass = expected == actual;
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name} (expected {expected}, got {actual})");
+        ok &= pass;
+    }
+
+    Case("small batch, large tree -> not flagged", false, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 10, totalKnown: 100));
+    Case("over the flat MaxAutoDeletes(50) -> flagged", true, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 51, totalKnown: 1000));
+    Case("small-folder wipe (6 of 8, 75%) -> flagged", true, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 6, totalKnown: 8));
+    Case("tiny folder (1 of 2, below the size floor) -> NOT flagged", false, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 1, totalKnown: 2));
+    Case("at the size floor, over 50% (3 of 4) -> flagged", true, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 3, totalKnown: 4));
+    Case("at the size floor, exactly 50% (2 of 4) -> NOT flagged (strictly-greater-than)", false, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 2, totalKnown: 4));
+    Case("nothing known, nothing deleted -> not flagged", false, FullSyncService.ExceedsAutoDeleteThreshold(deletes: 0, totalKnown: 0));
+
+    Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
+    return ok ? 0 : 1;
+}
+
+// OFFLINE pure self-test (no real Drive account — a fake IProtonDriveClientFactory that hangs forever on
+// CreateAsync) for CloudSyncService's new DriveTimeout event: when an on-demand Drive call is cancelled
+// (see EnableAsync/PopulateAsync's bounded timeouts, added after Explorer wedged indefinitely on a stuck
+// Drive session — see paws-architecture memory, 2026-07-17), CreateFetchChildren's catch should raise
+// DriveTimeout with the right account/pair id before rethrowing. Rather than waiting out the real 60s
+// bound, this passes a token that self-cancels after 50ms — short enough to run fast, but AFTER
+// EnableAsync's own `_enableGate.WaitAsync` (an uncontended semaphore, effectively instant) so the
+// cancellation actually lands inside the fetchChildren call this test means to exercise, not before it
+// (an earlier version of this test pre-cancelled the token up front and only proved _enableGate.WaitAsync
+// itself respects cancellation — never reaching CreateFetchChildren at all, so DriveTimeout never fired;
+// keeping the note since the failure mode is easy to reintroduce). `--drivetimeouttest`.
+static int DriveTimeoutTest()
+{
+    var ok = true;
+    void Case(string name, bool pass)
+    {
+        Console.WriteLine($"  [{(pass ? "PASS" : "FAIL")}] {name}");
+        ok &= pass;
+    }
+
+    var root = Path.Combine(Path.GetTempPath(), "paws-drivetimeouttest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+
+    var engine = new CloudFilterPlaceholderEngine();
+    var service = new CloudSyncService(
+        engine, new FakeHangingClientFactory(), new FakeSyncStateStore(), new FakePopulatedFolderStore(), new SemaphoreSlim(1, 1));
+
+    string? raisedAccountId = null;
+    string? raisedPairId = null;
+    var raiseCount = 0;
+    service.DriveTimeout += (accountId, pairId) =>
+    {
+        raisedAccountId = accountId;
+        raisedPairId = pairId;
+        raiseCount++;
+    };
+
+    var pair = new SyncPair { Id = "pair-1", LocalPath = root, RemotePath = "/", Mode = SyncMode.OnDemand };
+
+    try
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        service.EnableAsync("acct-1", pair, cts.Token).GetAwaiter().GetResult();
+        Case("EnableAsync should throw for a cancelled token (should never reach here)", false);
+    }
+    catch (OperationCanceledException)
+    {
+        Case("EnableAsync propagates a genuine caller cancellation as OperationCanceledException (not TimeoutException)", true);
+    }
+    catch (Exception ex)
+    {
+        Case($"EnableAsync threw the wrong exception type: {ex.GetType().Name}: {ex.Message}", false);
+    }
+
+    Case("DriveTimeout fired exactly once", raiseCount == 1);
+    Case("DriveTimeout carried the right account id", raisedAccountId == "acct-1");
+    Case("DriveTimeout carried the right pair id", raisedPairId == "pair-1");
+
+    try
+    {
+        engine.UnregisterSyncRoot(root);
+    }
+    catch
+    {
+    }
+
+    try
+    {
+        Directory.Delete(root, recursive: true);
+    }
+    catch
+    {
+    }
+
     Console.WriteLine($"\n  RESULT: {(ok ? "PASS" : "FAIL")}");
     return ok ? 0 : 1;
 }
@@ -2914,4 +3048,50 @@ sealed class FakeUploadClient(int failCount, Func<Exception> exceptionFactory) :
     public Task<string?> GetWebUrlAsync(RemoteNode node, CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+// Minimal IProtonDriveClientFactory test double for DriveTimeoutTest: CreateAsync never completes on its
+// own — it only ever returns via the passed-in CancellationToken being cancelled, simulating a Drive
+// session that hangs instead of responding. (Type declarations in a top-level-statements file must come
+// after every top-level statement/local function, hence living down here.)
+sealed class FakeHangingClientFactory : PAWS.Core.Drive.IProtonDriveClientFactory
+{
+    // Explicit empty accessors (rather than a field-like event) — this test double never raises it, and a
+    // field-like event here would warn CS0067 ("event is never used").
+    public event Action<string>? SessionExpired { add { } remove { } }
+
+    public async Task<IProtonDriveClient> CreateAsync(string accountId, CancellationToken cancellationToken = default)
+    {
+        await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+        throw new InvalidOperationException("unreachable — Task.Delay(Infinite) only returns via cancellation");
+    }
+}
+
+// Minimal in-memory ISyncStateStore test double for DriveTimeoutTest — EnableAsync only needs Load to not
+// throw (null = no saved state = first-time setup path).
+sealed class FakeSyncStateStore : PAWS.Core.Abstractions.ISyncStateStore
+{
+    public SyncState? Load(string pairId) => null;
+
+    public void Save(SyncState state)
+    {
+    }
+
+    public void Clear(string pairId)
+    {
+    }
+}
+
+// Minimal in-memory IPopulatedFolderStore test double for DriveTimeoutTest.
+sealed class FakePopulatedFolderStore : PAWS.Core.Abstractions.IPopulatedFolderStore
+{
+    public ISet<string> Load(string pairId) => new HashSet<string>(StringComparer.Ordinal);
+
+    public void Save(string pairId, IReadOnlySet<string> folders)
+    {
+    }
+
+    public void Clear(string pairId)
+    {
+    }
 }
