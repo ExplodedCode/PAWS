@@ -1,8 +1,9 @@
 # Native crypto library (`proton_crypto`)
 
-`proton_crypto.dll` wraps Proton's **GopenPGP / GoSRP**. It is required only by the **SRP / native
-fallback path** (`PAWS.Proton`, `PAWS.AuthTest`) and, later, Drive file (PGP) operations. The
-**primary browser login does not need it.**
+`proton_crypto.dll` wraps Proton's **GopenPGP / GoSRP**. It is required by `PAWS.Proton` for every
+Drive file operation, since Proton Drive is end-to-end encrypted (see `PAWS.Tests`'s
+`ProtonCryptoTests` for the self-test that exercises it). **Browser login itself does not need it**
+— PAWS has no SRP/password login path.
 
 The dll is **not committed** (it's gitignored) — build it from the `dotnet-crypto` Go source and
 drop the result here as `native/win-x64/proton_crypto.dll`. `PAWS.Proton` copies it next to the
@@ -30,5 +31,5 @@ Copy `bin/runtimes/win-x64/native/proton_crypto.dll` to `native/win-x64/proton_c
 Verify it loads:
 
 ```powershell
-dotnet run --project src/PAWS.AuthTest -- --cryptocheck
+dotnet test src/PAWS.Tests/PAWS.Tests.csproj --filter FullyQualifiedName~ProtonCryptoTests
 ```

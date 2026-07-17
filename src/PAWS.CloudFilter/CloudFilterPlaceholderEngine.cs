@@ -99,13 +99,7 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
 
     // The shell requires the id format "{providerId}!{userSid}!{accountSegment}"; the last segment is a
     // stable per-folder tag so each pair registers as its own root.
-    private static string ShellSyncRootId(SyncRootInfo info)
-    {
-        var sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "S-1-0-0";
-        var pathHash = System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.Unicode.GetBytes(info.LocalPath.TrimEnd('\\', '/').ToUpperInvariant()));
-        return $"{info.ProviderId}!{sid}!{Convert.ToHexString(pathHash.AsSpan(0, 8))}";
-    }
+    private static string ShellSyncRootId(SyncRootInfo info) => $"{info.ProviderId}!{ComputeSidAndPathHashSuffix(info.LocalPath)}";
 
     private static string FolderLeaf(string localPath)
     {
@@ -167,10 +161,73 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(current.Id);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            // GetSyncRootInformationForFolder can throw ERROR_NOT_FOUND (0x80070490) for a folder that
+            // IS genuinely shell-registered — observed reliably from an unpackaged process shortly after
+            // its own Register call (a caller/package-identity quirk of the per-folder lookup, not a
+            // real "nothing registered" state; the registry entry is present and DisplayNameResource-
+            // findable the whole time). Falling back to a direct registry-id lookup avoids leaving a
+            // permanently orphaned Explorer sidebar entry every time this happens (this used to require
+            // a separate manual cleanup pass over dozens of stray "PAWS - {name}" entries).
+            PawsLog.Write($"TryUnregisterShell fast path failed for '{localPath}' ({ex.GetType().Name}: {ex.Message}); trying registry-id fallback.");
+
+            var id = FindShellRegisteredId(localPath);
+            if (id is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(id);
+                return true;
+            }
+            catch (Exception fallbackEx)
+            {
+                PawsLog.Write($"TryUnregisterShell registry-id fallback also failed for '{localPath}': {fallbackEx.GetType().Name}: {fallbackEx.Message}");
+                return false;
+            }
         }
+    }
+
+    /// <summary>
+    /// Finds a shell sync-root registration's full id for <paramref name="localPath"/> without going
+    /// through the per-folder WinRT lookup (see the ERROR_NOT_FOUND caveat above). <see
+    /// cref="ShellSyncRootId"/>'s id format is <c>{providerId}!{sid}!{pathHash}</c>, where the path-hash
+    /// segment depends only on the current user's SID and the (case/trailing-slash-normalized) path —
+    /// never on the provider id or name — so a registration for this exact path (by any provider,
+    /// though in practice only ours) can be found by suffix-matching that segment directly against the
+    /// registry, which the shell's own registration always keeps in sync.
+    /// </summary>
+    private static string? FindShellRegisteredId(string localPath)
+    {
+        var suffix = "!" + ComputeSidAndPathHashSuffix(localPath);
+
+        const string RootKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager";
+        using var rootKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(RootKeyPath);
+        if (rootKey is null)
+        {
+            return null;
+        }
+
+        foreach (var name in rootKey.GetSubKeyNames())
+        {
+            if (name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                return name;
+            }
+        }
+
+        return null;
+    }
+
+    private static string ComputeSidAndPathHashSuffix(string localPath)
+    {
+        var sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? "S-1-0-0";
+        var pathHash = System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.Unicode.GetBytes(localPath.TrimEnd('\\', '/').ToUpperInvariant()));
+        return $"{sid}!{Convert.ToHexString(pathHash.AsSpan(0, 8))}";
     }
 
     public PlaceholderResult CreatePlaceholders(string localRoot, RemoteSnapshot remoteSnapshot)

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Links the REAL single-instance guard from the WinUI app (not a copy), so PAWS.Tests's cross-
+         process regression test exercises the exact code PAWS.exe uses. -->
+    <Compile Include="..\..\PAWS\SingleInstanceGuard.cs" Link="SingleInstanceGuard.cs" />
+  </ItemGroup>
+
+</Project>

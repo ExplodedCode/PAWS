@@ -21,8 +21,9 @@ All projects target **`net10.0`** (Windows-specific ones: `net10.0-windows10.0.1
 | `src/PAWS.Proton` | Wraps the official `Proton.Sdk` / `Proton.Drive.Sdk` + `Proton.Cryptography` (native E2E crypto) behind `IProtonDriveClient`: browser-session resume, file upload/download/list/rename/move/trash. |
 | `src/PAWS.CloudFilter` | `IPlaceholderEngine` over the Windows Cloud Filter API (`cfapi`): sync-root registration with Explorer shell integration, placeholder creation, hydrate-on-open, dehydrate ("free up space"), lazy per-folder population. |
 | `PAWS/` | WinUI 3 app: browser login, accounts/folders UI, on-demand + full-sync management, speed limits, conflict resolution, tray/background host, single-instance guard. |
-| `src/PAWS.Setup` | Console dev tool for account setup outside the GUI (`--weblogin` default, `--show`, `--reset`, `--selftest`). |
-| `src/PAWS.AuthTest` | Console diagnostic/test harness — dozens of `--verb` entry points exercising every layer (snapshotting, on-demand sync, hydration/dehydration, conflict resolution, throttling, single-instancing, and more) against a real or fake Drive client. The closest thing this project has to an automated test suite today — see [Known limitations](#known-limitations). |
+| `src/PAWS.Setup` | Console dev tool for account setup outside the GUI (`--weblogin` default, `--show`, `--reset`). |
+| `src/PAWS.Tests` | xUnit test project — pure/offline coverage for the reconciler, conflict resolution, transfer throttling, retry logic, the full-sync delete guard, drive-timeout handling, and cfapi placeholder/decommission behavior (real Windows Cloud Filter calls, no Proton account needed). Run with `dotnet test`. |
+| `src/PAWS.Tests.SingleInstanceHost` | Tiny companion executable (links the same `SingleInstanceGuard.cs` PAWS.exe ships) that `PAWS.Tests`'s single-instance test spawns as real child processes — not part of the shipping app. |
 
 ## Sync modes
 
@@ -90,6 +91,19 @@ dotnet run --project src/PAWS.Setup -- --show       # list configured accounts
 dotnet run --project src/PAWS.Setup -- --reset      # clear all credentials + settings
 ```
 
+## Running the tests
+
+```powershell
+dotnet test src/PAWS.Tests/PAWS.Tests.csproj
+```
+
+All tests are offline — no Proton account or network access needed. Most are pure logic (reconciler,
+conflict resolution, throttling, retry, the delete guard); a few make real calls into the Windows Cloud
+Filter API against throwaway temp folders (registering/unregistering sync roots, creating placeholders)
+and one spawns real child processes to verify single-instance behavior end to end. The native-crypto test
+skips itself (rather than failing) if `proton_crypto.dll` hasn't been built locally yet — see
+[Native crypto library](#native-crypto-library).
+
 ## Native crypto library
 
 `PAWS.Proton` requires `proton_crypto.dll` for every Drive operation (list/upload/download/etc.),
@@ -112,17 +126,14 @@ in RAM — is already fixed: hydration spills to a temp file on disk, not a `byt
 random-access-speed limitation, not a memory one. See `CloudFilterPlaceholderEngine.TransferAsync`'s
 doc comment for the full technical detail.)
 
-**No formal automated test project.** Testing today is `PAWS.AuthTest`'s console harness — dozens of
-hand-run `--verb` self-tests (some offline/pure, some against a live Drive account) rather than a
-`PAWS.Tests` project on a standard framework (xUnit/etc.) that CI could run automatically.
-
 ## Status
 
 Working end to end against a live Proton Drive account: browser sign-in with multi-account support,
 on-demand sync with Explorer integration (placeholders, hydration, dehydration, pinning), full
 two-way sync, background auto-sync (local watcher + periodic Drive poll) for both modes, conflict
-resolution, per-pair and app-wide transfer speed limits, single-instancing, and packaged
-autostart-at-login. See [Known limitations](#known-limitations) above for the two known gaps.
+resolution, per-pair and app-wide transfer speed limits, single-instancing, packaged
+autostart-at-login, and an automated xUnit test suite (`src/PAWS.Tests`). See
+[Known limitations](#known-limitations) above for the one known gap.
 
 ## License
 
