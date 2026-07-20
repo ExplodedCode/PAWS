@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Threading;
 using PAWS.Core.Diagnostics;
 using PAWS.Core.Drive;
 using PAWS.Core.Sync;
@@ -76,17 +77,38 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
                 registration.Id, Windows.Security.Cryptography.BinaryStringEncoding.Utf8);
 
             Windows.Storage.Provider.StorageProviderSyncRootManager.Register(registration);
+            RemovePackagedAppAumid(registration.Id, info.LocalPath);
 
             // Register over an EXISTING id succeeds but keeps the old capabilities (observed live: a root
             // registered before AllowPinning was set stayed Flags-stale after re-register, so Explorer
             // never showed the pin menu). Verify what the shell actually recorded and, if the pin
             // capability is missing, unregister and register fresh.
-            var recorded = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            var recorded = GetSyncRootInfoWithRetry(folder, info.LocalPath);
+            if (recorded is null)
+            {
+                // GetSyncRootInformationForFolder can throw ERROR_NOT_FOUND transiently for a folder that
+                // WAS just successfully registered (same quirk documented on the unregister path below) —
+                // confirmed live 2026-07-17. Register() itself didn't throw, so trust that the
+                // registration succeeded rather than falling through to CfUnregisterSyncRoot + a full
+                // re-attempt, which can cascade all the way to the Win32-only fallback (no Explorer
+                // context menu at all) just because THIS lookup is flaky, not because registration
+                // actually failed. If AllowPinning silently didn't stick, Settings ▸ "Repair Explorer
+                // context menu" re-runs this whole path on demand.
+                PawsLog.Write($"Shell sync-root registered for '{info.LocalPath}' but AllowPinning could not be verified (lookup kept failing) — assuming success rather than falling back to the Win32-only path.");
+                return true;
+            }
+
             if (!recorded.AllowPinning)
             {
                 Windows.Storage.Provider.StorageProviderSyncRootManager.Unregister(recorded.Id);
                 Windows.Storage.Provider.StorageProviderSyncRootManager.Register(registration);
-                recorded = Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+                RemovePackagedAppAumid(registration.Id, info.LocalPath);
+                recorded = GetSyncRootInfoWithRetry(folder, info.LocalPath) ?? recorded;
+            }
+
+            if (!recorded.AllowPinning)
+            {
+                PawsLog.Write($"Shell sync-root for '{info.LocalPath}' is registered but AllowPinning is still false after a re-register attempt — Explorer's 'Always keep on this device'/'Free up space' items may be missing. Try Settings ▸ Repair Explorer context menu.");
             }
 
             return recorded.AllowPinning;
@@ -95,6 +117,57 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         {
             return false;
         }
+    }
+
+    // When a PACKAGED app calls Register, the shell records the caller's AUMID on the sync-root key and
+    // then SUPPRESSES its own built-in "Always keep on this device"/"Free up space" context-menu verbs
+    // for that root, deferring to cloud-files handlers the package is presumed to declare (PAWS declares
+    // none). Root-caused empirically 2026-07-19: an UNPACKAGED registration with byte-for-byte identical
+    // policies got the verbs; deleting the AUMID value from the packaged registration made them appear
+    // instantly — with AllowPinning (registry Flags bit 0x20) correctly set the whole time, so this, not
+    // the pin capability, was why the menu never showed. The SyncRootManager tree is user-writable (the
+    // unelevated Register call itself writes it), so stripping the value needs no elevation. Best-effort:
+    // without it the root still syncs/hydrates fine — only the built-in menu items stay hidden.
+    private static void RemovePackagedAppAumid(string syncRootId, string localPath)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                $@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{syncRootId}", writable: true);
+            key?.DeleteValue("AUMID", throwOnMissingValue: false);
+        }
+        catch (Exception ex)
+        {
+            PawsLog.Write($"Could not remove the packaged-app AUMID from sync root '{syncRootId}' ({localPath}): {ex.GetType().Name}: {ex.Message} — Explorer's 'Always keep on this device'/'Free up space' items may stay hidden. Try Settings ▸ Repair Explorer context menu.");
+        }
+    }
+
+    // GetSyncRootInformationForFolder can throw ERROR_NOT_FOUND (0x80070490) for a folder that IS
+    // genuinely shell-registered — a transient lookup quirk, not evidence the registration itself failed
+    // (see the unregister-path remarks for the first place this was found and confirmed live). A few
+    // short retries ride out the race; null means it never resolved.
+    private static Windows.Storage.Provider.StorageProviderSyncRootInfo? GetSyncRootInfoWithRetry(
+        Windows.Storage.StorageFolder folder, string localPath, int attempts = 3)
+    {
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                return Windows.Storage.Provider.StorageProviderSyncRootManager.GetSyncRootInformationForFolder(folder);
+            }
+            catch (Exception ex) when (attempt < attempts)
+            {
+                PawsLog.Write($"GetSyncRootInformationForFolder attempt {attempt}/{attempts} failed for '{localPath}': {ex.GetType().Name}: {ex.Message} — retrying.");
+                Thread.Sleep(150);
+            }
+            catch (Exception ex)
+            {
+                PawsLog.Write($"GetSyncRootInformationForFolder failed for '{localPath}' after {attempts} attempts: {ex.GetType().Name}: {ex.Message}.");
+                return null;
+            }
+        }
+
+        return null;
     }
 
     // The shell requires the id format "{providerId}!{userSid}!{accountSegment}"; the last segment is a
@@ -306,7 +379,13 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         }
         else if (Directory.Exists(path))
         {
-            files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories);
+            // NOT Directory.EnumerateFiles(AllDirectories): that recursion descends into UNPOPULATED
+            // directory placeholders too, which (a) fails outright when their population is pending
+            // ("An invalid name request was made" — observed aborting the whole launch sweep on a
+            // freshly-set-up pair, 2026-07-18) and (b) would otherwise force-populate every lazily
+            // materialized folder just to look inside — during a sweep whose entire purpose is freeing
+            // space. An unpopulated directory contains nothing hydrated, so it is skipped wholesale.
+            files = EnumerateDehydrationCandidates(path, errors);
         }
         else
         {
@@ -348,6 +427,46 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         }
 
         return new DehydrateResult(dehydrated, skipped, errors);
+    }
+
+    // Walks the tree for DehydrateTree, descending only into directories whose content is actually
+    // materialized locally — an unpopulated directory placeholder (RECALL_ON_DATA_ACCESS on a dir) is
+    // skipped wholesale (nothing hydrated inside; enumerating it would trigger population, or fail while
+    // population is pending). Per-directory failures are recorded and the walk continues, so one bad
+    // directory can't abort the whole sweep.
+    private static IEnumerable<string> EnumerateDehydrationCandidates(string root, List<string> errors)
+    {
+        var pending = new Queue<string>();
+        pending.Enqueue(root);
+
+        while (pending.Count > 0)
+        {
+            var directory = pending.Dequeue();
+
+            List<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(directory).ToList();
+
+                foreach (var subDirectory in Directory.EnumerateDirectories(directory))
+                {
+                    if (((int)File.GetAttributes(subDirectory) & RecallOnDataAccessAttribute) == 0)
+                    {
+                        pending.Enqueue(subDirectory);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{directory}: {ex.Message}");
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                yield return file;
+            }
+        }
     }
 
     private static bool TryDehydrate(string file)
@@ -722,7 +841,6 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
             _ = Task.Run(() => PopulateAsync(operation, relativeFolder));
         }
 
-        // A folder listing is one lightweight metadata call — it should never legitimately take long.
         // Nothing on this path times out on its own (ProviderHeartbeat only pings cfapi so IT doesn't give
         // up; it never gives up itself), so a stuck/degraded Drive session previously hung this forever —
         // wedging Explorer's entire browse of the folder (and, since a shell-registered root's provider
@@ -731,7 +849,10 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         // live 2026-07-17: an independent, unrelated harness call (no cfapi, no Explorer, a fresh process)
         // hung identically on a plain Drive listing — the hang is in the Drive session/transport, not this
         // code — but PAWS still owes callers a bounded wait instead of propagating that hang forever.
-        private const int ListingTimeoutSeconds = 60;
+        // 180s, not the original 60s: a large folder's listing genuinely CAN run minutes (per-child
+        // metadata + name decryption on a cold session — 2026-07-18), and the heartbeat keeps Explorer
+        // content to wait; this bound exists to end a degraded session's wait, not to police folder size.
+        private const int ListingTimeoutSeconds = 180;
 
         private async Task PopulateAsync(CF_OPERATION_INFO operation, string relativeFolder)
         {

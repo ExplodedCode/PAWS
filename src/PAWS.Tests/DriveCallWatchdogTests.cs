@@ -39,10 +39,14 @@ public class DriveCallWatchdogTests
             wedgedCount++;
         };
 
+        // InvalidOperationException (not a cancellation): a wedge is a hard "restart PAWS" condition —
+        // a cancellation type here would be translated upstream into the softer, misleading "couldn't
+        // reach Proton Drive — wait and retry" DriveTimeout signal.
         var sw = Stopwatch.StartNew();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.GetWebUrlAsync("acct-1", "/some/path", "pair-1"));
         sw.Stop();
+        Assert.Contains("quit and reopen PAWS", ex.Message, StringComparison.OrdinalIgnoreCase);
 
         // Proves the watchdog actually bounded it — nowhere near a real 60s default, and comfortably
         // above the 200ms budget so this isn't just measuring scheduler noise.
@@ -55,7 +59,7 @@ public class DriveCallWatchdogTests
         // A second call — even for a different pair/path — must fail FAST because the gate is now
         // permanently poisoned, not wait out another full watchdog budget only to discover the same thing.
         var sw2 = Stopwatch.StartNew();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+        await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.GetWebUrlAsync("acct-1", "/some/other/path", "pair-2"));
         sw2.Stop();
 

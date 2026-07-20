@@ -129,6 +129,32 @@
                 </StackPanel>
             </Border>
 
+            <!-- Explorer integration -->
+            <Border
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="20,16">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Explorer integration" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock
+                        Text="If the 'Always keep on this device' / 'Free up space' right-click options are missing for an on-demand folder, re-add them here. This doesn't touch your files, sync settings, or folder pairs."
+                        FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Button
+                            x:Name="RepairContextMenuButton"
+                            Content="Repair Explorer context menu"
+                            Click="OnRepairContextMenuClicked"
+                            HorizontalAlignment="Left" />
+                        <TextBlock
+                            x:Name="RepairContextMenuStatusText"
+                            VerticalAlignment="Center"
+                            FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
             <!-- Reset -->
             <Border
                 Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"

@@ -46,20 +46,37 @@ public sealed class CloudSyncService(
     // every pair, a single stuck pair would also block every other pair's EnableAsync from ever running
     // — and StartOnDemandPairsAsync awaits pairs sequentially at launch, so it's not just this pair's
     // problem. Same bound and rationale as CloudFilterPlaceholderEngine.PopulateAsync's listing timeout.
-    private const int EnableListingTimeoutSeconds = 60;
+    // 180s (not the original 60s): with time-sliced capture gating, waiting on the GATE is no longer
+    // what consumes this budget — a listing that runs this long is genuinely enumerating a large folder
+    // (per-child metadata + name decryption, cold cache), and failing it at 60s just made every big
+    // folder a permanent error. Genuine wedges are the watchdog's job now, not this bound's.
+    private const int EnableListingTimeoutSeconds = 180;
     private readonly SemaphoreSlim _clientGate = new(1, 1);
     // The native crypto (proton_crypto.dll) is process-global and NOT concurrency-safe, so serialize every
     // operation that touches it — hydration downloads, snapshot captures, uploads — against each other AND
     // against full-sync work. This is the SAME shared gate the SyncEngine uses (injected), so on-demand and
     // full-sync never call the SDK concurrently.
     private readonly SemaphoreSlim _clientUseGate = driveGate;
+
+    // Serializes the LOGICAL state-mutating sync flows (push / pull / conflict-resolve) against each
+    // other. Historically this mutual exclusion fell out of the pull holding _clientUseGate for its whole
+    // body — but that whole-body hold is exactly what starved Explorer's browse listings for the entire
+    // duration of a large-tree capture (see RemoteSnapshotBuilder.CaptureAsync's gate remarks), so the
+    // crypto gate is now only ever held per SDK step. This gate restores the flow-level exclusion those
+    // methods still need: without it a watcher push could reconcile mid-pull and the pull would then apply
+    // placeholder ops computed from a pre-push snapshot (e.g. resetting a just-pushed file's placeholder
+    // to its OLD revision). Read-only flows (Explorer browse listings, hydration) never take this gate —
+    // staying responsive during a long push/pull is the whole point of the split.
+    private readonly SemaphoreSlim _syncOpGate = new(1, 1);
     private bool _disposed;
 
-    // Bounds every "should always be fast" metadata call (single-folder listing, path resolve) that runs
-    // under _clientUseGate — see RunGatedDriveCallAsync's remarks for why a plain CancellationToken isn't
-    // enough on its own (observed live 2026-07-17: a stuck call can fail to honor cancellation at all).
-    // Overridable only so tests can exercise the watchdog firing without a real 60-second wait.
-    private readonly TimeSpan _driveMetadataCallTimeout = driveMetadataCallTimeout ?? TimeSpan.FromSeconds(60);
+    // Bounds every metadata call (single-folder listing, path resolve) that runs under _clientUseGate —
+    // see RunGatedDriveCallAsync's remarks for why a plain CancellationToken isn't enough on its own
+    // (observed live 2026-07-17: a stuck call can fail to honor cancellation at all). 180s to match
+    // EnableListingTimeoutSeconds (see its remarks: a listing genuinely CAN run minutes on a large,
+    // cold folder — this bound exists to end a degraded session's wait, not to police folder size).
+    // Overridable only so tests can exercise the watchdog firing without a real minutes-long wait.
+    private readonly TimeSpan _driveMetadataCallTimeout = driveMetadataCallTimeout ?? TimeSpan.FromSeconds(180);
 
     // Set (permanently, for the rest of this process's life) the first time RunGatedDriveCallAsync's
     // watchdog fires — i.e. a Drive call didn't return even after we gave up waiting and cancelled it.
@@ -188,6 +205,29 @@ public sealed class CloudSyncService(
         finally
         {
             _enableGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Re-runs shell sync-root registration for an on-demand pair — the repair for when Explorer's
+    /// "Always keep on this device" / "Free up space" context menu items have gone missing (e.g. the
+    /// shell's AllowPinning capability silently failing to stick on a prior registration — see the
+    /// placeholder engine's shell-registration remarks). For a pair with a LIVE provider connection this
+    /// goes through the full disconnect → register → reconnect cycle rather than registering under the
+    /// live connection: the registration's AllowPinning self-heal can unregister-and-re-register the
+    /// root, and yanking a root out from under a connected provider strands it (the long-standing
+    /// "--shellfix only while the app is closed" rule). A pair that isn't currently being served just
+    /// gets a plain re-registration.
+    /// </summary>
+    public async Task RepairContextMenuAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
+    {
+        if (IsEnabled(pair.Id))
+        {
+            await ReconnectAsync(accountId, pair, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            placeholderEngine.RegisterSyncRoot(new SyncRootInfo(pair.LocalPath, ProviderId, "PAWS", "1.0.0.0"));
         }
     }
 
@@ -323,6 +363,19 @@ public sealed class CloudSyncService(
     /// </summary>
     public async Task<SyncResult> SyncChangesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
+        await _syncOpGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await SyncChangesCoreAsync(accountId, pair, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _syncOpGate.Release();
+        }
+    }
+
+    private async Task<SyncResult> SyncChangesCoreAsync(string accountId, SyncPair pair, CancellationToken cancellationToken)
+    {
         var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
         var populated = GetPopulated(pair.Id);
 
@@ -334,14 +387,16 @@ public sealed class CloudSyncService(
             ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
 
         RemoteNode root = null!;
-        RemoteSnapshot remote = null!;
         await GateAsync(async ct =>
         {
             root = await client.ResolvePathAsync(pair.RemotePath, ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
         }, cancellationToken).ConfigureAwait(false);
+
+        // Chunk-gated (one gate hold per folder listing, not one around the whole walk) so a large tree's
+        // capture can't starve Explorer browses for its whole duration — see the builder's gate remarks.
+        var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
 
         var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
         var operations = new Reconciler().Reconcile(remote, local, lastKnown);
@@ -368,11 +423,8 @@ public sealed class CloudSyncService(
         // Re-capture and persist state so the next run starts from a clean baseline. Local is again
         // scoped to populated folders, which keeps the saved state "materialized-only" — the property
         // that makes un-browsed remote content read as new (ignored by push), never as a deletion.
-        RemoteSnapshot? newRemote = null;
-        await GateAsync(async ct =>
-        {
-            newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
-        }, cancellationToken).ConfigureAwait(false);
+        // Chunk-gated like the initial capture.
+        var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false);
 
         var newLocal = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken);
         if (newRemote is not null && newLocal is not null)
@@ -465,20 +517,47 @@ public sealed class CloudSyncService(
     {
         if (_drivePoisoned)
         {
-            throw new OperationCanceledException(
+            // NOT an OperationCanceledException: callers translate a cancellation here into the softer
+            // "couldn't reach Proton Drive — wait and retry" DriveTimeout signal, which is exactly wrong
+            // for this state (waiting is known not to help; the one-time DriveSessionWedged notification
+            // already told the user to restart).
+            throw new InvalidOperationException(
                 $"Proton Drive access is stuck in this session ({operationDescription}) — quit and reopen PAWS to recover.");
         }
 
         // Linked so a caller waiting for the gate unblocks immediately if some OTHER concurrent call
         // poisons it while this one is still queued, instead of sitting out its own full budget first.
         using var gateWait = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _drivePoisonCts.Token);
-        await _clientUseGate.WaitAsync(gateWait.Token).ConfigureAwait(false);
+        try
+        {
+            await _clientUseGate.WaitAsync(gateWait.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_drivePoisonCts.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                $"Proton Drive access is stuck in this session ({operationDescription}) — quit and reopen PAWS to recover.");
+        }
+        catch (OperationCanceledException)
+        {
+            // The caller's own bound expired while still QUEUED for the shared drive gate — Drive was
+            // never even contacted, so surfacing this as "couldn't reach Proton Drive" (what an
+            // OperationCanceledException becomes upstream) would be false. Confirmed live 2026-07-18:
+            // a large folder's whole-tree capture held the gate for minutes and every Explorer browse
+            // "timed out" this way while Drive itself was healthy. Chunked capture gating makes long
+            // waits rare; this rewrap keeps the diagnosis honest for whatever contention remains.
+            throw new TimeoutException(
+                $"Timed out waiting for another sync operation to finish before {operationDescription} could start — Proton Drive itself was never contacted.");
+        }
 
         using var callBound = new CancellationTokenSource(_driveMetadataCallTimeout);
         using var callToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, callBound.Token);
 
+        // The watchdog waits DOUBLE the call bound: cancellation is requested at 1x, and the call then
+        // gets a full extra budget to observe it and unwind. Racing both at the same instant would make
+        // an ordinary bounded timeout (work returning cancelled right at the deadline) a coin flip
+        // against being declared permanently stuck.
         var workTask = work(callToken.Token);
-        var winner = await Task.WhenAny(workTask, Task.Delay(_driveMetadataCallTimeout, CancellationToken.None))
+        var winner = await Task.WhenAny(workTask, Task.Delay(_driveMetadataCallTimeout * 2, CancellationToken.None))
             .ConfigureAwait(false);
 
         if (winner == workTask)
@@ -507,7 +586,8 @@ public sealed class CloudSyncService(
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
 
-        throw new OperationCanceledException(
+        // InvalidOperationException, not OperationCanceledException — see the poisoned fail-fast above.
+        throw new InvalidOperationException(
             $"Proton Drive access appears stuck in this session ({operationDescription}) — quit and reopen PAWS to recover.");
     }
 
@@ -525,10 +605,14 @@ public sealed class CloudSyncService(
     /// </summary>
     public async Task<PullResult> PullChangesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
-        RemoteSnapshot remote;
         PullResult result;
 
-        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // Flow-level exclusion vs push/resolve only — NOT the crypto gate. Holding _clientUseGate for
+        // this whole body (as this method originally did) starved every Explorer browse for the entire
+        // multi-minute capture of a large tree (they died at their 60s bound with a false "couldn't
+        // reach Proton Drive" — confirmed live 2026-07-18). SDK calls below take the crypto gate
+        // per step instead.
+        await _syncOpGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             // The SDK serves each child's metadata from its per-session entity cache, so a long-lived
@@ -537,13 +621,19 @@ public sealed class CloudSyncService(
             // was first seen. Diagnostics (2026-06-30) confirmed this: a cached client missed a deletion
             // for 5 min, while a fresh client saw it within ~7s. So drop the cached client and resume a
             // fresh one with a cold cache to read current Drive truth; it becomes the new cached client so
-            // hydration reuses the same single session afterwards.
-            await EvictClientAsync(accountId).ConfigureAwait(false);
-            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
+            // hydration reuses the same single session afterwards. One gated chunk: the eviction must not
+            // overlap an in-flight hydration on the client being disposed.
+            IProtonDriveClient client = null!;
+            await GateAsync(async ct =>
+            {
+                await EvictClientAsync(accountId).ConfigureAwait(false);
+                client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
 
             var populated = GetPopulated(pair.Id);
 
-            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
+            // Chunk-gated walk (one gate hold per folder listing) — see RemoteSnapshotBuilder's remarks.
+            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
             var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
                 ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
@@ -605,7 +695,7 @@ public sealed class CloudSyncService(
         }
         finally
         {
-            _clientUseGate.Release();
+            _syncOpGate.Release();
         }
 
         // Ensure a provider is connected so the folder is browsable / hydratable. No snapshot to refresh —
@@ -621,15 +711,16 @@ public sealed class CloudSyncService(
     }
 
     /// <summary>
-    /// Captures the recursive remote snapshot of a folder for the UI ("check drive status"), serialized on
-    /// the shared drive gate so it can never overlap a sync/hydration (two concurrent high-level SDK
-    /// operations corrupt the transfer). Uses a fresh session so it reflects current Drive truth. Returns
-    /// null if the path is not a folder.
+    /// Captures the recursive remote snapshot of a folder for the UI ("check drive status") — each step
+    /// of the walk serialized on the shared drive gate (chunked, so a large tree can't starve Explorer
+    /// browses; see RemoteSnapshotBuilder's remarks) and never overlapping a sync/hydration SDK call
+    /// (two concurrent high-level SDK operations corrupt the transfer). Uses a fresh session so it
+    /// reflects current Drive truth. Returns null if the path is not a folder.
     /// </summary>
     public Task<RemoteSnapshot?> CaptureSnapshotAsync(string accountId, string remotePath, CancellationToken cancellationToken = default)
         => WithFreshClientAsync(
             accountId,
-            (client, ct) => new RemoteSnapshotBuilder(client).CaptureAsync(remotePath, cancellationToken: ct),
+            (client, ct) => new RemoteSnapshotBuilder(client).CaptureAsync(remotePath, gate: GateAsync, cancellationToken: ct),
             cancellationToken);
 
     /// <summary>
@@ -641,19 +732,23 @@ public sealed class CloudSyncService(
             accountId,
             async (client, ct) =>
             {
-                var folder = await client.ResolvePathAsync(remotePath, ct).ConfigureAwait(false);
-                if (folder is null)
+                List<RemoteNode>? children = null;
+                await GateAsync(async innerCt =>
                 {
-                    return null;
-                }
+                    var folder = await client.ResolvePathAsync(remotePath, innerCt).ConfigureAwait(false);
+                    if (folder is null)
+                    {
+                        return;
+                    }
 
-                var children = new List<RemoteNode>();
-                await foreach (var child in client.ListChildrenAsync(folder, ct).ConfigureAwait(false))
-                {
-                    children.Add(child);
-                }
+                    children = [];
+                    await foreach (var child in client.ListChildrenAsync(folder, innerCt).ConfigureAwait(false))
+                    {
+                        children.Add(child);
+                    }
+                }, ct).ConfigureAwait(false);
 
-                return children;
+                return (IReadOnlyList<RemoteNode>?)children;
             },
             cancellationToken);
 
@@ -678,23 +773,24 @@ public sealed class CloudSyncService(
         }, cancellationToken).ConfigureAwait(false);
     }
 
-    // Runs a read against a FRESH Drive session, holding the shared drive gate for the whole thing so it
-    // can't overlap any other Drive operation. Fresh session = current Drive truth (the SDK's per-session
-    // cache would otherwise hide remote deletions/revisions); it becomes the new cached client.
+    // Runs a read against a FRESH Drive session. The evict + resume happens as one gated chunk (the old
+    // client must not be disposed under an in-flight hydration); the operation itself runs UNGATED and is
+    // responsible for gating its own SDK steps (pass GateAsync into the capture, or wrap a single listing
+    // in one GateAsync chunk) — holding the gate across a whole recursive capture starves Explorer
+    // browses for its entire duration (see RemoteSnapshotBuilder's gate remarks). Fresh session = current
+    // Drive truth (the SDK's per-session cache would otherwise hide remote deletions/revisions); it
+    // becomes the new cached client.
     private async Task<T> WithFreshClientAsync<T>(
         string accountId, Func<IProtonDriveClient, CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
     {
-        await _clientUseGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        IProtonDriveClient client = null!;
+        await GateAsync(async ct =>
         {
             await EvictClientAsync(accountId).ConfigureAwait(false);
-            var client = await GetClientAsync(accountId, cancellationToken).ConfigureAwait(false);
-            return await operation(client, cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            _clientUseGate.Release();
-        }
+            client = await GetClientAsync(accountId, ct).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
+
+        return await operation(client, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -909,13 +1005,31 @@ public sealed class CloudSyncService(
         IReadOnlyDictionary<string, ConflictResolution> resolutions,
         CancellationToken cancellationToken = default)
     {
+        // Flow-level exclusion vs push/pull (see _syncOpGate's remarks) — resolution reconciles and
+        // mutates state just like they do.
+        await _syncOpGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await ResolveConflictsCoreAsync(accountId, pair, resolutions, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _syncOpGate.Release();
+        }
+    }
+
+    private async Task<ConflictResolveResult> ResolveConflictsCoreAsync(
+        string accountId,
+        SyncPair pair,
+        IReadOnlyDictionary<string, ConflictResolution> resolutions,
+        CancellationToken cancellationToken)
+    {
         var errors = new List<string>();
         var resolved = 0;
         var populated = GetPopulated(pair.Id);
 
         IProtonDriveClient client = null!;
         RemoteNode root = null!;
-        RemoteSnapshot remote = null!;
         await GateAsync(async ct =>
         {
             // Fresh session for current Drive truth (per-session cache would hide remote-side changes).
@@ -924,9 +1038,11 @@ public sealed class CloudSyncService(
 
             root = await client.ResolvePathAsync(pair.RemotePath, ct).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-            remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
         }, cancellationToken).ConfigureAwait(false);
+
+        // Chunk-gated walk (one gate hold per folder listing) — see RemoteSnapshotBuilder's remarks.
+        var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
 
         var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, populated, cancellationToken)
             ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
@@ -1027,12 +1143,8 @@ public sealed class CloudSyncService(
             }
 
             // Re-capture remote so uploads get their NEW revision recorded (and their placeholders
-            // finalized as dehydratable, identity-refreshed — same as a normal push).
-            RemoteSnapshot? newRemote = null;
-            await GateAsync(async ct =>
-            {
-                newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
-            }, cancellationToken).ConfigureAwait(false);
+            // finalized as dehydratable, identity-refreshed — same as a normal push). Chunk-gated.
+            var newRemote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false);
 
             if (newRemote is not null)
             {

@@ -19,30 +19,36 @@ public sealed class SyncEngine(
     /// <summary>Captures both trees and reconciles them against last-known state — no files are moved.</summary>
     public async Task<SyncPlan> PlanAsync(string accountId, SyncPair pair, CancellationToken cancellationToken = default)
     {
-        await driveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        // Chunk-gated (one drive-gate hold per SDK step, not one around the whole plan): a large tree's
+        // capture would otherwise starve every on-demand pair's Explorer browse/hydration callback on
+        // the shared gate for the capture's whole multi-minute duration — the same starvation the
+        // per-operation gating in ApplyAsync already prevents for file transfers. See
+        // RemoteSnapshotBuilder.CaptureAsync's gate remarks.
+        IProtonDriveClient client = null!;
+        await GateAsync(async ct => client = await clientFactory.CreateAsync(accountId, ct).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
+        await using var connectedClient = client;
+
+        RemoteNode? root = null;
+        await GateAsync(async ct => root = await client.ResolvePathAsync(pair.RemotePath, ct).ConfigureAwait(false), cancellationToken)
+            .ConfigureAwait(false);
+        if (root is null)
         {
-            await using var client = await clientFactory.CreateAsync(accountId, cancellationToken).ConfigureAwait(false);
-
-            var root = await client.ResolvePathAsync(pair.RemotePath, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
-
-            var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, cancellationToken: cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
-
-            // Full-sync mirrors the whole tree (no lazy population), so walk everything (null scope).
-            var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, null, cancellationToken)
-                ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
-
-            var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
-            var operations = new Reconciler().Reconcile(remote, local, lastKnown);
-
-            return new SyncPlan(pair, remote, local, root, operations);
+            throw new InvalidOperationException($"Remote folder not found: {pair.RemotePath}");
         }
-        finally
-        {
-            driveGate.Release();
-        }
+
+        var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"Remote path is not a folder: {pair.RemotePath}");
+
+        // Full-sync mirrors the whole tree (no lazy population), so walk everything (null scope). Local
+        // reads are plain filesystem — no SDK/crypto — so they never need the gate.
+        var local = new LocalSnapshotBuilder().Capture(pair.LocalPath, null, cancellationToken)
+            ?? throw new InvalidOperationException($"Local folder not found: {pair.LocalPath}");
+
+        var lastKnown = stateStore.Load(pair.Id) ?? SyncState.Empty(pair.Id);
+        var operations = new Reconciler().Reconcile(remote, local, lastKnown);
+
+        return new SyncPlan(pair, remote, local, root, operations);
     }
 
     /// <summary>
@@ -80,11 +86,8 @@ public sealed class SyncEngine(
             // the re-capture hiccups; the next run will simply recompute).
             try
             {
-                RemoteSnapshot? remote = null;
-                await GateAsync(async ct =>
-                {
-                    remote = await new RemoteSnapshotBuilder(client).CaptureAsync(plan.Pair.RemotePath, cancellationToken: ct).ConfigureAwait(false);
-                }, cancellationToken).ConfigureAwait(false);
+                // Chunk-gated like PlanAsync's capture.
+                var remote = await new RemoteSnapshotBuilder(client).CaptureAsync(plan.Pair.RemotePath, gate: GateAsync, cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 var local = new LocalSnapshotBuilder().Capture(plan.Pair.LocalPath, null, cancellationToken);
                 if (remote is not null && local is not null)

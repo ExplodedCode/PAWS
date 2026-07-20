@@ -1,7 +1,9 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using PAWS.Core.Configuration;
 using PAWS.Infrastructure.Startup;
 
 namespace PAWS.Views
@@ -127,6 +129,50 @@ namespace PAWS.Views
         // NumberBox reports NaN while empty; fall back to a sensible default.
         private static int ToKBps(double value)
             => double.IsNaN(value) || value < 16 ? 1024 : (int)value;
+
+        /// <summary>
+        /// Re-registers every on-demand folder's sync root, which re-runs the shell's AllowPinning check
+        /// that controls whether Explorer's "Always keep on this device"/"Free up space" items appear —
+        /// the same self-heal that already runs on every launch, just triggerable on demand for when the
+        /// items have gone missing between launches (e.g. a transient shell lookup failure at register
+        /// time — see CloudFilterPlaceholderEngine's remarks). Doesn't touch connections, sync state, or
+        /// files.
+        /// </summary>
+        private async void OnRepairContextMenuClicked(object sender, RoutedEventArgs e)
+        {
+            RepairContextMenuButton.IsEnabled = false;
+            RepairContextMenuStatusText.Text = "Repairing…";
+
+            // Task.Run: the shell registration underneath blocks its calling thread (synchronous WinRT
+            // interop), so keep it off the UI thread even though the repair API itself is async.
+            var repaired = await Task.Run(async () =>
+            {
+                var settings = App.Instance.SettingsStore.Load();
+                var count = 0;
+                foreach (var account in settings.Accounts)
+                {
+                    foreach (var pair in account.SyncPairs.Where(p => p.Mode == SyncMode.OnDemand && p.Enabled))
+                    {
+                        try
+                        {
+                            await App.Instance.CloudSync.RepairContextMenuAsync(account.Id, pair);
+                            count++;
+                        }
+                        catch
+                        {
+                            // Best-effort per folder — one failure shouldn't stop the rest.
+                        }
+                    }
+                }
+
+                return count;
+            });
+
+            RepairContextMenuStatusText.Text = repaired == 0
+                ? "No on-demand folders to repair."
+                : $"Done — repaired {repaired} folder{(repaired == 1 ? "" : "s")}. If items are still missing, try reopening Explorer.";
+            RepairContextMenuButton.IsEnabled = true;
+        }
 
         private async void OnResetClicked(object sender, RoutedEventArgs e)
             => await ResetAppAsync();
