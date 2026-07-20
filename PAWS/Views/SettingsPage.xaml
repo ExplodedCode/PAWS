@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="PAWS.Views.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer>
+        <StackPanel Padding="40,32,40,24" Spacing="20" MaxWidth="840" HorizontalAlignment="Center">
+
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <Button Click="OnBackClicked" VerticalAlignment="Center" ToolTipService.ToolTip="Back to folders">
+                    <FontIcon Glyph="&#xE72B;" FontSize="14" />
+                </Button>
+                <TextBlock Text="Settings" Style="{StaticResource TitleTextBlockStyle}" VerticalAlignment="Center" />
+            </StackPanel>
+
+            <!-- App behavior -->
+            <Border
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="20,16">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="App behavior" Style="{StaticResource SubtitleTextBlockStyle}" />
+
+                    <ToggleSwitch
+                        x:Name="StartupToggle"
+                        Header="Start PAWS when you sign in to Windows"
+                        Toggled="OnBehaviorToggled" />
+                    <ToggleSwitch
+                        x:Name="BackgroundToggle"
+                        Header="Keep running in the background when closed or minimized"
+                        Toggled="OnBehaviorToggled" />
+                    <ToggleSwitch
+                        x:Name="AutoSyncStartToggle"
+                        Header="Start syncing all accounts when PAWS starts"
+                        ToolTipService.ToolTip="Background sync resumes for every folder at launch — including folders you paused. Turn this off to keep pause states across restarts."
+                        Toggled="OnBehaviorToggled" />
+
+                    <Grid ColumnSpacing="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ToggleSwitch
+                            x:Name="AutoDehydrateToggle"
+                            Header="Automatically free up space"
+                            ToolTipService.ToolTip="At startup, on-demand files you haven't used for this many days become online-only again (their content is freed from disk; opening them downloads it back). Files marked 'Always keep on this device' and files with unsynced changes are never touched."
+                            Toggled="OnAutoDehydrateToggled" />
+                        <NumberBox
+                            x:Name="AutoDehydrateDaysBox"
+                            Grid.Column="1"
+                            Header="days unused"
+                            Minimum="1"
+                            Maximum="3650"
+                            SmallChange="1"
+                            SpinButtonPlacementMode="Compact"
+                            MinWidth="140"
+                            VerticalAlignment="Bottom"
+                            IsEnabled="False"
+                            ValueChanged="OnAutoDehydrateValueChanged" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- Sync speed -->
+            <Border
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="20,16">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Sync speed" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock
+                        Text="Cap how much of your connection PAWS uses. Applies to uploads, downloads, and opening on-demand files; changes take effect immediately, even mid-transfer."
+                        FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+
+                    <Grid ColumnSpacing="16" RowSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <ToggleSwitch
+                            x:Name="UploadLimitToggle"
+                            Header="Limit upload speed"
+                            Toggled="OnUploadLimitToggled" />
+                        <NumberBox
+                            x:Name="UploadLimitBox"
+                            Grid.Column="1"
+                            Header="KB/s"
+                            Minimum="16"
+                            Maximum="1000000"
+                            SmallChange="128"
+                            SpinButtonPlacementMode="Compact"
+                            MinWidth="140"
+                            VerticalAlignment="Bottom"
+                            IsEnabled="False"
+                            ValueChanged="OnLimitValueChanged" />
+
+                        <ToggleSwitch
+                            x:Name="DownloadLimitToggle"
+                            Grid.Row="1"
+                            Header="Limit download speed"
+                            Toggled="OnDownloadLimitToggled" />
+                        <NumberBox
+                            x:Name="DownloadLimitBox"
+                            Grid.Row="1"
+                            Grid.Column="1"
+                            Header="KB/s"
+                            Minimum="16"
+                            Maximum="1000000"
+                            SmallChange="128"
+                            SpinButtonPlacementMode="Compact"
+                            MinWidth="140"
+                            VerticalAlignment="Bottom"
+                            IsEnabled="False"
+                            ValueChanged="OnLimitValueChanged" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- Explorer integration -->
+            <Border
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="20,16">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Explorer integration" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock
+                        Text="If the 'Always keep on this device' / 'Free up space' right-click options are missing for an on-demand folder, re-add them here. This doesn't touch your files, sync settings, or folder pairs."
+                        FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <Button
+                            x:Name="RepairContextMenuButton"
+                            Content="Repair Explorer context menu"
+                            Click="OnRepairContextMenuClicked"
+                            HorizontalAlignment="Left" />
+                        <TextBlock
+                            x:Name="RepairContextMenuStatusText"
+                            VerticalAlignment="Center"
+                            FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Reset -->
+            <Border
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Padding="20,16">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Reset" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock
+                        Text="Signs out every account and removes all folder sync configurations from this PC. Your files are not deleted — everything on your PC and on Proton Drive stays where it is."
+                        FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                    <Button
+                        x:Name="ResetButton"
+                        Content="Reset app…"
+                        Foreground="{ThemeResource SystemFillColorCriticalBrush}"
+                        Click="OnResetClicked"
+                        HorizontalAlignment="Left" />
+                </StackPanel>
+            </Border>
+
+        </StackPanel>
+    </ScrollViewer>
+</Page>

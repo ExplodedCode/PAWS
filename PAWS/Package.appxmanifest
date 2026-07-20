@@ -4,9 +4,10 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:systemai="http://schemas.microsoft.com/appx/manifest/systemai/windows10"
-  IgnorableNamespaces="uap rescap systemai">
+  IgnorableNamespaces="uap uap5 rescap systemai">
 
   <Identity
     Name="d4f391fa-1b1d-4bb3-8f12-542fec853da7"
@@ -43,6 +44,18 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
+      <Extensions>
+        <!-- Proper packaged autostart (replaces the HKCU Run-key write for a packaged install — see
+             PAWS.Infrastructure.Startup.StartupRegistration): shows in Settings > Apps > Startup, and
+             TaskId here must exactly match the string StartupTask.GetAsync(...) uses in code. A full-trust
+             desktop app (runFullTrust below) just re-launches its own exe — no background-task class. -->
+        <!-- Executable is a literal name here (NOT the $targetnametoken$ token used on <Application> above)
+             — MakeAppx rejects the token inside an Extension element ("file name ... doesn't exist in the
+             package", confirmed by an actual packaging failure); PAWS.exe is the real, fixed output name. -->
+        <uap5:Extension Category="windows.startupTask" Executable="PAWS.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:StartupTask TaskId="PAWSStartup" Enabled="false" DisplayName="PAWS" />
+        </uap5:Extension>
+      </Extensions>
     </Application>
   </Applications>
 

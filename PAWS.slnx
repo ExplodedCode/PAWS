@@ -4,6 +4,17 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/PAWS.CloudFilter/PAWS.CloudFilter.csproj" />
+    <Project Path="src/PAWS.Core/PAWS.Core.csproj" />
+    <Project Path="src/PAWS.Infrastructure/PAWS.Infrastructure.csproj" />
+    <Project Path="src/PAWS.Proton/PAWS.Proton.csproj" />
+    <Project Path="src/PAWS.Setup/PAWS.Setup.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="src/PAWS.Tests/PAWS.Tests.csproj" />
+    <Project Path="src/PAWS.Tests.SingleInstanceHost/PAWS.Tests.SingleInstanceHost.csproj" />
+  </Folder>
   <Project Path="PAWS/PAWS.csproj">
     <Platform Solution="*|ARM64" Project="ARM64" />
     <Platform Solution="*|x64" Project="x64" />

@@ -4,6 +4,7 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:PAWS"
+    xmlns:tb="using:H.NotifyIcon"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
@@ -14,6 +15,34 @@
     </Window.SystemBackdrop>
 
     <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
 
+        <!-- Custom title bar so the caption area blends with the Mica backdrop. -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Height="40" Background="Transparent">
+            <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center" Margin="14,0,0,0">
+                <Image Source="ms-appx:///Assets/Square44x44Logo.scale-200.png" Width="18" Height="18" />
+                <TextBlock
+                    x:Name="AppTitleText"
+                    Text="PAWS"
+                    VerticalAlignment="Center"
+                    Style="{StaticResource CaptionTextBlockStyle}" />
+            </StackPanel>
+        </Grid>
+
+        <Frame x:Name="RootFrame" Grid.Row="1" />
+
+        <!-- Notification-area (tray) icon. Keeps PAWS reachable while it runs in the background.
+             The image is set in code (TrayIcon.Icon, from Assets\PAWS.ico): H.NotifyIcon's IconSource
+             ms-appx conversion throws COMException 0x800C000E at every startup. -->
+        <!-- The context menu is built in code-behind (see MainWindow ctor) with Command bindings rather
+             than XAML Click= handlers: H.NotifyIcon's flyout does not reliably route MenuFlyoutItem.Click
+             to the code-behind (confirmed live 2026-07-17 — the menu rendered but neither Open nor Quit
+             fired), whereas Command binding works (same path as the icon's LeftClickCommand). -->
+        <tb:TaskbarIcon
+            x:Name="TrayIcon"
+            ToolTipText="PAWS — Proton Drive sync" />
     </Grid>
 </Window>

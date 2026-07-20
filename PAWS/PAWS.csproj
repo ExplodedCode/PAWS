@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>PAWS</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
@@ -12,9 +12,16 @@
     <WinUISDKReferences>false</WinUISDKReferences>
     <EnableMsixTooling>true</EnableMsixTooling>
     <Nullable>enable</Nullable>
+    <!-- Don't Debugger.Break() in the XAML-generated UnhandledException hook: App wires its own handler
+         that logs the full exception (PawsLog) and marks it handled, so the break is redundant noise. -->
+    <!-- Custom Main (Program.cs) does the single-instance check before any Application/services exist. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_BREAK_ON_UNHANDLED_EXCEPTION;DISABLE_XAML_GENERATED_MAIN</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- CopyToOutputDirectory: the tray icon is loaded from AppContext.BaseDirectory at runtime
+         (MSIX packaging includes Content automatically, but plain builds only copy on request). -->
+    <Content Include="Assets\PAWS.ico" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Assets\SplashScreen.scale-200.png" />
     <Content Include="Assets\LockScreenLogo.scale-200.png" />
     <Content Include="Assets\Square150x150Logo.scale-200.png" />
@@ -37,8 +44,17 @@
     <ProjectCapability Include="Msix" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.3.2" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.1839" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\src\PAWS.Core\PAWS.Core.csproj" />
+    <ProjectReference Include="..\src\PAWS.CloudFilter\PAWS.CloudFilter.csproj" />
+    <ProjectReference Include="..\src\PAWS.Infrastructure\PAWS.Infrastructure.csproj" />
+    <!-- Real Proton Drive client (resume session + file ops). Brings in Proton.Sdk + the native
+         proton_crypto.dll, which flow transitively into the app output / MSIX. -->
+    <ProjectReference Include="..\src\PAWS.Proton\PAWS.Proton.csproj" />
   </ItemGroup>
 
   <!--

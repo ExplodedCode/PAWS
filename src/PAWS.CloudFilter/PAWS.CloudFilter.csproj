@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Windows-only: the Cloud Filter API (cldapi.dll) requires Windows 10 1809+. -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PAWS.Core\PAWS.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Vanara P/Invoke bindings for the Windows Cloud Filter API (cfapi / cldapi.dll). MIT. -->
+    <PackageReference Include="Vanara.PInvoke.CldApi" Version="5.0.5" />
+  </ItemGroup>
+
+</Project>

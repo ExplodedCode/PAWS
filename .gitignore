@@ -2,6 +2,13 @@
 AppPackages/
 BundleArtifacts/
 
+# Vendored native crypto library — rebuilt from dotnet-crypto Go source (see native/README.md)
+native/**/*.dll
+native/**/*.lib
+native/**/*.so
+native/**/*.dylib
+native/**/*.h
+
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
