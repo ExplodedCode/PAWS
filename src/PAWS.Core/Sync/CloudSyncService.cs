@@ -31,6 +31,7 @@ public sealed class CloudSyncService(
     private readonly Dictionary<string, IDisposable> _connections = new(StringComparer.Ordinal); // pairId -> provider
     private readonly Dictionary<string, IProtonDriveClient> _clients = new(StringComparer.Ordinal); // accountId -> client
     private readonly Dictionary<string, FolderWatcher> _watchers = new(StringComparer.Ordinal); // pairId -> auto push watcher
+    private readonly Dictionary<string, FolderWatcher> _pinWatchers = new(StringComparer.Ordinal); // pairId -> pin-state (attribute) watcher
     private readonly Dictionary<string, Timer> _pullTimers = new(StringComparer.Ordinal); // pairId -> periodic pull timer
     private readonly HashSet<string> _pullInFlight = new(StringComparer.Ordinal); // pairIds with a pull running
     // Folders (relative, '/'-separated, "" = root) that have been POPULATED (materialized locally), per
@@ -200,11 +201,175 @@ public sealed class CloudSyncService(
                 _connections[pair.Id] = connection;
             }
 
+            StartPinStateWatcher(accountId, pair);
+
+            // Catch-up: honor pin-state changes made while no provider was connected (files pinned while
+            // the app was closed, or freed up while a previous session was wedged). Fire-and-forget —
+            // hydrating pinned content can take as long as the downloads take.
+            _ = Task.Run(() => ApplyPinStatesAsync(accountId, pair, CancellationToken.None), CancellationToken.None);
+
             return rootChildren.Count;
         }
         finally
         {
             _enableGate.Release();
+        }
+    }
+
+    // Explorer's "Always keep on this device" / "Free up space" verbs only WRITE PIN-STATE ATTRIBUTES
+    // (FILE_ATTRIBUTE_PINNED 0x80000 / FILE_ATTRIBUTE_UNPINNED 0x100000) — confirmed empirically
+    // 2026-07-19 with a live provider attached: neither verb hydrates or dehydrates anything itself, and
+    // the provider sees no callback. Reacting to those attributes IS the feature; a provider that
+    // doesn't watch for them (as PAWS didn't) leaves both menu items as visually-working no-ops.
+    private void StartPinStateWatcher(string accountId, SyncPair pair)
+    {
+        lock (_pinWatchers)
+        {
+            if (_disposed || _pinWatchers.ContainsKey(pair.Id))
+            {
+                return;
+            }
+
+            _pinWatchers[pair.Id] = new FolderWatcher(
+                pair.LocalPath,
+                ct => ApplyPinStatesAsync(accountId, pair, ct),
+                quietPeriod: TimeSpan.FromSeconds(1),
+                notifyFilter: NotifyFilters.Attributes);
+        }
+    }
+
+    private void StopPinStateWatcher(string pairId)
+    {
+        FolderWatcher? watcher;
+        lock (_pinWatchers)
+        {
+            _pinWatchers.Remove(pairId, out watcher);
+        }
+
+        watcher?.Dispose();
+    }
+
+    /// <summary>
+    /// Applies the tree's current pin states: pinned-but-dehydrated files are downloaded (hydrated
+    /// through the connected provider), files explicitly marked "free up space" (unpinned) that still
+    /// hold content are dehydrated, and a pinned folder that was never browsed is populated first so its
+    /// children exist to hydrate. Pin state inherits downward: everything under a pinned folder is kept
+    /// local unless a child is itself explicitly unpinned. Runs debounced off the attribute watcher and
+    /// once at enable (catch-up); re-runs triggered by its own attribute changes settle as no-ops.
+    /// </summary>
+    public async Task ApplyPinStatesAsync(string accountId, SyncPair pair, CancellationToken cancellationToken)
+    {
+        const int PinnedAttr = 0x80000;        // FILE_ATTRIBUTE_PINNED
+        const int UnpinnedAttr = 0x100000;     // FILE_ATTRIBUTE_UNPINNED
+        const int CloudOnlyAttr = 0x400000;    // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+        var hydrated = 0;
+        var dehydrated = 0;
+        var failures = 0;
+
+        try
+        {
+            var pending = new Queue<(string Path, bool InheritedPinned)>();
+            pending.Enqueue((pair.LocalPath, false));
+
+            while (pending.Count > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var (directory, inheritedPinned) = pending.Dequeue();
+
+                List<(string Path, int Attrs, bool IsDir)> children;
+                try
+                {
+                    children = Directory.EnumerateFileSystemEntries(directory)
+                        .Select(p => (p, (int)File.GetAttributes(p), Directory.Exists(p)))
+                        .ToList();
+                }
+                catch (Exception ex)
+                {
+                    PawsLog.Write($"Pin sweep could not enumerate '{directory}': {ex.Message}");
+                    continue;
+                }
+
+                foreach (var (path, attrs, isDir) in children)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Explicit state on the item wins; otherwise a pinned ancestor's intent flows down.
+                    var pinned = (attrs & PinnedAttr) != 0 || (inheritedPinned && (attrs & UnpinnedAttr) == 0);
+
+                    if (!isDir)
+                    {
+                        if (pinned && (attrs & CloudOnlyAttr) != 0)
+                        {
+                            if (placeholderEngine.HydrateFile(path))
+                            {
+                                hydrated++;
+                            }
+                            else
+                            {
+                                failures++;
+                            }
+                        }
+                        else if ((attrs & UnpinnedAttr) != 0 && (attrs & CloudOnlyAttr) == 0)
+                        {
+                            // Explicit "free up space". DehydrateTree on a single file carries the
+                            // platform's own safety: pinned or not-in-sync (unpushed edits) are refused.
+                            var result = placeholderEngine.DehydrateTree(path);
+                            dehydrated += result.Dehydrated;
+                        }
+
+                        continue;
+                    }
+
+                    if ((attrs & CloudOnlyAttr) != 0)
+                    {
+                        // Un-browsed (never populated) folder. Only a PINNED one warrants forcing
+                        // population — "keep on this device" means everything under it, browsed or not.
+                        // Everything else stays lazy.
+                        if (pinned)
+                        {
+                            try
+                            {
+                                var relative = Path.GetRelativePath(pair.LocalPath, path).Replace(Path.DirectorySeparatorChar, '/');
+                                var entries = await CreateFetchChildren(accountId, pair)(relative, cancellationToken).ConfigureAwait(false);
+                                if (entries.Count > 0)
+                                {
+                                    placeholderEngine.CreatePlaceholders(pair.LocalPath, new RemoteSnapshot
+                                    {
+                                        RootPath = pair.RemotePath,
+                                        CapturedUtc = DateTimeOffset.UtcNow,
+                                        Entries = entries,
+                                    });
+                                }
+
+                                pending.Enqueue((path, true));
+                            }
+                            catch (Exception ex)
+                            {
+                                failures++;
+                                PawsLog.Write($"Pin sweep could not populate pinned folder '{path}': {ex.GetType().Name}: {ex.Message}");
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    pending.Enqueue((path, pinned));
+                }
+            }
+
+            if (hydrated > 0 || dehydrated > 0 || failures > 0)
+            {
+                PawsLog.Write($"Pin sweep for '{pair.LocalPath}': downloaded {hydrated}, freed {dehydrated}, failures {failures}.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Watcher disposed / shutdown — nothing to report.
+        }
+        catch (Exception ex)
+        {
+            PawsLog.Write($"Pin sweep failed for '{pair.LocalPath}': {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -911,7 +1076,11 @@ public sealed class CloudSyncService(
     }
 
     /// <summary>Disconnects the provider for a pair (placeholders and registration are left in place).</summary>
-    public void Disable(string pairId) => DisposeConnection(pairId);
+    public void Disable(string pairId)
+    {
+        StopPinStateWatcher(pairId);
+        DisposeConnection(pairId);
+    }
 
     /// <summary>
     /// Fully removes a pair's sync machinery from this PC, returning the local folder to an ordinary
@@ -1363,6 +1532,18 @@ public sealed class CloudSyncService(
         foreach (var watcher in watchers)
         {
             watcher.Dispose();
+        }
+
+        List<FolderWatcher> pinWatchers;
+        lock (_pinWatchers)
+        {
+            pinWatchers = [.. _pinWatchers.Values];
+            _pinWatchers.Clear();
+        }
+
+        foreach (var pinWatcher in pinWatchers)
+        {
+            pinWatcher.Dispose();
         }
 
         List<Timer> pullTimers;

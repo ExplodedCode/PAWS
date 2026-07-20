@@ -237,5 +237,7 @@ internal sealed class ThrowingPlaceholderEngine : IPlaceholderEngine
 
     public DecommissionResult DecommissionTree(string localRoot, bool keepLocalFiles) => throw new NotSupportedException();
 
+    public bool HydrateFile(string path) => throw new NotSupportedException();
+
     public void FinalizeUploadedFile(string fullPath, string fileIdentity) => throw new NotSupportedException();
 }

@@ -83,6 +83,15 @@ public interface IPlaceholderEngine
     DehydrateResult DehydrateTree(string path, TimeSpan? notUsedFor = null);
 
     /// <summary>
+    /// Hydrates (downloads the full content of) the dehydrated placeholder at <paramref name="path"/> by
+    /// driving the platform's hydration through the CONNECTED provider — the folder's provider must be
+    /// connected or this fails. Blocks until the content is local (or the download fails). Returns false
+    /// on failure. Used to honor Explorer's "Always keep on this device": that verb only SETS the pinned
+    /// attribute — actually downloading the pinned file is the sync engine's job.
+    /// </summary>
+    bool HydrateFile(string path);
+
+    /// <summary>
     /// Takes a folder OUT of files-on-demand, returning it to an ordinary local folder. Must run while
     /// the sync root is still registered (afterwards the caller unregisters it) — reverting or deleting
     /// placeholders needs the Cloud Filter driver's cooperation, and unregistering first would strand

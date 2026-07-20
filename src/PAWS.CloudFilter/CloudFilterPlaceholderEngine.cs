@@ -482,6 +482,24 @@ public sealed class CloudFilterPlaceholderEngine : IPlaceholderEngine
         }
     }
 
+    public bool HydrateFile(string path)
+    {
+        // Shared open (not the EXCLUSIVE oplock dehydration takes): hydration can run for as long as the
+        // download does, and other readers opening the file mid-hydration is normal — the platform
+        // coordinates the ranges. CfHydratePlaceholder blocks while cldflt raises FETCH_DATA against the
+        // folder's connected provider (HydrationConnection.TransferAsync serves it, same as a user
+        // opening the file in Explorer would).
+        if (CfOpenFileWithOplock(path, CF_OPEN_FILE_FLAGS.CF_OPEN_FILE_FLAG_NONE, out var handle).Failed)
+        {
+            return false;
+        }
+
+        using (handle)
+        {
+            return CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAGS.CF_HYDRATE_FLAG_NONE).Succeeded;
+        }
+    }
+
     public DecommissionResult DecommissionTree(string localRoot, bool keepLocalFiles)
     {
         var reverted = 0;

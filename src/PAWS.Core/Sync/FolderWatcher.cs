@@ -24,7 +24,10 @@ public sealed class FolderWatcher : IDisposable
     /// <param name="path">Absolute path of the folder to watch (must exist).</param>
     /// <param name="onChanged">Invoked, debounced, after changes settle. Cancelled on dispose.</param>
     /// <param name="quietPeriod">How long the tree must be idle before the callback fires (default 3s).</param>
-    public FolderWatcher(string path, Func<CancellationToken, Task> onChanged, TimeSpan? quietPeriod = null)
+    /// <param name="notifyFilter">What changes to watch. The default covers content sync (names, writes,
+    /// sizes); pass <see cref="NotifyFilters.Attributes"/> to react to pin-state changes instead
+    /// (Explorer's "Always keep on this device"/"Free up space" are pure attribute writes).</param>
+    public FolderWatcher(string path, Func<CancellationToken, Task> onChanged, TimeSpan? quietPeriod = null, NotifyFilters? notifyFilter = null)
     {
         if (!Directory.Exists(path))
         {
@@ -38,8 +41,8 @@ public sealed class FolderWatcher : IDisposable
         _watcher = new FileSystemWatcher(path)
         {
             IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName
-                | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime,
+            NotifyFilter = notifyFilter ?? (NotifyFilters.FileName | NotifyFilters.DirectoryName
+                | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime),
             InternalBufferSize = 64 * 1024,
         };
 
