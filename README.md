@@ -22,7 +22,7 @@ All projects target **`net10.0`** (Windows-specific ones: `net10.0-windows10.0.1
 | `src/PAWS.CloudFilter` | `IPlaceholderEngine` over the Windows Cloud Filter API (`cfapi`): sync-root registration with Explorer shell integration, placeholder creation, hydrate-on-open, dehydrate ("free up space"), lazy per-folder population. |
 | `PAWS/` | WinUI 3 app: browser login, accounts/folders UI, on-demand + full-sync management, speed limits, conflict resolution, tray/background host, single-instance guard. |
 | `src/PAWS.Setup` | Console dev tool for account setup outside the GUI (`--weblogin` default, `--show`, `--reset`). |
-| `src/PAWS.Tests` | xUnit test project — pure/offline coverage for the reconciler, conflict resolution, transfer throttling, retry logic, the full-sync delete guard, drive-timeout handling, and cfapi placeholder/decommission behavior (real Windows Cloud Filter calls, no Proton account needed). Run with `dotnet test`. |
+| `src/PAWS.Tests` | xUnit test project — pure/offline coverage for the reconciler, conflict resolution, transfer throttling, retry logic, the full-sync delete guard, drive-timeout and drive-watchdog handling, pin-state hydration, and cfapi placeholder/decommission behavior (real Windows Cloud Filter calls, no Proton account needed). Run with `dotnet test`. |
 | `src/PAWS.Tests.SingleInstanceHost` | Tiny companion executable (links the same `SingleInstanceGuard.cs` PAWS.exe ships) that `PAWS.Tests`'s single-instance test spawns as real child processes — not part of the shipping app. |
 
 ## Sync modes
@@ -31,7 +31,10 @@ Each folder pair (local path ↔ Drive path) is configured independently as:
 
 - **On-demand** — files appear instantly as placeholders; content downloads only when opened.
   Explorer shows cloud/pinned status icons, and right-click gives "Always keep on this device" /
-  "Free up space" to pin or dehydrate a file. Folders populate lazily as you browse into them.
+  "Free up space" to pin or dehydrate a file. Folders populate lazily as you browse into them. If
+  those right-click items ever go missing for a folder, Settings has a "Repair Explorer context
+  menu" button that re-registers the sync root's shell integration without touching files or sync
+  state.
 - **Full sync** — a complete local copy of the folder, kept in sync both ways.
 
 Both modes support **Auto** mode (a background watcher plus a periodic Drive poll — no button
@@ -113,6 +116,13 @@ the `dotnet-crypto` Go source and drop it at `native/win-x64/proton_crypto.dll`.
 
 ## Known limitations
 
+**A wedged Drive connection needs a restart.** In rare cases a Drive call can fail to return even
+after being cancelled, permanently jamming the shared client gate. PAWS detects this (a watchdog on
+every Drive metadata call) rather than hanging silently: affected pairs show "Proton Drive
+connection stuck — quit and reopen PAWS to recover" and a tray notification appears. This is
+distinct from an ordinary timeout (which resolves itself on retry) — once wedged, Drive access stays
+unusable for the rest of that run, so PAWS says so plainly instead of suggesting a retry.
+
 **No true byte-range hydration.** Opening an on-demand file always downloads the whole file from
 byte 0, even when only a small range is actually requested (e.g. seeking deep into a large file).
 Proton's public C# SDK (`Proton.Drive.Sdk`) exposes only a whole-file, sequential download
@@ -133,7 +143,7 @@ on-demand sync with Explorer integration (placeholders, hydration, dehydration, 
 two-way sync, background auto-sync (local watcher + periodic Drive poll) for both modes, conflict
 resolution, per-pair and app-wide transfer speed limits, single-instancing, packaged
 autostart-at-login, and an automated xUnit test suite (`src/PAWS.Tests`). See
-[Known limitations](#known-limitations) above for the one known gap.
+[Known limitations](#known-limitations) above for the known gaps.
 
 ## License
 
